@@ -1,52 +1,73 @@
-# 台股 MCP V5：全市場選股＋智慧快取
+# 台股 MCP V6：免費全市場初篩＋快取
 
-保留 V4 的全部功能，新增兩層快取與管理工具。
+V6 不再使用 Fugle `Snapshot Quotes`，因此不需要為了全市場選股升級
+Fugle 開發者／進階方案。
 
-## 新增功能
+## 資料流程
 
-- 全市場選股 `screen_market`
-- 記憶體 TTL 快取（不需新增設定）
-- 可選 Redis／Render Key Value 共用快取
-- 同一資料的併發請求只打一次上游 API（防止 cache stampede）
-- `force_refresh=true` 可強制刷新全市場選股資料
-- `get_cache_status` 查看命中率、實際 API 呼叫數、估計省下的呼叫數
-- `clear_cache` 可清除指定快取
+1. 上市候選池：證交所 OpenAPI 最新全市場日行情
+2. 上櫃候選池：櫃買中心 OpenAPI 最新全市場日行情
+3. 依成交值、價格與當日漲跌預篩
+4. 候選股的 180 日 K 線：沿用 Fugle 個股歷史行情
+5. `include_chip=true`：入選股再用 FinMind 補法人與融資券
 
-## 快取策略
+官方全市場資料不是盤中逐筆即時 Snapshot。收盤後執行最完整；
+盤中執行時，結果依官方端點當下最新公布批次。
 
-- 即時報價：盤中 10 秒
-- 全市場快照：盤中 30 秒
-- 歷史日 K：盤中 5 分鐘；盤後快取至下一個工作日 08:30
-- FinMind 法人／融資／外資／借券：更新時段 20 分鐘，其餘 2～10 小時
-- 股權分散：24 小時
+## 原有功能保留
 
-## 環境變數
+- 即時報價
+- 歷史 K 線
+- 均線、布林通道、量比
+- 三大法人、融資融券、外資持股、借券
+- 股權分散
+- 單檔完整分析
+- 指定清單排名
+- Redis／記憶體快取
+- 快取狀態與清除
 
-必要：
+## Render 環境變數
+
+保留：
 
 - `FUGLE_API_KEY`
 - `FINMIND_TOKEN`
+- `REDIS_URL`（已設定 Redis 才需要）
 
-選用：
-
-- `REDIS_URL`：Render Key Value 的 Internal URL
-- `CACHE_PREFIX`：預設 `twstock:mcp:v5`
-- `CACHE_MAX_ITEMS`：記憶體快取上限，預設 2500
-
-沒有 `REDIS_URL` 也能運作，但免費 Render 休眠、重啟或重新部署後，記憶體快取會消失。
+不需要新增證交所或櫃買中心 API Key。
 
 ## 更新方式
 
 1. 解壓縮 ZIP。
-2. 到原 GitHub Repository。
-3. 上傳並覆蓋 `server.py`、`requirements.txt`、`README.md`、`.gitignore`。
+2. 到原本 GitHub Repository。
+3. 覆蓋 `server.py`、`requirements.txt`、`README.md`、`.gitignore`。
 4. Commit changes。
-5. 等 Render 顯示 Deploy live。
-6. 回 ChatGPT App 重新整理工具。
+5. 等 Render 顯示 `Deploy live`。
+6. ChatGPT → Apps → 台股 App → Refresh。
+7. 建議開新對話重新選取 App。
 
-## 建議測試
+## 測試
 
-- `使用 get_cache_status 查看快取狀態`
-- `使用 screen_market，以 early_stage 策略找前 10 名，candidate_limit=40`
-- 立刻重跑同一條件，再查看 `get_cache_status`，應看到 cache hits 增加。
-- 需要全新資料時，把 `force_refresh` 設為 `true`。
+```text
+使用 screen_market，
+strategy=early_stage，
+markets=BOTH，
+top_n=10，
+candidate_limit=40，
+include_chip=true，
+force_refresh=false
+```
+
+再執行：
+
+```text
+使用 get_cache_status 查看快取狀態
+```
+
+## 清除全市場快取
+
+```text
+使用 clear_cache，scope=market
+```
+
+舊的 `scope=snapshot` 仍保留相容性，也會清除官方全市場資料快取。

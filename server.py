@@ -22,10 +22,12 @@ except ImportError:  # Redis is optional; memory cache still works.
 PORT = int(os.environ.get("PORT", "8000"))
 FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+TWSE_DAILY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+TPEX_DAILY_CLOSE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
-CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v5")
+CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v6")
 CACHE_MAX_ITEMS = int(os.environ.get("CACHE_MAX_ITEMS", "2500"))
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 
@@ -45,6 +47,7 @@ CACHE_STATS: dict[str, int] = {
     "writes": 0,
     "fugleUpstreamRequests": 0,
     "finmindUpstreamRequests": 0,
+    "officialMarketUpstreamRequests": 0,
     "upstreamErrors": 0,
 }
 
@@ -82,7 +85,14 @@ def _quote_ttl() -> int:
 
 
 def _snapshot_ttl() -> int:
-    return 30 if _is_tw_market_hours() else _seconds_until_next_weekday_open()
+    # 保留函式名稱以相容舊版快取狀態欄位。
+    return _official_market_ttl()
+
+
+def _official_market_ttl() -> int:
+    # 公開市場端點不是 Fugle 即時快照。盤中每 15 分鐘重抓一次；
+    # 盤後資料固定，快取至下一個交易日早上。
+    return 15 * 60 if _is_tw_market_hours() else _seconds_until_next_weekday_open()
 
 
 def _historical_ttl() -> int:
@@ -228,7 +238,7 @@ mcp = FastMCP(
     "Taiwan Stock MCP",
     instructions=(
         "Use this server to query Taiwan stock real-time quotes, historical K-lines, "
-        "moving averages, Bollinger Bands, technical summaries, institutional trading, "
+        "moving averages, Bollinger Bands, official-market screening, institutional trading, "
         "margin/short balances, foreign ownership, securities lending, shareholding distribution, "
         "full-market screening, watchlist ranking, and full stock analysis. "
         "Stock symbols are strings such as 2330, 2313, or 4977."
@@ -679,21 +689,243 @@ async def _get_intraday_quote(symbol: str, force_refresh: bool = False) -> dict[
     )
 
 
-async def _get_snapshot_quotes(market: str, force_refresh: bool = False) -> dict[str, Any]:
-    """取得 Fugle 全市場快照；此端點需要 Fugle 開發者或進階方案。"""
-    market = market.upper().strip()
-    if market not in {"TSE", "OTC"}:
-        raise ValueError("market 僅支援 TSE 或 OTC。")
+async def _official_http_json(
+    url: str,
+    cache_tag: str,
+    force_refresh: bool = False,
+) -> Any:
+    """讀取證交所／櫃買中心公開 JSON，並套用共用快取。"""
+
+    async def fetch() -> Any:
+        CACHE_STATS["officialMarketUpstreamRequests"] += 1
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "TaiwanStockMCP/6.0 (+public-market-screener)",
+        }
+        async with httpx.AsyncClient(timeout=35.0, follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+
+        if response.status_code == 429:
+            raise RuntimeError("官方市場資料服務目前要求過於頻繁，請稍後再試。")
+        try:
+            response.raise_for_status()
+        except Exception:
+            CACHE_STATS["upstreamErrors"] += 1
+            raise
+
+        try:
+            return response.json()
+        except Exception as exc:
+            CACHE_STATS["upstreamErrors"] += 1
+            raise RuntimeError("官方市場資料回傳的內容不是有效 JSON。") from exc
+
     return await _cached_call(
-        "fugle:snapshot",
-        {"market": market, "type": "COMMONSTOCK"},
-        _snapshot_ttl(),
-        lambda: _fugle_get(
-            f"snapshot/quotes/{market}",
-            params={"type": "COMMONSTOCK"},
-        ),
+        "official:market",
+        {"tag": cache_tag, "url": url},
+        _official_market_ttl(),
+        fetch,
         force_refresh=force_refresh,
     )
+
+
+def _first_value(row: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in row and row.get(key) not in (None, ""):
+            return row.get(key)
+    return None
+
+
+def _market_number(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) else default
+
+    text = str(value).strip()
+    if not text or text in {"--", "---", "----", "N/A", "null", "None"}:
+        return default
+
+    text = (
+        text.replace(",", "")
+        .replace("＋", "+")
+        .replace("－", "-")
+        .replace("−", "-")
+        .replace("▲", "+")
+        .replace("△", "+")
+        .replace("▼", "-")
+        .replace("▽", "-")
+    )
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    if not match:
+        return default
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return default
+
+
+def _signed_market_change(row: dict[str, Any]) -> float:
+    raw = _first_value(
+        row,
+        "Change", "ChangeAmount", "PriceChange", "漲跌價差", "漲跌", "漲跌幅",
+    )
+    value = _market_number(raw)
+    sign = str(_first_value(
+        row,
+        "ChangeSign", "UpDown", "Trend", "漲跌符號", "漲跌註記",
+    ) or "").strip()
+
+    negative_tokens = {"-", "－", "跌", "down", "DOWN", "red_down"}
+    positive_tokens = {"+", "＋", "漲", "up", "UP", "red_up"}
+    if sign in negative_tokens:
+        return -abs(value)
+    if sign in positive_tokens:
+        return abs(value)
+    return value
+
+
+def _response_rows(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    for key in ("data", "Data", "rows", "result", "results"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [row for row in value if isinstance(row, dict)]
+
+    numbered = []
+    for key, value in payload.items():
+        if re.fullmatch(r"data\d+", str(key)) and isinstance(value, list):
+            if value and isinstance(value[0], dict):
+                numbered.extend(value)
+    return numbered
+
+
+def _normalize_official_row(
+    row: dict[str, Any],
+    market: str,
+) -> dict[str, Any] | None:
+    symbol = str(_first_value(
+        row,
+        "Code", "SecuritiesCompanyCode", "SecuritiesCode", "StockCode",
+        "證券代號", "股票代號", "代號",
+    ) or "").strip()
+
+    # 排除 ETF（0 開頭）、權證與非四碼普通股。
+    if not re.fullmatch(r"[1-9]\d{3}", symbol):
+        return None
+
+    name = str(_first_value(
+        row,
+        "Name", "CompanyName", "SecuritiesCompanyName", "StockName",
+        "證券名稱", "股票名稱", "名稱",
+    ) or "").strip()
+
+    close = _market_number(_first_value(
+        row, "ClosingPrice", "Close", "ClosePrice", "收盤價", "收盤",
+    ))
+    open_price = _market_number(_first_value(
+        row, "OpeningPrice", "Open", "OpenPrice", "開盤價", "開盤",
+    ))
+    high = _market_number(_first_value(
+        row, "HighestPrice", "High", "HighPrice", "最高價", "最高",
+    ))
+    low = _market_number(_first_value(
+        row, "LowestPrice", "Low", "LowPrice", "最低價", "最低",
+    ))
+    volume = _market_number(_first_value(
+        row, "TradeVolume", "TradingShares", "TradingVolume", "Volume",
+        "成交股數", "成交量",
+    ))
+    trade_value = _market_number(_first_value(
+        row, "TradeValue", "TransactionAmount", "TradingAmount", "Amount",
+        "成交金額", "成交值",
+    ))
+    change = _signed_market_change(row)
+
+    if close <= 0:
+        return None
+    if trade_value <= 0 and volume > 0:
+        trade_value = close * volume
+
+    previous_close = close - change
+    change_percent = (
+        change / previous_close * 100
+        if previous_close > 0
+        else 0.0
+    )
+
+    report_date = _first_value(
+        row, "Date", "TradeDate", "ReportDate", "資料日期", "日期",
+    )
+
+    return {
+        "symbol": symbol,
+        "name": name,
+        "market": market,
+        "openPrice": open_price or None,
+        "highPrice": high or None,
+        "lowPrice": low or None,
+        "closePrice": close,
+        "change": change,
+        "changePercent": round(change_percent, 4),
+        "tradeVolume": int(round(volume)),
+        "tradeValue": int(round(trade_value)),
+        "date": str(report_date) if report_date not in (None, "") else None,
+    }
+
+
+async def _get_official_market_quotes(
+    market: str,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """取得證交所或櫃買中心最新公開全市場日行情，不需要 Fugle Snapshot 權限。"""
+    market = market.upper().strip()
+    if market == "TSE":
+        url = TWSE_DAILY_ALL_URL
+        source = "TWSE OpenAPI STOCK_DAY_ALL"
+    elif market == "OTC":
+        url = TPEX_DAILY_CLOSE_URL
+        source = "TPEx OpenAPI tpex_mainboard_daily_close_quotes"
+    else:
+        raise ValueError("market 僅支援 TSE 或 OTC。")
+
+    payload = await _official_http_json(
+        url,
+        cache_tag=market,
+        force_refresh=force_refresh,
+    )
+    rows = _response_rows(payload)
+    normalized = []
+    for row in rows:
+        item = _normalize_official_row(row, market)
+        if item is not None:
+            normalized.append(item)
+
+    if not normalized:
+        sample_keys = sorted(rows[0].keys())[:20] if rows else []
+        raise RuntimeError(
+            f"{market} 官方市場資料目前沒有解析到普通股。"
+            f"可能是上游尚未更新或欄位改版；sampleKeys={sample_keys}"
+        )
+
+    report_dates = sorted({
+        str(item.get("date"))
+        for item in normalized
+        if item.get("date")
+    })
+    return {
+        "market": market,
+        "date": report_dates[-1] if report_dates else None,
+        "time": None,
+        "data": normalized,
+        "source": source,
+        "fetchedAtTaipei": _taipei_now().isoformat(),
+        "freshness": "官方端點最新公布的全市場日行情，不是盤中逐筆即時快照。",
+    }
 
 
 async def _get_historical_candles_raw(
@@ -1029,7 +1261,7 @@ def ping() -> dict:
     """檢查台股 MCP 伺服器是否正常運作。"""
     return {
         "ok": True,
-        "server": "Taiwan Stock MCP v5-cache",
+        "server": "Taiwan Stock MCP v6-official-market",
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "tools": [
             "get_realtime_quote",
@@ -1351,14 +1583,15 @@ async def screen_market(
     force_refresh: bool = False,
 ) -> dict:
     """
-    掃描上市與上櫃普通股，先以全市場行情快照篩出流動性候選股，
-    再計算均線、布林、量比、突破位置與過熱風險並排名。
+    掃描上市與上櫃普通股。全市場初篩使用證交所／櫃買中心最新公開日行情，
+    不需要 Fugle Snapshot Quotes 付費權限；候選股深度技術分析仍使用
+    Fugle 個股歷史 K 線。
 
     strategy：balanced、breakout、early_stage、trend、pullback。
     markets：BOTH、TSE、OTC。
     include_chip=true 時，只為最後入選股補上法人與融資籌碼評分。
 
-    注意：全市場快照需要 Fugle 開發者或進階行情方案。
+    注意：官方全市場資料不是盤中逐筆即時快照，收盤後使用最完整。
     """
     strategy = strategy.lower().strip()
     markets = markets.upper().strip()
@@ -1368,45 +1601,42 @@ async def screen_market(
         raise ValueError("markets 僅支援 BOTH、TSE、OTC。")
     if not 1 <= top_n <= 20:
         raise ValueError("top_n 請填 1 到 20。")
-    if not top_n <= candidate_limit <= 60:
-        raise ValueError("candidate_limit 必須大於等於 top_n，且最多 60。")
+    if not top_n <= candidate_limit <= 55:
+        raise ValueError("candidate_limit 必須大於等於 top_n，且最多 55。")
     if min_trade_value < 0:
         raise ValueError("min_trade_value 不可為負數。")
     if min_price <= 0 or max_price <= min_price:
         raise ValueError("價格範圍設定不正確。")
 
     requested_markets = ["TSE", "OTC"] if markets == "BOTH" else [markets]
-    try:
-        snapshots_raw = await asyncio.gather(
-            *[_get_snapshot_quotes(market, force_refresh=force_refresh) for market in requested_markets]
-        )
-    except RuntimeError as exc:
-        if "方案沒有此資料權限" in str(exc):
-            raise RuntimeError(
-                "全市場選股需要 Fugle 的 Snapshot Quotes 權限。"
-                "請確認 Fugle 為開發者或進階方案；個股查詢功能不受影響。"
-            ) from exc
-        raise
+    market_payloads = await asyncio.gather(
+        *[
+            _get_official_market_quotes(
+                market,
+                force_refresh=force_refresh,
+            )
+            for market in requested_markets
+        ]
+    )
 
     universe: list[dict[str, Any]] = []
     as_of: list[dict[str, Any]] = []
-    for market, payload in zip(requested_markets, snapshots_raw):
-        as_of.append({"market": market, "date": payload.get("date"), "time": payload.get("time")})
+    for market, payload in zip(requested_markets, market_payloads):
+        as_of.append({
+            "market": market,
+            "date": payload.get("date"),
+            "source": payload.get("source"),
+            "fetchedAtTaipei": payload.get("fetchedAtTaipei"),
+        })
         for row in payload.get("data", []):
-            symbol = str(row.get("symbol", ""))
             close = _safe_float(row.get("closePrice"))
             trade_value = _safe_float(row.get("tradeValue"))
-            if not re.fullmatch(r"\d{4}", symbol):
-                continue
             if not min_price <= close <= max_price:
                 continue
             if trade_value < min_trade_value:
                 continue
-            item = dict(row)
-            item["market"] = market
-            universe.append(item)
+            universe.append(dict(row))
 
-    # 預篩兼顧成交值、當日動能與不追過熱。
     def prefilter_score(row: dict[str, Any]) -> float:
         value = _safe_float(row.get("tradeValue"))
         change = _safe_float(row.get("changePercent"))
@@ -1421,9 +1651,18 @@ async def screen_market(
 
     universe.sort(key=prefilter_score, reverse=True)
     candidates = universe[:candidate_limit]
+
     semaphore = asyncio.Semaphore(6)
     results = await asyncio.gather(
-        *[_analyze_candidate(row, strategy, semaphore, force_refresh=force_refresh) for row in candidates],
+        *[
+            _analyze_candidate(
+                row,
+                strategy,
+                semaphore,
+                force_refresh=force_refresh,
+            )
+            for row in candidates
+        ],
         return_exceptions=True,
     )
 
@@ -1431,11 +1670,17 @@ async def screen_market(
     errors: list[dict[str, str]] = []
     for row, result in zip(candidates, results):
         if isinstance(result, Exception):
-            errors.append({"symbol": str(row.get("symbol")), "error": str(result)})
+            errors.append({
+                "symbol": str(row.get("symbol")),
+                "error": str(result),
+            })
         else:
             analyzed.append(result)
 
-    analyzed.sort(key=lambda item: _safe_float(item.get("score")), reverse=True)
+    analyzed.sort(
+        key=lambda item: _safe_float(item.get("score")),
+        reverse=True,
+    )
     selected = analyzed[:top_n]
 
     if include_chip and selected:
@@ -1444,10 +1689,21 @@ async def screen_market(
         )
         for item, chip in zip(selected, chip_results):
             item["chip"] = chip
-            item["score"] = round(_safe_float(item.get("score")) + _safe_float(chip.get("scoreAdjustment")), 2)
-            item["reasons"] = (item.get("reasons", []) + chip.get("reasons", []))[:8]
-            item["risks"] = (item.get("risks", []) + chip.get("risks", []))[:6]
-        selected.sort(key=lambda item: _safe_float(item.get("score")), reverse=True)
+            item["score"] = round(
+                _safe_float(item.get("score"))
+                + _safe_float(chip.get("scoreAdjustment")),
+                2,
+            )
+            item["reasons"] = (
+                item.get("reasons", []) + chip.get("reasons", [])
+            )[:8]
+            item["risks"] = (
+                item.get("risks", []) + chip.get("risks", [])
+            )[:6]
+        selected.sort(
+            key=lambda item: _safe_float(item.get("score")),
+            reverse=True,
+        )
 
     for rank, item in enumerate(selected, start=1):
         item["rank"] = rank
@@ -1456,6 +1712,11 @@ async def screen_market(
         "strategy": strategy,
         "markets": requested_markets,
         "asOf": as_of,
+        "marketDataMode": "official_latest_daily_market",
+        "marketDataFreshness": (
+            "全市場初篩依證交所／櫃買中心端點最新公布的日行情；"
+            "不是 Fugle 盤中 Snapshot。收盤後執行最完整。"
+        ),
         "snapshotUniverseCount": len(universe),
         "deepAnalyzedCount": len(analyzed),
         "candidateLimit": candidate_limit,
@@ -1466,11 +1727,20 @@ async def screen_market(
         },
         "includeChip": include_chip,
         "forceRefresh": force_refresh,
-        "cacheNote": "相同行情、K 線與籌碼請求會依 TTL 使用快取；force_refresh=true 可略過。",
+        "cacheNote": (
+            "官方市場行情、歷史 K 線與籌碼依 TTL 使用快取；"
+            "force_refresh=true 可略過快取。"
+        ),
         "results": selected,
         "errors": errors[:15],
-        "method": "全市場快照預篩，再對候選股計算 180 日技術指標；不是報酬保證。",
-        "source": "Fugle MarketData API v1.0；include_chip 時另用 FinMind API v4",
+        "method": (
+            "證交所／櫃買中心最新公開日行情預篩，"
+            "再對候選股計算 180 日技術指標；不是報酬保證。"
+        ),
+        "source": (
+            "TWSE OpenAPI + TPEx OpenAPI；候選股歷史 K 線使用 "
+            "Fugle MarketData API v1.0；include_chip 時另用 FinMind API v4"
+        ),
         "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1662,10 +1932,10 @@ async def get_cache_status() -> dict:
         },
         "ttlPolicySeconds": {
             "quoteDuringMarket": 10,
-            "snapshotDuringMarket": 30,
+            "officialMarketDuringMarket": 900,
             "historicalDuringMarket": 300,
             "afterCloseQuoteMax": 3600,
-            "afterCloseSnapshotAndHistorical": "until next weekday 08:30 Asia/Taipei",
+            "afterCloseOfficialMarketAndHistorical": "until next weekday 08:30 Asia/Taipei",
             "finmindUpdateWindow": 1200,
             "finmindDaytime": 7200,
             "finmindNight": 36000,
@@ -1682,18 +1952,19 @@ async def get_cache_status() -> dict:
 @mcp.tool()
 async def clear_cache(scope: str = "all") -> dict:
     """
-    清除快取。scope 支援 all、quote、snapshot、historical、finmind。
+    清除快取。scope 支援 all、quote、market、snapshot、historical、finmind。
     一般情況不必清除；需要強制取得最新資料時使用。
     """
     scope = scope.lower().strip()
     namespace_map = {
         "quote": "fugle:quote",
-        "snapshot": "fugle:snapshot",
+        "market": "official:market",
+        "snapshot": "official:market",
         "historical": "fugle:historical",
         "finmind": "finmind:",
     }
     if scope not in {"all", *namespace_map.keys()}:
-        raise ValueError("scope 僅支援 all、quote、snapshot、historical、finmind。")
+        raise ValueError("scope 僅支援 all、quote、market、snapshot、historical、finmind。")
 
     target = None if scope == "all" else namespace_map[scope]
     memory_deleted = 0
