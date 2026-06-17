@@ -1,55 +1,52 @@
-# 台股 MCP v3：即時報價、技術面與籌碼面
+# 台股 MCP V5：全市場選股＋智慧快取
 
-## 原有工具
+保留 V4 的全部功能，新增兩層快取與管理工具。
 
-- `ping`
-- `get_realtime_quote`
-- `get_historical_candles`
-- `get_technical_summary`
+## 新增功能
 
-## 新增籌碼工具
+- 全市場選股 `screen_market`
+- 記憶體 TTL 快取（不需新增設定）
+- 可選 Redis／Render Key Value 共用快取
+- 同一資料的併發請求只打一次上游 API（防止 cache stampede）
+- `force_refresh=true` 可強制刷新全市場選股資料
+- `get_cache_status` 查看命中率、實際 API 呼叫數、估計省下的呼叫數
+- `clear_cache` 可清除指定快取
 
-- `get_institutional_trades`
-  - 外資、投信、自營商買賣超
-  - 近 5／10／20 個交易日累計
+## 快取策略
 
-- `get_margin_short`
-  - 融資融券買賣與餘額
-  - 每日增減與期間變化
+- 即時報價：盤中 10 秒
+- 全市場快照：盤中 30 秒
+- 歷史日 K：盤中 5 分鐘；盤後快取至下一個工作日 08:30
+- FinMind 法人／融資／外資／借券：更新時段 20 分鐘，其餘 2～10 小時
+- 股權分散：24 小時
 
-- `get_foreign_shareholding`
-  - 外資持股股數與比例
-  - 查詢期間比例變化
+## 環境變數
 
-- `get_securities_lending`
-  - 借券成交量
-  - 加權平均借券費率
-  - 注意：不是借券賣出餘額
+必要：
 
-- `get_shareholding_distribution`
-  - 股權持股分級
-  - 百張以下持股比例
-  - 需要 FinMind backer 或 sponsor 方案
+- `FUGLE_API_KEY`
+- `FINMIND_TOKEN`
 
-- `get_chip_summary`
-  - 一次取得法人、融資券、外資持股、借券成交摘要
+選用：
 
-## Render 環境變數
+- `REDIS_URL`：Render Key Value 的 Internal URL
+- `CACHE_PREFIX`：預設 `twstock:mcp:v5`
+- `CACHE_MAX_ITEMS`：記憶體快取上限，預設 2500
 
-原本的：
-
-`FUGLE_API_KEY=你的 Fugle API Key`
-
-新增：
-
-`FINMIND_TOKEN=你的 FinMind Token`
+沒有 `REDIS_URL` 也能運作，但免費 Render 休眠、重啟或重新部署後，記憶體快取會消失。
 
 ## 更新方式
 
-1. 解壓縮本 ZIP。
-2. 到原本的 GitHub Repository。
+1. 解壓縮 ZIP。
+2. 到原 GitHub Repository。
 3. 上傳並覆蓋 `server.py`、`requirements.txt`、`README.md`、`.gitignore`。
 4. Commit changes。
 5. 等 Render 顯示 Deploy live。
-6. 在 Render 的 Environment 新增 `FINMIND_TOKEN`。
-7. 回 ChatGPT App 開發者模式重新整理工具；若舊對話未更新，開新對話並重新選取 App。
+6. 回 ChatGPT App 重新整理工具。
+
+## 建議測試
+
+- `使用 get_cache_status 查看快取狀態`
+- `使用 screen_market，以 early_stage 策略找前 10 名，candidate_limit=40`
+- 立刻重跑同一條件，再查看 `get_cache_status`，應看到 cache hits 增加。
+- 需要全新資料時，把 `force_refresh` 設為 `true`。
