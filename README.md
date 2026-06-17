@@ -1,37 +1,29 @@
-# 台股 MCP Starter
+# 台股 MCP v2
 
-這是一個最小可用版本，提供：
+新增功能：
 
-- `ping`：確認 MCP 是否正常
-- `get_realtime_quote`：透過 Fugle MarketData API v1.0 查台股即時報價
+- `ping`
+- `get_realtime_quote`
+- `get_historical_candles`
+- `get_technical_summary`
 
-## Render 設定
+技術摘要包含：
 
-- Build Command：`pip install -r requirements.txt`
-- Start Command：`python server.py`
-- Environment Variable：
-  - Key：`FUGLE_API_KEY`
-  - Value：你的 Fugle 行情 API v1.0 金鑰
+- 5、10、20、60 日均線
+- 均線排列
+- 20 日布林通道
+- 20 日量比
+- 20／60 日區間高低
 
-部署完成後，MCP 網址通常是：
+## 更新方式
 
-`https://你的服務名稱.onrender.com/mcp`
+1. 把本 ZIP 解壓縮。
+2. 到原本的 GitHub Repository。
+3. 用本版 `server.py`、`requirements.txt`、`README.md` 覆蓋舊檔。
+4. Commit changes。
+5. 等 Render 自動部署完成。
+6. ChatGPT → 設定 → Apps & Connectors → 你的台股 App → Refresh。
 
-## 本機測試
+Render 環境變數仍只需要：
 
-```bash
-pip install -r requirements.txt
-set FUGLE_API_KEY=你的金鑰
-python server.py
-```
-
-macOS / Linux：
-
-```bash
-export FUGLE_API_KEY=你的金鑰
-python server.py
-```
-
-本機 MCP endpoint：
-
-`http://localhost:8000/mcp`
+`FUGLE_API_KEY=你的 Fugle API Key`
