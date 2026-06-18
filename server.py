@@ -24,10 +24,18 @@ FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 TWSE_DAILY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX_DAILY_CLOSE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+TWSE_DAILY_FALLBACK_URL = (
+    "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+    "?date={date}&type=ALLBUT0999&response=json"
+)
+TPEX_DAILY_FALLBACK_URL = (
+    "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes"
+    "?date={date}&id=&response=json"
+)
 
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
-CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v7-free")
+CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v7.1-free")
 CACHE_MAX_ITEMS = int(os.environ.get("CACHE_MAX_ITEMS", "2500"))
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 
@@ -742,6 +750,20 @@ def _normalize_trade_date(value: Any) -> str | None:
         except ValueError:
             return None
 
+    # Allow dates embedded in official report titles, e.g. 115年06月18日.
+    embedded = re.search(
+        r"(?<!\d)(\d{3,4})\s*[年/-]\s*(\d{1,2})\s*[月/-]\s*(\d{1,2})\s*日?",
+        raw,
+    )
+    if embedded:
+        year, month, day = map(int, embedded.groups())
+        if year < 1911:
+            year += 1911
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError:
+            return None
+
     digits = re.sub(r"\D", "", raw)
     if len(digits) == 8:
         try:
@@ -930,7 +952,7 @@ async def _official_http_json(
         CACHE_STATS["officialMarketUpstreamRequests"] += 1
         headers = {
             "Accept": "application/json",
-            "User-Agent": "TaiwanStockMCP/7.0-free (+official-same-day-screener)",
+            "User-Agent": "TaiwanStockMCP/7.1-free (+official-fallback-screener)",
         }
         async with httpx.AsyncClient(timeout=35.0, follow_redirects=True) as client:
             response = await client.get(url, headers=headers)
@@ -1003,7 +1025,7 @@ def _signed_market_change(row: dict[str, Any]) -> float:
     value = _market_number(raw)
     sign = str(_first_value(
         row,
-        "ChangeSign", "UpDown", "Trend", "漲跌符號", "漲跌註記",
+        "ChangeSign", "UpDown", "Trend", "漲跌符號", "漲跌註記", "漲跌(+/-)",
     ) or "").strip()
 
     negative_tokens = {"-", "－", "跌", "down", "DOWN", "red_down"}
@@ -1159,6 +1181,347 @@ async def _get_official_market_quotes(
         "source": source,
         "fetchedAtTaipei": _taipei_now().isoformat(),
         "freshness": "官方端點最新公布的全市場日行情，不是盤中逐筆即時快照。",
+    }
+
+
+
+
+def _plain_text(value: Any) -> str:
+    """Remove simple HTML wrappers occasionally returned by official endpoints."""
+    text = "" if value is None else str(value)
+    text = re.sub(r"<[^>]+>", "", text)
+    return text.replace("\u3000", " ").strip()
+
+
+def _normalized_field_name(value: Any) -> str:
+    return re.sub(r"[\s\u3000]", "", _plain_text(value)).lower()
+
+
+def _find_table_value(record: dict[str, Any], aliases: tuple[str, ...]) -> tuple[Any, str | None]:
+    normalized = {_normalized_field_name(key): key for key in record}
+    for alias in aliases:
+        key = normalized.get(_normalized_field_name(alias))
+        if key is not None:
+            return record.get(key), str(key)
+    return None, None
+
+
+def _official_table_records(payload: Any) -> list[dict[str, Any]]:
+    """Extract array-based table rows from TWSE/TPEx report JSON formats."""
+    records: list[dict[str, Any]] = []
+
+    def visit(node: Any, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(node, dict):
+            fields = None
+            for key in ("fields", "Fields", "columns", "Columns", "columnNames"):
+                value = node.get(key)
+                if isinstance(value, list) and value:
+                    fields = [_plain_text(item) for item in value]
+                    break
+            data_rows = None
+            for key in ("data", "Data", "rows", "aaData"):
+                value = node.get(key)
+                if isinstance(value, list):
+                    data_rows = value
+                    break
+            if fields and data_rows:
+                field_tokens = {_normalized_field_name(item) for item in fields}
+                has_symbol = bool(field_tokens & {
+                    _normalized_field_name("證券代號"),
+                    _normalized_field_name("股票代號"),
+                    _normalized_field_name("代號"),
+                })
+                has_close = bool(field_tokens & {
+                    _normalized_field_name("收盤價"),
+                    _normalized_field_name("收盤"),
+                })
+                if has_symbol and has_close:
+                    for row in data_rows:
+                        if isinstance(row, dict):
+                            records.append(dict(row))
+                        elif isinstance(row, (list, tuple)):
+                            records.append({
+                                fields[index]: row[index] if index < len(row) else None
+                                for index in range(len(fields))
+                            })
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    visit(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node:
+                if isinstance(value, (dict, list)):
+                    visit(value, depth + 1)
+
+    visit(payload)
+    return records
+
+
+def _payload_trade_dates(payload: Any) -> list[str]:
+    dates: set[str] = set()
+
+    def maybe_add(value: Any) -> None:
+        normalized = _normalize_trade_date(value)
+        if normalized:
+            dates.add(normalized)
+
+    def visit(node: Any, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                key_token = _normalized_field_name(key)
+                if any(token in key_token for token in ("date", "日期", "年月日")):
+                    maybe_add(value)
+                elif key_token in {"title", "subtitle", "說明", "名稱"}:
+                    maybe_add(value)
+                if isinstance(value, (dict, list)):
+                    visit(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node:
+                if isinstance(value, (dict, list)):
+                    visit(value, depth + 1)
+
+    visit(payload)
+    return sorted(dates)
+
+
+def _fallback_record_to_official_row(
+    record: dict[str, Any],
+    market: str,
+    trade_date: str,
+) -> dict[str, Any] | None:
+    symbol, _ = _find_table_value(record, (
+        "證券代號", "股票代號", "代號", "Code", "StockCode",
+    ))
+    name, _ = _find_table_value(record, (
+        "證券名稱", "股票名稱", "名稱", "Name", "StockName",
+    ))
+    close, _ = _find_table_value(record, ("收盤價", "收盤", "ClosingPrice", "Close"))
+    open_price, _ = _find_table_value(record, ("開盤價", "開盤", "OpeningPrice", "Open"))
+    high, _ = _find_table_value(record, ("最高價", "最高", "HighestPrice", "High"))
+    low, _ = _find_table_value(record, ("最低價", "最低", "LowestPrice", "Low"))
+    volume, volume_key = _find_table_value(record, (
+        "成交股數", "成交量", "成交股數(股)", "成交量(股)",
+        "成交仟股", "成交千股", "成交量(千股)", "成交量(仟股)",
+    ))
+    trade_value, value_key = _find_table_value(record, (
+        "成交金額", "成交值", "成交金額(元)", "成交值(元)",
+        "成交仟元", "成交千元", "成交金額(千元)", "成交金額(仟元)",
+    ))
+    change, _ = _find_table_value(record, (
+        "漲跌價差", "漲跌", "Change", "ChangeAmount", "PriceChange",
+    ))
+    change_sign, _ = _find_table_value(record, (
+        "漲跌(+/-)", "漲跌符號", "漲跌註記", "ChangeSign", "UpDown",
+    ))
+
+    volume_number = _market_number(volume)
+    if volume_key and any(unit in _normalized_field_name(volume_key) for unit in ("千股", "仟股")):
+        volume_number *= 1000
+    value_number = _market_number(trade_value)
+    if value_key and any(unit in _normalized_field_name(value_key) for unit in ("千元", "仟元")):
+        value_number *= 1000
+
+    canonical = {
+        "Code": _plain_text(symbol),
+        "Name": _plain_text(name),
+        "ClosingPrice": _plain_text(close),
+        "OpeningPrice": _plain_text(open_price),
+        "HighestPrice": _plain_text(high),
+        "LowestPrice": _plain_text(low),
+        "TradeVolume": volume_number,
+        "TradeValue": value_number,
+        "Change": _plain_text(change),
+        "ChangeSign": _plain_text(change_sign),
+        "Date": trade_date,
+    }
+    return _normalize_official_row(canonical, market)
+
+
+def _fallback_dataset_quality(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    count = len(rows)
+    if count == 0:
+        return {
+            "count": 0,
+            "uniqueSymbols": 0,
+            "ohlcCoverage": 0.0,
+            "liquidityCoverage": 0.0,
+        }
+    unique_symbols = len({str(row.get("symbol")) for row in rows})
+    ohlc_count = sum(
+        1 for row in rows
+        if all(_safe_float(row.get(key)) > 0 for key in (
+            "openPrice", "highPrice", "lowPrice", "closePrice",
+        ))
+    )
+    liquidity_count = sum(
+        1 for row in rows
+        if _safe_float(row.get("tradeVolume")) > 0
+        and _safe_float(row.get("tradeValue")) > 0
+    )
+    return {
+        "count": count,
+        "uniqueSymbols": unique_symbols,
+        "ohlcCoverage": round(ohlc_count / count, 4),
+        "liquidityCoverage": round(liquidity_count / count, 4),
+    }
+
+
+async def _get_official_market_quotes_fallback(
+    market: str,
+    target_date: str,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """Fetch a specified trading date from a second free official endpoint."""
+    market = market.upper().strip()
+    normalized_target = _normalize_trade_date(target_date)
+    if not normalized_target:
+        raise ValueError("備援行情 target_date 格式不正確。")
+
+    if market == "TSE":
+        url = TWSE_DAILY_FALLBACK_URL.format(date=normalized_target.replace("-", ""))
+        source = "TWSE RWD MI_INDEX ALLBUT0999"
+        minimum_count = V7_MIN_TSE_COUNT
+    elif market == "OTC":
+        url = TPEX_DAILY_FALLBACK_URL.format(date=normalized_target.replace("-", "/"))
+        source = "TPEx afterTrading dailyQuotes"
+        minimum_count = V7_MIN_OTC_COUNT
+    else:
+        raise ValueError("market 僅支援 TSE 或 OTC。")
+
+    payload = await _official_http_json(
+        url,
+        cache_tag=f"fallback:{market}:{normalized_target}",
+        force_refresh=force_refresh,
+    )
+
+    if isinstance(payload, dict):
+        status = str(payload.get("stat") or payload.get("status") or "").strip().upper()
+        if status and status not in {"OK", "SUCCESS", "200"}:
+            raise RuntimeError(f"{market} 官方備援端點回傳狀態：{status}")
+
+    payload_dates = _payload_trade_dates(payload)
+    if normalized_target not in payload_dates:
+        raise RuntimeError(
+            f"{market} 官方備援資料日期驗證失敗；"
+            f"目標={normalized_target}，回傳日期={payload_dates or '無'}。"
+        )
+
+    table_records = _official_table_records(payload)
+    normalized_rows: list[dict[str, Any]] = []
+    seen_symbols: set[str] = set()
+    for record in table_records:
+        item = _fallback_record_to_official_row(record, market, normalized_target)
+        if item is None:
+            continue
+        symbol = str(item.get("symbol"))
+        if symbol in seen_symbols:
+            continue
+        seen_symbols.add(symbol)
+        normalized_rows.append(item)
+
+    quality = _fallback_dataset_quality(normalized_rows)
+    validation_errors: list[str] = []
+    if quality["count"] < minimum_count:
+        validation_errors.append(
+            f"普通股家數 {quality['count']} 低於門檻 {minimum_count}"
+        )
+    if quality["uniqueSymbols"] != quality["count"]:
+        validation_errors.append("股票代號有重複")
+    if quality["ohlcCoverage"] < 0.80:
+        validation_errors.append(
+            f"OHLC完整率僅 {quality['ohlcCoverage']:.1%}"
+        )
+    if quality["liquidityCoverage"] < 0.75:
+        validation_errors.append(
+            f"成交量／成交值完整率僅 {quality['liquidityCoverage']:.1%}"
+        )
+    if validation_errors:
+        raise RuntimeError(
+            f"{market} 官方備援資料未通過安全檢查：" + "；".join(validation_errors)
+        )
+
+    return {
+        "market": market,
+        "date": normalized_target,
+        "time": None,
+        "data": normalized_rows,
+        "source": source,
+        "fetchedAtTaipei": _taipei_now().isoformat(),
+        "freshness": "指定日期官方盤後行情備援資料。",
+        "fallback": True,
+        "fallbackTargetDate": normalized_target,
+        "validation": quality,
+    }
+
+
+async def _resolve_official_market_payloads(
+    requested_markets: list[str],
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """Resolve all requested markets to one latest date, using official fallbacks when needed."""
+    primary_payloads = await asyncio.gather(
+        *[
+            _get_official_market_quotes(market, force_refresh=force_refresh)
+            for market in requested_markets
+        ]
+    )
+    primary_by_market = {
+        market: payload for market, payload in zip(requested_markets, primary_payloads)
+    }
+    primary_dates = {
+        market: _normalize_trade_date(payload.get("date"))
+        for market, payload in primary_by_market.items()
+    }
+    reference_date = await _get_reference_market_date(force_refresh=force_refresh)
+    target_candidates = [value for value in primary_dates.values() if value]
+    if reference_date:
+        target_candidates.append(reference_date)
+    target_date = max(target_candidates) if target_candidates else None
+
+    final_by_market = dict(primary_by_market)
+    fallback_attempts: list[dict[str, Any]] = []
+    fallback_markets: list[str] = []
+
+    if target_date:
+        for market in requested_markets:
+            if primary_dates.get(market) == target_date:
+                continue
+            attempt = {
+                "market": market,
+                "primaryDate": primary_dates.get(market),
+                "targetDate": target_date,
+                "used": False,
+            }
+            try:
+                fallback_payload = await _get_official_market_quotes_fallback(
+                    market,
+                    target_date,
+                    force_refresh=force_refresh,
+                )
+                final_by_market[market] = fallback_payload
+                attempt.update({
+                    "used": True,
+                    "source": fallback_payload.get("source"),
+                    "date": fallback_payload.get("date"),
+                    "validation": fallback_payload.get("validation"),
+                })
+                fallback_markets.append(market)
+            except Exception as exc:
+                attempt["error"] = str(exc)
+            fallback_attempts.append(attempt)
+
+    return {
+        "primaryByMarket": primary_by_market,
+        "finalByMarket": final_by_market,
+        "primaryMarketDates": primary_dates,
+        "referenceDate": reference_date,
+        "targetDate": target_date,
+        "fallbackUsed": bool(fallback_markets),
+        "fallbackMarkets": fallback_markets,
+        "fallbackAttempts": fallback_attempts,
     }
 
 
@@ -1602,8 +1965,8 @@ def ping() -> dict:
     """檢查台股 MCP 伺服器是否正常運作。"""
     return {
         "ok": True,
-        "server": "Taiwan Stock MCP v7-free-official-same-day",
-        "version": "7.0.0-free",
+        "server": "Taiwan Stock MCP v7.1-free-official-fallback",
+        "version": "7.1.0-free",
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "tools": [
             "get_realtime_quote",
@@ -1925,16 +2288,14 @@ async def screen_market(
     force_refresh: bool = False,
 ) -> dict:
     """
-    V7 免費版全市場篩選：先使用證交所／櫃買中心「同一交易日」官方行情
-    掃描全部普通股，再對候選股使用 Fugle 免費歷史 K 線做技術分析。
+    V7.1 免費版全市場篩選：先使用證交所／櫃買中心最新 OpenAPI；
+    若市場日期不同或落後 Fugle 參考交易日，會自動查詢可指定日期的第二官方端點。
+    只有在上市、上櫃都通過日期、家數與欄位完整性檢查後才會產生排名。
 
     strategy：balanced、breakout、early_stage、trend、pullback。
     markets：BOTH、TSE、OTC。
     candidate_limit：深度技術分析檔數，免費版最多 55。
     include_chip=true：只對技術初評前 top_n 檔補法人與融資籌碼。
-
-    若上市、上櫃日期不同，或官方日期落後 Fugle 最新交易日，會拒絕排名，
-    避免把前一交易日漲幅誤當成當日資料。
     """
     strategy = strategy.lower().strip()
     markets = markets.upper().strip()
@@ -1952,22 +2313,23 @@ async def screen_market(
         raise ValueError("價格範圍設定不正確。")
 
     requested_markets = ["TSE", "OTC"] if markets == "BOTH" else [markets]
-    market_payloads = await asyncio.gather(
-        *[
-            _get_official_market_quotes(
-                market,
-                force_refresh=force_refresh,
-            )
-            for market in requested_markets
-        ]
+    resolution = await _resolve_official_market_payloads(
+        requested_markets,
+        force_refresh=force_refresh,
     )
+    primary_by_market = resolution["primaryByMarket"]
+    final_by_market = resolution["finalByMarket"]
+    primary_market_dates = resolution["primaryMarketDates"]
+    reference_date = resolution["referenceDate"]
 
     as_of: list[dict[str, Any]] = []
     market_dates: dict[str, str | None] = {}
     market_counts: dict[str, int] = {}
     full_universe: list[dict[str, Any]] = []
 
-    for market, payload in zip(requested_markets, market_payloads):
+    for market in requested_markets:
+        payload = final_by_market[market]
+        primary_payload = primary_by_market[market]
         market_date = _normalize_trade_date(payload.get("date"))
         market_dates[market] = market_date
         rows = [dict(row) for row in payload.get("data", [])]
@@ -1976,6 +2338,11 @@ async def screen_market(
             "market": market,
             "date": market_date,
             "source": payload.get("source"),
+            "primaryDate": _normalize_trade_date(primary_payload.get("date")),
+            "primarySource": primary_payload.get("source"),
+            "fallbackUsed": bool(payload.get("fallback")),
+            "fallbackTargetDate": payload.get("fallbackTargetDate"),
+            "validation": payload.get("validation"),
             "fetchedAtTaipei": payload.get("fetchedAtTaipei"),
         })
         full_universe.extend(rows)
@@ -1984,13 +2351,21 @@ async def screen_market(
     if len(distinct_dates) != 1 or any(value is None for value in market_dates.values()):
         return {
             "ok": False,
-            "serverVersion": "v7-free-official-same-day",
+            "serverVersion": "v7.1-free-official-fallback",
             "errorCode": "MARKET_DATE_MISMATCH",
-            "message": "上市與上櫃官方行情日期不同或缺漏，本次拒絕產生排名。",
+            "message": (
+                "主要官方行情日期不同，且免費官方備援仍無法讓所有市場對齊；"
+                "本次拒絕產生排名。"
+            ),
             "strategy": strategy,
             "markets": requested_markets,
+            "primaryMarketDates": primary_market_dates,
+            "finalMarketDates": market_dates,
+            "referenceDate": reference_date,
+            "fallbackUsed": resolution["fallbackUsed"],
+            "fallbackMarkets": resolution["fallbackMarkets"],
+            "fallbackAttempts": resolution["fallbackAttempts"],
             "asOf": as_of,
-            "marketDates": market_dates,
             "results": [],
             "errors": [],
             "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
@@ -1998,25 +2373,34 @@ async def screen_market(
 
     scoring_date = next(iter(distinct_dates))
     warnings: list[str] = []
-    reference_date = await _get_reference_market_date(force_refresh=force_refresh)
-    if reference_date and reference_date != scoring_date:
+    if reference_date and scoring_date < reference_date:
         return {
             "ok": False,
-            "serverVersion": "v7-free-official-same-day",
+            "serverVersion": "v7.1-free-official-fallback",
             "errorCode": "OFFICIAL_DATA_NOT_LATEST",
             "message": (
-                "官方全市場資料尚未更新到最新交易日，本次拒絕排名；"
+                "主要與備援官方資料都尚未更新到最新交易日，本次拒絕排名；"
                 f"官方={scoring_date}，Fugle參考={reference_date}。"
             ),
             "strategy": strategy,
             "markets": requested_markets,
             "scoringDate": scoring_date,
             "referenceDate": reference_date,
+            "primaryMarketDates": primary_market_dates,
+            "finalMarketDates": market_dates,
+            "fallbackUsed": resolution["fallbackUsed"],
+            "fallbackMarkets": resolution["fallbackMarkets"],
+            "fallbackAttempts": resolution["fallbackAttempts"],
             "asOf": as_of,
             "results": [],
             "errors": [],
             "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
         }
+    if reference_date and scoring_date > reference_date:
+        warnings.append(
+            f"官方市場日期 {scoring_date} 晚於Fugle參考日期 {reference_date}；"
+            "以已通過雙市場驗證的官方日期為準。"
+        )
     if not reference_date:
         warnings.append("無法取得Fugle參考交易日；僅以官方市場日期一致性判斷。")
 
@@ -2030,7 +2414,7 @@ async def screen_market(
     if len(full_universe) < minimum_count:
         return {
             "ok": False,
-            "serverVersion": "v7-free-official-same-day",
+            "serverVersion": "v7.1-free-official-fallback",
             "errorCode": "MARKET_UNIVERSE_INCOMPLETE",
             "message": (
                 f"官方普通股資料僅 {len(full_universe)} 檔，"
@@ -2040,6 +2424,11 @@ async def screen_market(
             "markets": requested_markets,
             "scoringDate": scoring_date,
             "referenceDate": reference_date,
+            "primaryMarketDates": primary_market_dates,
+            "finalMarketDates": market_dates,
+            "fallbackUsed": resolution["fallbackUsed"],
+            "fallbackMarkets": resolution["fallbackMarkets"],
+            "fallbackAttempts": resolution["fallbackAttempts"],
             "asOf": as_of,
             "marketCounts": market_counts,
             "results": [],
@@ -2135,17 +2524,22 @@ async def screen_market(
 
     return {
         "ok": True,
-        "serverVersion": "v7-free-official-same-day",
+        "serverVersion": "v7.1-free-official-fallback",
         "strategy": strategy,
         "markets": requested_markets,
         "scoringDate": scoring_date,
         "referenceDate": reference_date,
         "allUniverseUsingSameDate": True,
+        "primaryMarketDates": primary_market_dates,
+        "finalMarketDates": market_dates,
+        "fallbackUsed": resolution["fallbackUsed"],
+        "fallbackMarkets": resolution["fallbackMarkets"],
+        "fallbackAttempts": resolution["fallbackAttempts"],
         "asOf": as_of,
-        "marketDataMode": "official_same_day_full_market",
+        "marketDataMode": "official_same_day_full_market_with_fallback",
         "marketDataFreshness": (
-            "全市場初篩使用證交所／櫃買中心同一交易日官方行情；"
-            "並以Fugle參考股票日期確認是否為最新交易日。"
+            "先使用TWSE／TPEx最新OpenAPI；日期不同或落後時，"
+            "自動改查指定日期官方盤後端點，並驗證日期、家數、OHLC與成交資料。"
         ),
         "marketCounts": market_counts,
         "marketUniverseCount": len(full_universe),
@@ -2164,17 +2558,19 @@ async def screen_market(
         "forceRefresh": force_refresh,
         "warnings": warnings,
         "cacheNote": (
-            "官方行情、歷史K線及籌碼使用快取；force_refresh=true會略過快取。"
+            "主要官方行情、備援行情、歷史K線及籌碼使用快取；"
+            "force_refresh=true會略過快取。"
         ),
         "results": selected,
         "errors": errors[:15],
         "method": (
-            "同日官方全市場行情多通道初篩，候選股併入當日官方K棒後重算技術指標；"
-            "技術前N名再補法人與融資籌碼。"
+            "雙官方來源同日全市場行情多通道初篩，候選股併入當日官方K棒後"
+            "重算技術指標；技術前N名再補法人與融資籌碼。"
         ),
         "source": (
-            "TWSE OpenAPI + TPEx OpenAPI；候選股歷史K線使用Fugle "
-            "MarketData API v1.0；include_chip時另用FinMind API v4"
+            "TWSE STOCK_DAY_ALL / MI_INDEX + TPEx mainboard close / dailyQuotes；"
+            "候選股歷史K線使用Fugle MarketData API v1.0；"
+            "include_chip時另用FinMind API v4"
         ),
         "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
     }

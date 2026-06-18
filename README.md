@@ -1,48 +1,55 @@
-# 台股 MCP V7 免費版：官方同日全市場篩選
+# 台股 MCP V7.1：免費官方雙來源同日篩選
 
-版本：`Taiwan Stock MCP v7-free-official-same-day`（`7.0.0-free`）
+V7.1 保留 V7 的免費全市場掃描，並新增 TWSE／TPEx 第二官方盤後端點。
+主要 OpenAPI 日期不同或落後時，程式會自動嘗試指定日期備援，不需要任何新 API Key。
 
-這個版本不使用 Fugle 付費的全市場 Snapshot Quotes，適合 Fugle 免費基本方案與 Render 免費 Web Service。
+## 行情流程
 
-## V7 解決的問題
+1. 主要上市來源：TWSE OpenAPI `STOCK_DAY_ALL`
+2. 主要上櫃來源：TPEx OpenAPI `tpex_mainboard_daily_close_quotes`
+3. 若主要來源日期不同，或落後 Fugle 參考交易日：
+   - 上市備援：TWSE `MI_INDEX` 指定日期盤後行情
+   - 上櫃備援：TPEx `dailyQuotes` 指定日期盤後行情
+4. 備援資料必須通過：
+   - 回傳日期等於目標交易日
+   - 普通股家數高於安全門檻
+   - 股票代號不重複
+   - OHLC 完整率至少 80%
+   - 成交量／成交值完整率至少 75%
+5. 全市場日期一致後，才進行多通道初篩。
+6. 候選股以 Fugle 歷史 K 線做深度技術分析，並併入當日官方 K 棒。
+7. `include_chip=true` 時，只對技術前 `top_n` 檔補 FinMind 籌碼。
 
-V6 可能發生：上市資料仍是前一交易日、上櫃資料已更新到最新交易日，卻仍混合產生排名。這會讓前一日漲幅被誤認成當日漲幅，也可能漏掉當日才發動的股票。
+若主要與備援都無法對齊日期，仍會拒絕排名，不會混用不同交易日資料。
 
-V7 會：
+## 版本辨識
 
-1. 取得 TWSE 與 TPEx 官方全市場普通股日行情。
-2. 將民國日期統一轉為 ISO 日期（例如 `1150618` → `2026-06-18`）。
-3. 上市、上櫃日期不同時拒絕排名。
-4. 用 Fugle 2330 報價日期確認官方資料是否已更新到最新交易日。
-5. 全市場先使用同日行情做多通道初篩，而不是只按漲幅或成交值排序。
-6. 對 `candidate_limit` 檔（預設 40）呼叫 Fugle 免費歷史 K 線。
-7. 把官方當日 K 棒併入歷史資料後，重新計算均線、布林、量比與前高。
-8. 只對技術初評前 `top_n` 檔補法人與融資籌碼。
-9. 回傳 `scoringDate`、`referenceDate`、`allUniverseUsingSameDate` 與市場家數供驗證。
-
-## 免費版資料流程
+`ping` 應回傳：
 
 ```text
-TWSE + TPEx 官方同日全市場行情
-→ 全市場價格／成交值過濾
-→ 多通道候選池（預設 40 檔）
-→ Fugle 免費歷史 K 線
-→ 合併官方當日 K 棒並重算技術指標
-→ 前 10 檔補 FinMind 籌碼
-→ 輸出前 10 名
+Taiwan Stock MCP v7.1-free-official-fallback
+version=7.1.0-free
 ```
 
-## Render 必要環境變數
+成功篩選時新增：
 
-保留原本：
+- `primaryMarketDates`
+- `finalMarketDates`
+- `fallbackUsed`
+- `fallbackMarkets`
+- `fallbackAttempts`
+- `asOf[].primarySource`
+- `asOf[].source`
+- `asOf[].validation`
 
-- `FUGLE_API_KEY`
-- `FINMIND_TOKEN`
-- `REDIS_URL`（沒有 Redis 可以不設）
+## Render 環境變數
 
-新增／確認：
+沿用 V7 原設定即可，不需新增官方 API Key：
 
 ```text
+FUGLE_API_KEY
+FINMIND_TOKEN
+REDIS_URL（如有）
 PYTHON_VERSION=3.12.13
 V7_HISTORY_CALLS_PER_MINUTE=55
 V7_HISTORY_CONCURRENCY=3
@@ -53,18 +60,17 @@ V7_MIN_OTC_COUNT=750
 V7_REFERENCE_SYMBOL=2330
 ```
 
-## Render 指令
+## 更新既有 V7
 
-沿用原本 V6：
+1. 解壓縮 ZIP。
+2. 到目前 Render 服務所使用的 GitHub 分支 `v7-free-official-same-day`。
+3. 上傳並覆蓋根目錄檔案。
+4. Commit changes。
+5. Render 通常會自動重新部署；沒有自動部署時手動執行 Deploy latest commit。
+6. MCP URL 不變，ChatGPT App 不必重建。
+7. 先執行 `PING`，確認版本為 `7.1.0-free`。
 
-```text
-Build Command: pip install -r requirements.txt
-Start Command: python server.py
-```
-
-若你目前 Render 的 Start Command 不同，請以原本能運作的 V6 設定為準。
-
-## 使用方式
+## 測試指令
 
 ```text
 使用 screen_market，
@@ -73,57 +79,24 @@ markets=BOTH，
 top_n=10，
 candidate_limit=40，
 include_chip=true，
-force_refresh=false
-```
-
-第一次部署後建議先用：
-
-```text
 force_refresh=true
 ```
 
-## 成功回傳應包含
-
-```json
-{
-  "ok": true,
-  "serverVersion": "v7-free-official-same-day",
-  "scoringDate": "2026-06-18",
-  "referenceDate": "2026-06-18",
-  "allUniverseUsingSameDate": true,
-  "marketUniverseCount": 1900,
-  "technicalCandidateLimit": 40,
-  "deepAnalyzedCount": 40,
-  "chipAnalyzedCount": 10
-}
-```
-
-## 正常的拒絕情況
-
-### 上市與上櫃日期不同
+若備援成功，結果應顯示：
 
 ```text
-errorCode=MARKET_DATE_MISMATCH
+ok=true
+fallbackUsed=true
+fallbackMarkets=["TSE"] 或 ["OTC"]
+primaryMarketDates 與 finalMarketDates 不同
+allUniverseUsingSameDate=true
 ```
 
-### 官方資料尚未追上 Fugle 最新交易日
+若備援端點也尚未發布完整資料，會保留 `MARKET_DATE_MISMATCH` 或
+`OFFICIAL_DATA_NOT_LATEST` 防呆。
 
-```text
-errorCode=OFFICIAL_DATA_NOT_LATEST
-```
-
-### 官方普通股家數異常過少
-
-```text
-errorCode=MARKET_UNIVERSE_INCOMPLETE
-```
-
-這些不是程式故障，而是 V7 的資料防呆。等官方資料更新後再執行即可。
-
-## 測試
+## 離線測試
 
 ```bash
-python test_v7_free.py
+python test_v71_free.py
 ```
-
-應看到 5 個 `PASS`。
