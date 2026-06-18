@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 .venv/
+server.py.v6-backup

@@ -27,7 +27,7 @@ TPEX_DAILY_CLOSE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_
 
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
-CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v6")
+CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v7-free")
 CACHE_MAX_ITEMS = int(os.environ.get("CACHE_MAX_ITEMS", "2500"))
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 
@@ -50,6 +50,28 @@ CACHE_STATS: dict[str, int] = {
     "officialMarketUpstreamRequests": 0,
     "upstreamErrors": 0,
 }
+
+
+# V7-free: stay below Fugle Basic historical-data limit and keep Render Free stable.
+V7_HISTORY_CALLS_PER_MINUTE = min(
+    55,
+    max(1, int(os.environ.get("V7_HISTORY_CALLS_PER_MINUTE", "55"))),
+)
+V7_HISTORY_CONCURRENCY = max(
+    1,
+    min(6, int(os.environ.get("V7_HISTORY_CONCURRENCY", "3"))),
+)
+V7_CHIP_CONCURRENCY = max(
+    1,
+    min(5, int(os.environ.get("V7_CHIP_CONCURRENCY", "2"))),
+)
+V7_MIN_UNIVERSE_COUNT = int(os.environ.get("V7_MIN_UNIVERSE_COUNT", "1800"))
+V7_MIN_TSE_COUNT = int(os.environ.get("V7_MIN_TSE_COUNT", "950"))
+V7_MIN_OTC_COUNT = int(os.environ.get("V7_MIN_OTC_COUNT", "750"))
+V7_REFERENCE_SYMBOL = os.environ.get("V7_REFERENCE_SYMBOL", "2330").strip() or "2330"
+
+_history_rate_lock = asyncio.Lock()
+_history_request_times: list[float] = []
 
 
 def _json_dumps(value: Any) -> str:
@@ -90,14 +112,24 @@ def _snapshot_ttl() -> int:
 
 
 def _official_market_ttl() -> int:
-    # 公開市場端點不是 Fugle 即時快照。盤中每 15 分鐘重抓一次；
-    # 盤後資料固定，快取至下一個交易日早上。
-    return 15 * 60 if _is_tw_market_hours() else _seconds_until_next_weekday_open()
+    # 盤中每 15 分鐘重抓。收盤後官方資料可能分批更新，18:30 前維持短 TTL；
+    # 避免 13:45 剛抓到前一日資料後，被快取到下一個交易日。
+    now = _taipei_now()
+    if _is_tw_market_hours(now):
+        return 15 * 60
+    if now.weekday() < 5 and dt_time(13, 45) < now.time() < dt_time(18, 30):
+        return 5 * 60
+    return _seconds_until_next_weekday_open(now)
 
 
 def _historical_ttl() -> int:
-    # Daily candle changes intraday, but is stable after the close.
-    return 300 if _is_tw_market_hours() else _seconds_until_next_weekday_open()
+    # Fugle 日 K 在收盤後仍可能更新；18:30 前保持短 TTL。
+    now = _taipei_now()
+    if _is_tw_market_hours(now):
+        return 300
+    if now.weekday() < 5 and dt_time(13, 45) < now.time() < dt_time(18, 30):
+        return 5 * 60
+    return _seconds_until_next_weekday_open(now)
 
 
 def _finmind_ttl(dataset: str) -> int:
@@ -373,7 +405,7 @@ def _as_int(value: float) -> int:
 def _days_range(days: int, minimum: int = 5, maximum: int = 365) -> tuple[str, str]:
     if not minimum <= days <= maximum:
         raise ValueError(f"days 請填 {minimum} 到 {maximum}。")
-    end = date.today()
+    end = _taipei_now().date()
     start = end - timedelta(days=days)
     return start.isoformat(), end.isoformat()
 
@@ -409,13 +441,18 @@ def _institutional_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _get_institutional_data(symbol: str, days: int) -> dict[str, Any]:
+async def _get_institutional_data(
+    symbol: str,
+    days: int,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
     start, end = _days_range(days, 5, 365)
     rows = await _finmind_get(
         "TaiwanStockInstitutionalInvestorsBuySellWide",
         symbol,
         start,
         end,
+        force_refresh=force_refresh,
     )
     parsed = [_institutional_row(row) for row in rows]
 
@@ -456,13 +493,18 @@ async def _get_institutional_data(symbol: str, days: int) -> dict[str, Any]:
     }
 
 
-async def _get_margin_data(symbol: str, days: int) -> dict[str, Any]:
+async def _get_margin_data(
+    symbol: str,
+    days: int,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
     start, end = _days_range(days, 5, 365)
     rows = await _finmind_get(
         "TaiwanStockMarginPurchaseShortSale",
         symbol,
         start,
         end,
+        force_refresh=force_refresh,
     )
     if not rows:
         raise RuntimeError("查無融資融券資料，可能尚未更新或股票代號不正確。")
@@ -678,6 +720,194 @@ def _clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
 
 
+
+def _normalize_trade_date(value: Any) -> str | None:
+    """Normalize ISO, YYYYMMDD, and ROC YYYMMDD dates to YYYY-MM-DD."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(TAIPEI_TZ).date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    iso_match = re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", raw)
+    if iso_match:
+        year, month, day = map(int, iso_match.groups())
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError:
+            return None
+
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 8:
+        try:
+            return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8])).isoformat()
+        except ValueError:
+            return None
+    if len(digits) == 7:
+        try:
+            return date(
+                int(digits[:3]) + 1911,
+                int(digits[3:5]),
+                int(digits[5:7]),
+            ).isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def _quote_reference_date(quote: dict[str, Any]) -> str | None:
+    for candidate in (
+        quote.get("date"),
+        (quote.get("lastTrade") or {}).get("date")
+        if isinstance(quote.get("lastTrade"), dict)
+        else None,
+    ):
+        normalized = _normalize_trade_date(candidate)
+        if normalized:
+            return normalized
+
+    updated = quote.get("lastUpdated")
+    try:
+        if updated is not None:
+            epoch = float(updated)
+            if epoch > 10_000_000_000:
+                epoch /= 1000.0
+            return datetime.fromtimestamp(epoch, TAIPEI_TZ).date().isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        pass
+    return None
+
+
+def _close_location(row: dict[str, Any]) -> float:
+    high = _safe_float(row.get("highPrice"))
+    low = _safe_float(row.get("lowPrice"))
+    close = _safe_float(row.get("closePrice"))
+    if high <= low:
+        return 0.5
+    return _clamp((close - low) / (high - low), 0.0, 1.0)
+
+
+def _quick_prefilter_score(row: dict[str, Any], strategy: str) -> float:
+    value = _safe_float(row.get("tradeValue"))
+    change = _safe_float(row.get("changePercent"))
+    close_loc = _close_location(row)
+    liquidity = math.log10(max(value, 1))
+    score = liquidity + close_loc * 2.5
+
+    if strategy == "pullback":
+        if -4.0 <= change <= 1.5:
+            score += 4.0 - abs(change + 0.5) * 0.4
+        elif change > 6.5:
+            score -= 5.0
+    elif strategy == "breakout":
+        score += _clamp(change, 0, 8) * 1.1
+        if change >= 9:
+            score -= 8
+    else:
+        if 0.8 <= change <= 6.5:
+            score += 5.0 + change * 0.5
+        elif -0.8 <= change < 0.8:
+            score += 2.0
+        elif change >= 9:
+            score -= 7.0
+        elif change <= -5:
+            score -= 5.0
+    return score
+
+
+def _main_uptrend_stage(score: float) -> tuple[int, str]:
+    normalized = int(round(_clamp(score, 0.0, 100.0)))
+    if normalized >= 78:
+        stage = "主升段啟動候選"
+    elif normalized >= 62:
+        stage = "轉強觀察"
+    else:
+        stage = "尚未確認"
+    return normalized, stage
+
+
+def _build_multilane_candidates(
+    rows: list[dict[str, Any]],
+    strategy: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Create a diversified same-day pool instead of one momentum-only ranking."""
+    selected: dict[str, dict[str, Any]] = {}
+    lane_size = max(12, math.ceil(limit * 0.55))
+
+    def add(items: list[dict[str, Any]], target_size: int) -> None:
+        for item in items:
+            selected[str(item.get("symbol"))] = item
+            if len(selected) >= target_size:
+                break
+
+    if strategy == "pullback":
+        lane1 = [row for row in rows if -4.0 <= _safe_float(row.get("changePercent")) <= 1.5]
+    elif strategy == "breakout":
+        lane1 = [row for row in rows if 1.5 <= _safe_float(row.get("changePercent")) <= 8.5]
+    else:
+        lane1 = [row for row in rows if 0.8 <= _safe_float(row.get("changePercent")) <= 7.5]
+    lane1.sort(
+        key=lambda row: (
+            _quick_prefilter_score(row, strategy),
+            _safe_float(row.get("tradeValue")),
+        ),
+        reverse=True,
+    )
+    add(lane1, lane_size)
+
+    strong_close = [
+        row for row in rows
+        if -1.5 <= _safe_float(row.get("changePercent")) <= 6.5
+        and _close_location(row) >= 0.72
+    ]
+    strong_close.sort(
+        key=lambda row: (_close_location(row), _safe_float(row.get("tradeValue"))),
+        reverse=True,
+    )
+    add(strong_close, lane_size * 2)
+
+    liquid = sorted(
+        rows,
+        key=lambda row: _safe_float(row.get("tradeValue")),
+        reverse=True,
+    )
+    add(liquid, lane_size * 3)
+
+    quiet_turn = [
+        row for row in rows
+        if -0.8 <= _safe_float(row.get("changePercent")) <= 3.0
+        and _close_location(row) >= 0.62
+    ]
+    quiet_turn.sort(
+        key=lambda row: (_close_location(row), _safe_float(row.get("tradeValue"))),
+        reverse=True,
+    )
+    add(quiet_turn, lane_size * 4)
+
+    ranked = sorted(
+        selected.values(),
+        key=lambda row: _quick_prefilter_score(row, strategy),
+        reverse=True,
+    )
+
+    if len(ranked) < limit:
+        present = {str(row.get("symbol")) for row in ranked}
+        remainder = [row for row in rows if str(row.get("symbol")) not in present]
+        remainder.sort(
+            key=lambda row: _quick_prefilter_score(row, strategy),
+            reverse=True,
+        )
+        ranked.extend(remainder[: limit - len(ranked)])
+
+    return ranked[:limit]
+
+
 async def _get_intraday_quote(symbol: str, force_refresh: bool = False) -> dict[str, Any]:
     symbol = _validate_symbol(symbol)
     return await _cached_call(
@@ -700,7 +930,7 @@ async def _official_http_json(
         CACHE_STATS["officialMarketUpstreamRequests"] += 1
         headers = {
             "Accept": "application/json",
-            "User-Agent": "TaiwanStockMCP/6.0 (+public-market-screener)",
+            "User-Agent": "TaiwanStockMCP/7.0-free (+official-same-day-screener)",
         }
         async with httpx.AsyncClient(timeout=35.0, follow_redirects=True) as client:
             response = await client.get(url, headers=headers)
@@ -913,19 +1143,39 @@ async def _get_official_market_quotes(
         )
 
     report_dates = sorted({
-        str(item.get("date"))
+        normalized_date
         for item in normalized
-        if item.get("date")
+        if (normalized_date := _normalize_trade_date(item.get("date")))
     })
+    if len(report_dates) > 1:
+        raise RuntimeError(
+            f"{market} 官方市場資料包含多個交易日期：{report_dates[-5:]}"
+        )
     return {
         "market": market,
-        "date": report_dates[-1] if report_dates else None,
+        "date": report_dates[0] if report_dates else None,
         "time": None,
         "data": normalized,
         "source": source,
         "fetchedAtTaipei": _taipei_now().isoformat(),
         "freshness": "官方端點最新公布的全市場日行情，不是盤中逐筆即時快照。",
     }
+
+
+async def _acquire_history_rate_slot() -> None:
+    """Limit only actual Fugle historical upstream calls, not cache hits."""
+    while True:
+        async with _history_rate_lock:
+            now = time.monotonic()
+            cutoff = now - 60.0
+            _history_request_times[:] = [
+                stamp for stamp in _history_request_times if stamp > cutoff
+            ]
+            if len(_history_request_times) < V7_HISTORY_CALLS_PER_MINUTE:
+                _history_request_times.append(now)
+                return
+            delay = _history_request_times[0] + 60.0 - now
+        await asyncio.sleep(max(delay, 0.05))
 
 
 async def _get_historical_candles_raw(
@@ -937,7 +1187,7 @@ async def _get_historical_candles_raw(
 ) -> dict[str, Any]:
     symbol = _validate_symbol(symbol)
     timeframe = timeframe.upper().strip()
-    end = date.today()
+    end = _taipei_now().date()
     start = end - timedelta(days=days)
     params = {
         "from": start.isoformat(),
@@ -947,11 +1197,15 @@ async def _get_historical_candles_raw(
         "fields": "open,high,low,close,volume,turnover,change",
         "sort": "asc",
     }
+    async def fetch_history() -> dict[str, Any]:
+        await _acquire_history_rate_slot()
+        return await _fugle_get(f"historical/candles/{symbol}", params=params)
+
     return await _cached_call(
         "fugle:historical",
         {"symbol": symbol, **params},
         _historical_ttl(),
-        lambda: _fugle_get(f"historical/candles/{symbol}", params=params),
+        fetch_history,
         force_refresh=force_refresh,
     )
 
@@ -968,6 +1222,69 @@ async def _get_daily_candles_raw(
         adjusted=True,
         force_refresh=force_refresh,
     )
+
+
+
+async def _get_reference_market_date(force_refresh: bool = False) -> str | None:
+    """Use one free Fugle intraday quote to verify the official market date is latest."""
+    try:
+        quote = await _get_intraday_quote(
+            V7_REFERENCE_SYMBOL,
+            force_refresh=force_refresh,
+        )
+        reference = _quote_reference_date(quote)
+        if reference:
+            return reference
+    except Exception:
+        pass
+
+    # Fallback to a short historical query if the quote did not contain a usable date.
+    try:
+        raw = await _get_daily_candles_raw(
+            V7_REFERENCE_SYMBOL,
+            days=30,
+            force_refresh=force_refresh,
+        )
+        candles = raw.get("data") or []
+        if candles:
+            return _normalize_trade_date(candles[-1].get("date"))
+    except Exception:
+        pass
+    return None
+
+
+def _upsert_official_candle(
+    candles: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+    scoring_date: str,
+) -> list[dict[str, Any]]:
+    close = _safe_float(snapshot.get("closePrice"))
+    if close <= 0:
+        raise RuntimeError(f"{snapshot.get('symbol')} 官方收盤價無效。")
+
+    today = {
+        "date": scoring_date,
+        "open": _safe_float(snapshot.get("openPrice"), close) or close,
+        "high": _safe_float(snapshot.get("highPrice"), close) or close,
+        "low": _safe_float(snapshot.get("lowPrice"), close) or close,
+        "close": close,
+        "volume": int(_safe_float(snapshot.get("tradeVolume"))),
+        "turnover": int(_safe_float(snapshot.get("tradeValue"))),
+        "change": _safe_float(snapshot.get("change")),
+    }
+
+    merged = [
+        dict(row)
+        for row in candles
+        if _normalize_trade_date(row.get("date")) != scoring_date
+    ]
+    for row in merged:
+        normalized = _normalize_trade_date(row.get("date"))
+        if normalized:
+            row["date"] = normalized
+    merged.append(today)
+    merged.sort(key=lambda row: str(row.get("date") or ""))
+    return merged
 
 
 def _technical_features(symbol: str, candles: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1187,11 +1504,15 @@ def _score_candidate(
     return round(score, 2), reasons[:6], risks[:5]
 
 
-async def _safe_chip_for_ranking(symbol: str, days: int = 45) -> dict[str, Any]:
+async def _safe_chip_for_ranking(
+    symbol: str,
+    days: int = 45,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
     try:
         institutional, margin = await asyncio.gather(
-            _get_institutional_data(symbol, days),
-            _get_margin_data(symbol, days),
+            _get_institutional_data(symbol, days, force_refresh=force_refresh),
+            _get_margin_data(symbol, days, force_refresh=force_refresh),
         )
         five = institutional.get("cumulative", {}).get("last5TradingDays", {})
         foreign5 = int(five.get("foreignNetShares", 0))
@@ -1233,23 +1554,43 @@ async def _safe_chip_for_ranking(symbol: str, days: int = 45) -> dict[str, Any]:
 async def _analyze_candidate(
     snapshot: dict[str, Any],
     strategy: str,
+    scoring_date: str,
     semaphore: asyncio.Semaphore,
     force_refresh: bool = False,
 ) -> dict[str, Any]:
     symbol = _validate_symbol(str(snapshot.get("symbol", "")))
     async with semaphore:
-        raw = await _get_daily_candles_raw(symbol, 180, force_refresh=force_refresh)
-    tech = _technical_features(symbol, raw.get("data", []))
+        raw = await _get_daily_candles_raw(
+            symbol,
+            180,
+            force_refresh=force_refresh,
+        )
+    candles = _upsert_official_candle(
+        raw.get("data", []),
+        snapshot,
+        scoring_date,
+    )
+    tech = _technical_features(symbol, candles)
+    latest_date = _normalize_trade_date(tech.get("latestDate"))
+    if latest_date != scoring_date:
+        raise RuntimeError(
+            f"技術資料日期不一致：{latest_date} != {scoring_date}"
+        )
+    tech["latestDate"] = scoring_date
     score, reasons, risks = _score_candidate(snapshot, tech, strategy)
+    main_uptrend_score, stage = _main_uptrend_stage(score)
     return {
         "symbol": symbol,
         "name": snapshot.get("name"),
         "market": snapshot.get("market"),
+        "quoteDate": scoring_date,
         "closePrice": snapshot.get("closePrice"),
         "changePercent": snapshot.get("changePercent"),
         "tradeVolume": snapshot.get("tradeVolume"),
         "tradeValue": snapshot.get("tradeValue"),
         "score": score,
+        "mainUptrendScore": main_uptrend_score,
+        "stage": stage,
         "reasons": reasons,
         "risks": risks,
         "technical": tech,
@@ -1261,7 +1602,8 @@ def ping() -> dict:
     """檢查台股 MCP 伺服器是否正常運作。"""
     return {
         "ok": True,
-        "server": "Taiwan Stock MCP v6-official-market",
+        "server": "Taiwan Stock MCP v7-free-official-same-day",
+        "version": "7.0.0-free",
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "tools": [
             "get_realtime_quote",
@@ -1583,15 +1925,16 @@ async def screen_market(
     force_refresh: bool = False,
 ) -> dict:
     """
-    掃描上市與上櫃普通股。全市場初篩使用證交所／櫃買中心最新公開日行情，
-    不需要 Fugle Snapshot Quotes 付費權限；候選股深度技術分析仍使用
-    Fugle 個股歷史 K 線。
+    V7 免費版全市場篩選：先使用證交所／櫃買中心「同一交易日」官方行情
+    掃描全部普通股，再對候選股使用 Fugle 免費歷史 K 線做技術分析。
 
     strategy：balanced、breakout、early_stage、trend、pullback。
     markets：BOTH、TSE、OTC。
-    include_chip=true 時，只為最後入選股補上法人與融資籌碼評分。
+    candidate_limit：深度技術分析檔數，免費版最多 55。
+    include_chip=true：只對技術初評前 top_n 檔補法人與融資籌碼。
 
-    注意：官方全市場資料不是盤中逐筆即時快照，收盤後使用最完整。
+    若上市、上櫃日期不同，或官方日期落後 Fugle 最新交易日，會拒絕排名，
+    避免把前一交易日漲幅誤當成當日資料。
     """
     strategy = strategy.lower().strip()
     markets = markets.upper().strip()
@@ -1602,7 +1945,7 @@ async def screen_market(
     if not 1 <= top_n <= 20:
         raise ValueError("top_n 請填 1 到 20。")
     if not top_n <= candidate_limit <= 55:
-        raise ValueError("candidate_limit 必須大於等於 top_n，且最多 55。")
+        raise ValueError("candidate_limit 必須大於等於 top_n，且免費版最多 55。")
     if min_trade_value < 0:
         raise ValueError("min_trade_value 不可為負數。")
     if min_price <= 0 or max_price <= min_price:
@@ -1619,45 +1962,116 @@ async def screen_market(
         ]
     )
 
-    universe: list[dict[str, Any]] = []
     as_of: list[dict[str, Any]] = []
+    market_dates: dict[str, str | None] = {}
+    market_counts: dict[str, int] = {}
+    full_universe: list[dict[str, Any]] = []
+
     for market, payload in zip(requested_markets, market_payloads):
+        market_date = _normalize_trade_date(payload.get("date"))
+        market_dates[market] = market_date
+        rows = [dict(row) for row in payload.get("data", [])]
+        market_counts[market] = len(rows)
         as_of.append({
             "market": market,
-            "date": payload.get("date"),
+            "date": market_date,
             "source": payload.get("source"),
             "fetchedAtTaipei": payload.get("fetchedAtTaipei"),
         })
-        for row in payload.get("data", []):
-            close = _safe_float(row.get("closePrice"))
-            trade_value = _safe_float(row.get("tradeValue"))
-            if not min_price <= close <= max_price:
-                continue
-            if trade_value < min_trade_value:
-                continue
-            universe.append(dict(row))
+        full_universe.extend(rows)
 
-    def prefilter_score(row: dict[str, Any]) -> float:
-        value = _safe_float(row.get("tradeValue"))
-        change = _safe_float(row.get("changePercent"))
-        liquidity = math.log10(max(value, 1))
-        momentum = _clamp(change, -3, 7) * 0.7
-        overheat_penalty = max(change - 8.0, 0) * 2.0
-        if strategy == "pullback":
-            momentum = -abs(change) * 0.25
-        elif strategy == "breakout":
-            momentum = _clamp(change, 0, 8) * 1.2
-        return liquidity + momentum - overheat_penalty
+    distinct_dates = {value for value in market_dates.values() if value}
+    if len(distinct_dates) != 1 or any(value is None for value in market_dates.values()):
+        return {
+            "ok": False,
+            "serverVersion": "v7-free-official-same-day",
+            "errorCode": "MARKET_DATE_MISMATCH",
+            "message": "上市與上櫃官方行情日期不同或缺漏，本次拒絕產生排名。",
+            "strategy": strategy,
+            "markets": requested_markets,
+            "asOf": as_of,
+            "marketDates": market_dates,
+            "results": [],
+            "errors": [],
+            "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
+        }
 
-    universe.sort(key=prefilter_score, reverse=True)
-    candidates = universe[:candidate_limit]
+    scoring_date = next(iter(distinct_dates))
+    warnings: list[str] = []
+    reference_date = await _get_reference_market_date(force_refresh=force_refresh)
+    if reference_date and reference_date != scoring_date:
+        return {
+            "ok": False,
+            "serverVersion": "v7-free-official-same-day",
+            "errorCode": "OFFICIAL_DATA_NOT_LATEST",
+            "message": (
+                "官方全市場資料尚未更新到最新交易日，本次拒絕排名；"
+                f"官方={scoring_date}，Fugle參考={reference_date}。"
+            ),
+            "strategy": strategy,
+            "markets": requested_markets,
+            "scoringDate": scoring_date,
+            "referenceDate": reference_date,
+            "asOf": as_of,
+            "results": [],
+            "errors": [],
+            "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
+        }
+    if not reference_date:
+        warnings.append("無法取得Fugle參考交易日；僅以官方市場日期一致性判斷。")
 
-    semaphore = asyncio.Semaphore(6)
+    if markets == "BOTH":
+        minimum_count = V7_MIN_UNIVERSE_COUNT
+    elif markets == "TSE":
+        minimum_count = V7_MIN_TSE_COUNT
+    else:
+        minimum_count = V7_MIN_OTC_COUNT
+
+    if len(full_universe) < minimum_count:
+        return {
+            "ok": False,
+            "serverVersion": "v7-free-official-same-day",
+            "errorCode": "MARKET_UNIVERSE_INCOMPLETE",
+            "message": (
+                f"官方普通股資料僅 {len(full_universe)} 檔，"
+                f"低於安全門檻 {minimum_count} 檔，本次拒絕排名。"
+            ),
+            "strategy": strategy,
+            "markets": requested_markets,
+            "scoringDate": scoring_date,
+            "referenceDate": reference_date,
+            "asOf": as_of,
+            "marketCounts": market_counts,
+            "results": [],
+            "errors": [],
+            "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
+        }
+
+    eligible: list[dict[str, Any]] = []
+    for row in full_universe:
+        close = _safe_float(row.get("closePrice"))
+        trade_value = _safe_float(row.get("tradeValue"))
+        if not min_price <= close <= max_price:
+            continue
+        if trade_value < min_trade_value:
+            continue
+        normalized = dict(row)
+        normalized["date"] = scoring_date
+        eligible.append(normalized)
+
+    candidates = _build_multilane_candidates(
+        eligible,
+        strategy,
+        candidate_limit,
+    )
+
+    semaphore = asyncio.Semaphore(V7_HISTORY_CONCURRENCY)
     results = await asyncio.gather(
         *[
             _analyze_candidate(
                 row,
                 strategy,
+                scoring_date,
                 semaphore,
                 force_refresh=force_refresh,
             )
@@ -1684,15 +2098,26 @@ async def screen_market(
     selected = analyzed[:top_n]
 
     if include_chip and selected:
-        chip_results = await asyncio.gather(
-            *[_safe_chip_for_ranking(item["symbol"], 45) for item in selected]
-        )
+        chip_semaphore = asyncio.Semaphore(V7_CHIP_CONCURRENCY)
+
+        async def load_chip(item: dict[str, Any]) -> dict[str, Any]:
+            async with chip_semaphore:
+                return await _safe_chip_for_ranking(
+                    item["symbol"],
+                    45,
+                    force_refresh=force_refresh,
+                )
+
+        chip_results = await asyncio.gather(*[load_chip(item) for item in selected])
         for item, chip in zip(selected, chip_results):
             item["chip"] = chip
             item["score"] = round(
                 _safe_float(item.get("score"))
                 + _safe_float(chip.get("scoreAdjustment")),
                 2,
+            )
+            item["mainUptrendScore"], item["stage"] = _main_uptrend_stage(
+                _safe_float(item.get("score"))
             )
             item["reasons"] = (
                 item.get("reasons", []) + chip.get("reasons", [])
@@ -1709,16 +2134,26 @@ async def screen_market(
         item["rank"] = rank
 
     return {
+        "ok": True,
+        "serverVersion": "v7-free-official-same-day",
         "strategy": strategy,
         "markets": requested_markets,
+        "scoringDate": scoring_date,
+        "referenceDate": reference_date,
+        "allUniverseUsingSameDate": True,
         "asOf": as_of,
-        "marketDataMode": "official_latest_daily_market",
+        "marketDataMode": "official_same_day_full_market",
         "marketDataFreshness": (
-            "全市場初篩依證交所／櫃買中心端點最新公布的日行情；"
-            "不是 Fugle 盤中 Snapshot。收盤後執行最完整。"
+            "全市場初篩使用證交所／櫃買中心同一交易日官方行情；"
+            "並以Fugle參考股票日期確認是否為最新交易日。"
         ),
-        "snapshotUniverseCount": len(universe),
+        "marketCounts": market_counts,
+        "marketUniverseCount": len(full_universe),
+        "eligibleUniverseCount": len(eligible),
+        "snapshotUniverseCount": len(eligible),
+        "technicalCandidateLimit": candidate_limit,
         "deepAnalyzedCount": len(analyzed),
+        "chipAnalyzedCount": len(selected) if include_chip else 0,
         "candidateLimit": candidate_limit,
         "filters": {
             "minTradeValue": min_trade_value,
@@ -1727,19 +2162,19 @@ async def screen_market(
         },
         "includeChip": include_chip,
         "forceRefresh": force_refresh,
+        "warnings": warnings,
         "cacheNote": (
-            "官方市場行情、歷史 K 線與籌碼依 TTL 使用快取；"
-            "force_refresh=true 可略過快取。"
+            "官方行情、歷史K線及籌碼使用快取；force_refresh=true會略過快取。"
         ),
         "results": selected,
         "errors": errors[:15],
         "method": (
-            "證交所／櫃買中心最新公開日行情預篩，"
-            "再對候選股計算 180 日技術指標；不是報酬保證。"
+            "同日官方全市場行情多通道初篩，候選股併入當日官方K棒後重算技術指標；"
+            "技術前N名再補法人與融資籌碼。"
         ),
         "source": (
-            "TWSE OpenAPI + TPEx OpenAPI；候選股歷史 K 線使用 "
-            "Fugle MarketData API v1.0；include_chip 時另用 FinMind API v4"
+            "TWSE OpenAPI + TPEx OpenAPI；候選股歷史K線使用Fugle "
+            "MarketData API v1.0；include_chip時另用FinMind API v4"
         ),
         "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
     }
@@ -1935,7 +2370,8 @@ async def get_cache_status() -> dict:
             "officialMarketDuringMarket": 900,
             "historicalDuringMarket": 300,
             "afterCloseQuoteMax": 3600,
-            "afterCloseOfficialMarketAndHistorical": "until next weekday 08:30 Asia/Taipei",
+            "postCloseUpdateWindowOfficialAndHistorical": 300,
+            "after1830OfficialMarketAndHistorical": "until next weekday 08:30 Asia/Taipei",
             "finmindUpdateWindow": 1200,
             "finmindDaytime": 7200,
             "finmindNight": 36000,
