@@ -27,7 +27,7 @@ TPEX_DAILY_CLOSE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_
 
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
-CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v9")
+CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v8")
 CACHE_MAX_ITEMS = int(os.environ.get("CACHE_MAX_ITEMS", "2500"))
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 
@@ -1261,8 +1261,8 @@ def ping() -> dict:
     """檢查台股 MCP 伺服器是否正常運作。"""
     return {
         "ok": True,
-        "server": "Taiwan Stock MCP v9-monitor-alerts",
-        "version": "9.0.0-monitor",
+        "server": "Taiwan Stock MCP v8-free-score-tracker",
+        "version": "8.0.0-free",
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "tools": [
             "get_realtime_quote",
@@ -2493,7 +2493,7 @@ async def screen_market_v2(
         item["rank"] = rank
     base["results"] = enhanced[:top_n]
     base["v8"] = {
-        "version": "9.0.0-monitor",
+        "version": "8.0.0-free",
         "includeTheme": include_theme,
         "includeRisk": include_risk,
         "recordResult": record_result,
@@ -2593,150 +2593,99 @@ async def get_signal_performance(signal_id: str) -> dict:
     return {"available": False, "signalId": signal_id, "message": "找不到此 signal_id。"}
 
 
+# === V9 Dynamic Monitor Config Tools ===
+# 這段工具讓 ChatGPT 可以直接更新 Background Worker 的動態監控設定。
+# 需搭配 monitor_config_store.py，並且 Web Service / Background Worker 都設定同一組 REDIS_URL。
+
 @mcp.tool()
-async def send_test_notification(message: str = "") -> dict:
-    """V9：傳送一則 Telegram 測試通知。需要先設定 TELEGRAM_BOT_TOKEN 與 TELEGRAM_CHAT_ID。"""
-    from notifications import build_test_message, send_telegram_message
-    text = message.strip() if isinstance(message, str) and message.strip() else build_test_message()
-    data = await send_telegram_message(text)
+async def get_dynamic_monitor_config() -> dict:
+    """V9：查看 Redis 動態監控設定。"""
+    from monitor_config_store import get_effective_config, redis_configured, REDIS_KEY
+
+    config = await get_effective_config()
     return {
         "ok": True,
-        "message": "Telegram 測試通知已送出。請檢查手機 Telegram。",
-        "telegramOk": bool(data.get("ok")),
-        "chatIdConfigured": bool(os.environ.get("TELEGRAM_CHAT_ID")),
-        "botTokenConfigured": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
+        "redisConfigured": redis_configured(),
+        "redisKey": REDIS_KEY,
+        "config": config,
+        "message": "這是 Background Worker 會讀取的動態監控設定。",
     }
 
 
 @mcp.tool()
-async def get_telegram_setup_status(limit: int = 5) -> dict:
-    from notifications import get_telegram_updates, _get_secret_value
+async def update_monitor_config(
+    watchlist: str | None = None,
+    poll_seconds: int | None = None,
+    cooldown_seconds: int | None = None,
+    enabled: bool | None = None,
+    market_only: bool | None = None,
+    breakout_from_open_percent: float | None = None,
+    drop_from_open_percent: float | None = None,
+    new_high_extension_percent: float | None = None,
+) -> dict:
+    """V9：更新盤中監控設定。watchlist 格式例：2313:華通,4977:眾達-KY"""
+    from monitor_config_store import update_dynamic_config, redis_configured, REDIS_KEY
 
-    token_value = _get_secret_value("TELEGRAM_BOT_TOKEN")
-    chat_value = _get_secret_value("TELEGRAM_CHAT_ID")
-
-    secret_candidates = [
-        "/etc/secrets/telegram.env",
-        "/etc/secrets/telegram_env",
-        "telegram.env",
-        "telegram_env",
-    ]
-
-    debug_env = {
-        "cwd": os.getcwd(),
-        "telegramBotTokenInEnv": "TELEGRAM_BOT_TOKEN" in os.environ,
-        "telegramBotTokenLength": len(os.environ.get("TELEGRAM_BOT_TOKEN", "")),
-        "telegramBotTokenStrippedLength": len(os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()),
-        "telegramChatIdInEnv": "TELEGRAM_CHAT_ID" in os.environ,
-        "telegramChatIdLength": len(os.environ.get("TELEGRAM_CHAT_ID", "")),
-        "telegramChatIdStrippedLength": len(os.environ.get("TELEGRAM_CHAT_ID", "").strip()),
-        "testEnv": os.environ.get("TEST_ENV", "NOT_FOUND"),
-        "matchedEnvKeys": sorted([
-            k for k in os.environ.keys()
-            if "TELEGRAM" in k or "TEST" in k or "FUGLE" in k or "FINMIND" in k
-        ]),
-        "etcSecretsExists": os.path.exists("/etc/secrets"),
-        "etcSecretsFiles": sorted(os.listdir("/etc/secrets")) if os.path.exists("/etc/secrets") else [],
-        "rootFilesMatchingTelegram": sorted([
-            name for name in os.listdir(os.getcwd())
-            if "telegram" in name.lower()
-        ]),
-        "secretCandidateExists": {
-            path: os.path.exists(path) for path in secret_candidates
-        },
-        "telegramSecretFileExists": any(os.path.exists(path) for path in secret_candidates),
-        "telegramBotTokenFromSecretLength": len(_get_secret_value("TELEGRAM_BOT_TOKEN")),
-        "telegramChatIdFromSecretLength": len(_get_secret_value("TELEGRAM_CHAT_ID")),
-    }
-
-    token_configured = bool(token_value.strip())
-    chat_configured = bool(chat_value.strip())
-
-    if not token_configured:
+    if not redis_configured():
         return {
             "ok": False,
-            "botTokenConfigured": False,
-            "chatIdConfigured": chat_configured,
-            "message": "尚未設定 TELEGRAM_BOT_TOKEN。請先用 BotFather 建立 Bot，並把 Token 放到 Render Environment 或 Secret File telegram.env。",
-            "debug": debug_env,
+            "message": "REDIS_URL 尚未設定。請先在 Web Service 與 Background Worker 都設定同一組 REDIS_URL。",
         }
 
     try:
-        updates = await get_telegram_updates(limit=limit)
+        config = await update_dynamic_config(
+            watchlist=watchlist,
+            poll_seconds=poll_seconds,
+            cooldown_seconds=cooldown_seconds,
+            enabled=enabled,
+            market_only=market_only,
+            breakout_from_open_percent=breakout_from_open_percent,
+            drop_from_open_percent=drop_from_open_percent,
+            new_high_extension_percent=new_high_extension_percent,
+        )
     except Exception as exc:
         return {
             "ok": False,
-            "botTokenConfigured": token_configured,
-            "chatIdConfigured": chat_configured,
-            "message": f"已讀到 TELEGRAM_BOT_TOKEN，但呼叫 Telegram getUpdates 失敗：{exc}",
-            "debug": debug_env,
+            "message": f"更新監控設定失敗：{exc}",
         }
 
-    chats = []
-    for item in updates.get("result", []):
-        msg = item.get("message") or item.get("edited_message") or {}
-        chat = msg.get("chat") or {}
-        if chat.get("id") is not None:
-            chats.append({
-                "chatId": chat.get("id"),
-                "type": chat.get("type"),
-                "firstName": chat.get("first_name"),
-                "username": chat.get("username"),
-                "text": msg.get("text"),
-            })
-
     return {
         "ok": True,
-        "botTokenConfigured": token_configured,
-        "chatIdConfigured": chat_configured,
-        "configuredChatId": "SET" if chat_configured else "",
-        "recentChats": chats[-10:],
-        "message": "若 recentChats 有 chatId，請把它填到 Render 的 TELEGRAM_CHAT_ID；若用 Secret File，請加到 telegram.env。",
-        "debug": debug_env,
-    }
-
-@mcp.tool()
-async def get_monitor_config() -> dict:
-    """V9：查看盤中監測設定與 Render 環境變數是否齊全。"""
-    path = os.environ.get("MONITOR_RULES_FILE", "monitor_rules.json")
-    config: dict[str, Any] = {}
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    env_watchlist = os.environ.get("MONITOR_WATCHLIST", "")
-    return {
-        "ok": True,
-        "version": "9.0.0-monitor",
-        "rulesFile": path,
-        "rulesFileExists": os.path.exists(path),
+        "redisKey": REDIS_KEY,
         "config": config,
-        "environment": {
-            "MONITOR_ENABLED": os.environ.get("MONITOR_ENABLED", ""),
-            "MONITOR_WATCHLIST": env_watchlist,
-            "MONITOR_POLL_SECONDS": os.environ.get("MONITOR_POLL_SECONDS", ""),
-            "ALERT_COOLDOWN_SECONDS": os.environ.get("ALERT_COOLDOWN_SECONDS", ""),
-            "TELEGRAM_BOT_TOKEN_configured": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
-            "TELEGRAM_CHAT_ID_configured": bool(os.environ.get("TELEGRAM_CHAT_ID")),
-            "FUGLE_API_KEY_configured": bool(os.environ.get("FUGLE_API_KEY")),
-        },
-        "note": "免費版建議最多5檔，每檔用成交/報價輪詢；正式盤中監測由 Render Background Worker 執行。",
+        "message": "監控設定已更新。Background Worker 會在下一輪輪詢讀到新設定。",
     }
 
 
 @mcp.tool()
-async def preview_order(
-    symbol: str,
-    side: str,
-    entry_price: float,
-    stop_price: float,
-    budget: float = 50000,
-    max_risk: float = 500,
-    day_trade: bool = True,
-    odd_lot: bool = True,
-) -> dict:
-    """V9：下單預覽，只計算股數、成本與風險，不會送出委託。"""
-    from order_preview import build_order_preview
-    return build_order_preview(symbol, side, entry_price, stop_price, budget, max_risk, day_trade, odd_lot)
+async def set_monitor_watchlist(watchlist: str, poll_seconds: int | None = None) -> dict:
+    """V9：快速設定監控清單，可選擇一起改秒數。例：2313:華通,4977:眾達-KY"""
+    from monitor_config_store import update_dynamic_config, redis_configured, REDIS_KEY
+
+    if not redis_configured():
+        return {
+            "ok": False,
+            "message": "REDIS_URL 尚未設定。請先在 Web Service 與 Background Worker 都設定同一組 REDIS_URL。",
+        }
+
+    try:
+        config = await update_dynamic_config(
+            watchlist=watchlist,
+            poll_seconds=poll_seconds,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "message": f"設定監控清單失敗：{exc}",
+        }
+
+    return {
+        "ok": True,
+        "redisKey": REDIS_KEY,
+        "config": config,
+        "message": "監控清單已更新。Background Worker 會在下一輪輪詢讀到新設定。",
+    }
+
 
 
 if __name__ == "__main__":
