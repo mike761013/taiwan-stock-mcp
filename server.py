@@ -2610,29 +2610,44 @@ async def send_test_notification(message: str = "") -> dict:
 
 @mcp.tool()
 async def get_telegram_setup_status(limit: int = 5) -> dict:
-    """V9：查看 Telegram Bot 是否可連線，並列出最近 updates 中可用的 chat.id。"""
     from notifications import get_telegram_updates
- token_value = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-chat_value = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-debug_env = {
-    "telegramBotTokenInEnv": "TELEGRAM_BOT_TOKEN" in os.environ,
-    "telegramBotTokenLength": len(token_value),
-    "telegramChatIdInEnv": "TELEGRAM_CHAT_ID" in os.environ,
-    "telegramChatIdLength": len(chat_value),
-    "testEnv": os.environ.get("TEST_ENV", "NOT_FOUND"),
-}
+    token_value = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_value = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-token_configured = bool(token_value.strip())
-chat_configured = bool(chat_value.strip())
+    debug_env = {
+        "telegramBotTokenInEnv": "TELEGRAM_BOT_TOKEN" in os.environ,
+        "telegramBotTokenLength": len(token_value),
+        "telegramBotTokenStrippedLength": len(token_value.strip()),
+        "telegramChatIdInEnv": "TELEGRAM_CHAT_ID" in os.environ,
+        "telegramChatIdLength": len(chat_value),
+        "telegramChatIdStrippedLength": len(chat_value.strip()),
+        "testEnv": os.environ.get("TEST_ENV", "NOT_FOUND"),
+    }
+
+    token_configured = bool(token_value.strip())
+    chat_configured = bool(chat_value.strip())
+
     if not token_configured:
         return {
             "ok": False,
             "botTokenConfigured": False,
+            "chatIdConfigured": chat_configured,
             "message": "尚未設定 TELEGRAM_BOT_TOKEN。請先用 BotFather 建立 Bot 並把 Token 放到 Render Environment。",
-        "debug": debug_env,
+            "debug": debug_env,
         }
-    updates = await get_telegram_updates(limit=limit)
+
+    try:
+        updates = await get_telegram_updates(limit=limit)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "botTokenConfigured": token_configured,
+            "chatIdConfigured": chat_configured,
+            "message": f"已讀到 TELEGRAM_BOT_TOKEN，但呼叫 Telegram getUpdates 失敗：{exc}",
+            "debug": debug_env,
+        }
+
     chats = []
     for item in updates.get("result", []):
         msg = item.get("message") or item.get("edited_message") or {}
@@ -2645,14 +2660,15 @@ chat_configured = bool(chat_value.strip())
                 "username": chat.get("username"),
                 "text": msg.get("text"),
             })
+
     return {
         "ok": True,
         "botTokenConfigured": token_configured,
         "chatIdConfigured": chat_configured,
         "configuredChatId": os.environ.get("TELEGRAM_CHAT_ID", ""),
         "recentChats": chats[-10:],
-        "message": "若 recentChats 有 chatId，請把它填到 Render 的 TELEGRAM_CHAT_ID。若沒有，請先到 Telegram 對 Bot 傳 /start。",
-    "debug": debug_env,
+        "message": "若 recentChats 有 chatId，請把它填到 Render 的 TELEGRAM_CHAT_ID。",
+        "debug": debug_env,
     }
 
 
