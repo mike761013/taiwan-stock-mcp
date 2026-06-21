@@ -2593,11 +2593,9 @@ async def get_signal_performance(signal_id: str) -> dict:
     return {"available": False, "signalId": signal_id, "message": "找不到此 signal_id。"}
 
 
-if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
-
 # === V9 Dynamic Monitor Config Tools ===
-# 貼到 server.py 裡任一個 @mcp.tool() 區塊附近即可，通常放在 get_monitor_config 後面最直覺。
+# 這段工具讓 ChatGPT 可以直接更新 Background Worker 的動態監控設定。
+# 需搭配 monitor_config_store.py，並且 Web Service / Background Worker 都設定同一組 REDIS_URL。
 
 @mcp.tool()
 async def get_dynamic_monitor_config() -> dict:
@@ -2687,3 +2685,8 @@ async def set_monitor_watchlist(watchlist: str, poll_seconds: int | None = None)
         "config": config,
         "message": "監控清單已更新。Background Worker 會在下一輪輪詢讀到新設定。",
     }
+
+
+
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")
