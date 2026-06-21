@@ -1,12 +1,13 @@
 import os
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
-TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+
 TELEGRAM_API_BASE = "https://api.telegram.org"
+
+
 def _read_secret_file_value(key: str) -> str:
     """Read KEY=value from Render Secret File fallback.
 
@@ -42,58 +43,72 @@ def _get_secret_value(key: str) -> str:
 
 
 def _telegram_token() -> str:
-   token = _get_secret_value("TELEGRAM_BOT_TOKEN")
+    token = _get_secret_value("TELEGRAM_BOT_TOKEN")
     if not token:
-        raise RuntimeError("尚未設定 TELEGRAM_BOT_TOKEN。請到 Render Environment 新增此變數。")
+        raise RuntimeError("尚未設定 TELEGRAM_BOT_TOKEN。請先放到 Render Environment 或 Secret File telegram.env。")
     return token
 
 
 def _telegram_chat_id() -> str:
     chat_id = _get_secret_value("TELEGRAM_CHAT_ID")
     if not chat_id:
-        raise RuntimeError("尚未設定 TELEGRAM_CHAT_ID。請先對 Bot 傳 /start，取得 chat id 後放到 Render Environment。")
+        raise RuntimeError("尚未設定 TELEGRAM_CHAT_ID。請先對 Bot 傳 /start，取得 chat id 後放到 Render。")
     return chat_id
 
 
-async def send_telegram_message(text: str, *, disable_web_page_preview: bool = True) -> dict[str, Any]:
+def build_test_message() -> str:
+    now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    return f"【台股 MCP V9 測試】\nTelegram 手機通知已連線成功。\n時間：{now}"
+
+
+# 兼容可能的舊名稱，避免 server.py 若有引用不同名稱時出錯。
+build_telegram_test_message = build_test_message
+make_test_message = build_test_message
+
+
+async def send_telegram_message(
+    text: str,
+    *,
+    disable_web_page_preview: bool = True,
+) -> dict[str, Any]:
     """Send a plain-text Telegram message using Bot API."""
     token = _telegram_token()
     chat_id = _telegram_chat_id()
-    text = str(text)
-    if len(text) > 3900:
-        text = text[:3850] + "\n...（訊息過長，已截斷）"
+
     url = f"{TELEGRAM_API_BASE}/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
         "disable_web_page_preview": disable_web_page_preview,
     }
-    async with httpx.AsyncClient(timeout=20.0) as client:
+
+    async with httpx.AsyncClient(timeout=15) as client:
         response = await client.post(url, json=payload)
+
     try:
         data = response.json()
     except Exception:
-        data = {"ok": False, "description": response.text}
+        data = {"ok": False, "raw": response.text}
+
     if response.status_code >= 400 or not data.get("ok"):
         raise RuntimeError(f"Telegram 發送失敗：HTTP {response.status_code} {data}")
+
     return data
 
 
 async def get_telegram_updates(limit: int = 5) -> dict[str, Any]:
-    """Fetch latest Bot updates; useful to discover chat.id after user sends /start."""
     token = _telegram_token()
     url = f"{TELEGRAM_API_BASE}/bot{token}/getUpdates"
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.get(url, params={"limit": max(1, min(int(limit), 20))})
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.get(url, params={"limit": limit, "timeout": 0})
+
     try:
         data = response.json()
     except Exception:
-        data = {"ok": False, "description": response.text}
+        data = {"ok": False, "raw": response.text}
+
     if response.status_code >= 400 or not data.get("ok"):
         raise RuntimeError(f"Telegram getUpdates 失敗：HTTP {response.status_code} {data}")
+
     return data
-
-
-def build_test_message() -> str:
-    now = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    return f"【台股 MCP V9 測試】\nTelegram 手機通知已連線成功。\n時間：{now}"

@@ -2609,6 +2609,7 @@ async def send_test_notification(message: str = "") -> dict:
 
 
 @mcp.tool()
+@mcp.tool()
 async def get_telegram_setup_status(limit: int = 5) -> dict:
     from notifications import get_telegram_updates, _get_secret_value
 
@@ -2616,18 +2617,21 @@ async def get_telegram_setup_status(limit: int = 5) -> dict:
     chat_value = _get_secret_value("TELEGRAM_CHAT_ID")
 
     debug_env = {
-    "telegramBotTokenInEnv": "TELEGRAM_BOT_TOKEN" in os.environ,
-    "telegramBotTokenLength": len(token_value),
-    "telegramBotTokenStrippedLength": len(token_value.strip()),
-    "telegramChatIdInEnv": "TELEGRAM_CHAT_ID" in os.environ,
-    "telegramChatIdLength": len(chat_value),
-    "telegramChatIdStrippedLength": len(chat_value.strip()),
-    "testEnv": os.environ.get("TEST_ENV", "NOT_FOUND"),
-    "matchedEnvKeys": sorted([k for k in os.environ.keys() if "TELEGRAM" in k or "TEST" in k or "FUGLE" in k or "FINMIND" in k]),
-}
-    "telegramSecretFileExists": os.path.exists("/etc/secrets/telegram.env") or os.path.exists("telegram.env"),
-    "telegramBotTokenFromSecretLength": len(_get_secret_value("TELEGRAM_BOT_TOKEN")),
-    "telegramChatIdFromSecretLength": len(_get_secret_value("TELEGRAM_CHAT_ID")),
+        "telegramBotTokenInEnv": "TELEGRAM_BOT_TOKEN" in os.environ,
+        "telegramBotTokenLength": len(os.environ.get("TELEGRAM_BOT_TOKEN", "")),
+        "telegramBotTokenStrippedLength": len(os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()),
+        "telegramChatIdInEnv": "TELEGRAM_CHAT_ID" in os.environ,
+        "telegramChatIdLength": len(os.environ.get("TELEGRAM_CHAT_ID", "")),
+        "telegramChatIdStrippedLength": len(os.environ.get("TELEGRAM_CHAT_ID", "").strip()),
+        "testEnv": os.environ.get("TEST_ENV", "NOT_FOUND"),
+        "matchedEnvKeys": sorted([
+            k for k in os.environ.keys()
+            if "TELEGRAM" in k or "TEST" in k or "FUGLE" in k or "FINMIND" in k
+        ]),
+        "telegramSecretFileExists": os.path.exists("/etc/secrets/telegram.env") or os.path.exists("telegram.env"),
+        "telegramBotTokenFromSecretLength": len(_get_secret_value("TELEGRAM_BOT_TOKEN")),
+        "telegramChatIdFromSecretLength": len(_get_secret_value("TELEGRAM_CHAT_ID")),
+    }
 
     token_configured = bool(token_value.strip())
     chat_configured = bool(chat_value.strip())
@@ -2637,7 +2641,7 @@ async def get_telegram_setup_status(limit: int = 5) -> dict:
             "ok": False,
             "botTokenConfigured": False,
             "chatIdConfigured": chat_configured,
-            "message": "尚未設定 TELEGRAM_BOT_TOKEN。請先用 BotFather 建立 Bot 並把 Token 放到 Render Environment。",
+            "message": "尚未設定 TELEGRAM_BOT_TOKEN。請先用 BotFather 建立 Bot，並把 Token 放到 Render Environment 或 Secret File telegram.env。",
             "debug": debug_env,
         }
 
@@ -2669,12 +2673,11 @@ async def get_telegram_setup_status(limit: int = 5) -> dict:
         "ok": True,
         "botTokenConfigured": token_configured,
         "chatIdConfigured": chat_configured,
-        "configuredChatId": os.environ.get("TELEGRAM_CHAT_ID", ""),
+        "configuredChatId": "SET" if chat_configured else "",
         "recentChats": chats[-10:],
-        "message": "若 recentChats 有 chatId，請把它填到 Render 的 TELEGRAM_CHAT_ID。",
+        "message": "若 recentChats 有 chatId，請把它填到 Render 的 TELEGRAM_CHAT_ID；若用 Secret File，請加到 telegram.env。",
         "debug": debug_env,
     }
-
 
 @mcp.tool()
 async def get_monitor_config() -> dict:
