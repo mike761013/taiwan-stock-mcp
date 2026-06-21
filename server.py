@@ -24,18 +24,10 @@ FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 TWSE_DAILY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX_DAILY_CLOSE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
-TWSE_DAILY_FALLBACK_URL = (
-    "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
-    "?date={date}&type=ALLBUT0999&response=json"
-)
-TPEX_DAILY_FALLBACK_URL = (
-    "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes"
-    "?date={date}&id=&response=json"
-)
 
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
-CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v7.1-free")
+CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v8")
 CACHE_MAX_ITEMS = int(os.environ.get("CACHE_MAX_ITEMS", "2500"))
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 
@@ -58,28 +50,6 @@ CACHE_STATS: dict[str, int] = {
     "officialMarketUpstreamRequests": 0,
     "upstreamErrors": 0,
 }
-
-
-# V7-free: stay below Fugle Basic historical-data limit and keep Render Free stable.
-V7_HISTORY_CALLS_PER_MINUTE = min(
-    55,
-    max(1, int(os.environ.get("V7_HISTORY_CALLS_PER_MINUTE", "55"))),
-)
-V7_HISTORY_CONCURRENCY = max(
-    1,
-    min(6, int(os.environ.get("V7_HISTORY_CONCURRENCY", "3"))),
-)
-V7_CHIP_CONCURRENCY = max(
-    1,
-    min(5, int(os.environ.get("V7_CHIP_CONCURRENCY", "2"))),
-)
-V7_MIN_UNIVERSE_COUNT = int(os.environ.get("V7_MIN_UNIVERSE_COUNT", "1800"))
-V7_MIN_TSE_COUNT = int(os.environ.get("V7_MIN_TSE_COUNT", "950"))
-V7_MIN_OTC_COUNT = int(os.environ.get("V7_MIN_OTC_COUNT", "750"))
-V7_REFERENCE_SYMBOL = os.environ.get("V7_REFERENCE_SYMBOL", "2330").strip() or "2330"
-
-_history_rate_lock = asyncio.Lock()
-_history_request_times: list[float] = []
 
 
 def _json_dumps(value: Any) -> str:
@@ -120,24 +90,14 @@ def _snapshot_ttl() -> int:
 
 
 def _official_market_ttl() -> int:
-    # 盤中每 15 分鐘重抓。收盤後官方資料可能分批更新，18:30 前維持短 TTL；
-    # 避免 13:45 剛抓到前一日資料後，被快取到下一個交易日。
-    now = _taipei_now()
-    if _is_tw_market_hours(now):
-        return 15 * 60
-    if now.weekday() < 5 and dt_time(13, 45) < now.time() < dt_time(18, 30):
-        return 5 * 60
-    return _seconds_until_next_weekday_open(now)
+    # 公開市場端點不是 Fugle 即時快照。盤中每 15 分鐘重抓一次；
+    # 盤後資料固定，快取至下一個交易日早上。
+    return 15 * 60 if _is_tw_market_hours() else _seconds_until_next_weekday_open()
 
 
 def _historical_ttl() -> int:
-    # Fugle 日 K 在收盤後仍可能更新；18:30 前保持短 TTL。
-    now = _taipei_now()
-    if _is_tw_market_hours(now):
-        return 300
-    if now.weekday() < 5 and dt_time(13, 45) < now.time() < dt_time(18, 30):
-        return 5 * 60
-    return _seconds_until_next_weekday_open(now)
+    # Daily candle changes intraday, but is stable after the close.
+    return 300 if _is_tw_market_hours() else _seconds_until_next_weekday_open()
 
 
 def _finmind_ttl(dataset: str) -> int:
@@ -413,7 +373,7 @@ def _as_int(value: float) -> int:
 def _days_range(days: int, minimum: int = 5, maximum: int = 365) -> tuple[str, str]:
     if not minimum <= days <= maximum:
         raise ValueError(f"days 請填 {minimum} 到 {maximum}。")
-    end = _taipei_now().date()
+    end = date.today()
     start = end - timedelta(days=days)
     return start.isoformat(), end.isoformat()
 
@@ -449,18 +409,13 @@ def _institutional_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _get_institutional_data(
-    symbol: str,
-    days: int,
-    force_refresh: bool = False,
-) -> dict[str, Any]:
+async def _get_institutional_data(symbol: str, days: int) -> dict[str, Any]:
     start, end = _days_range(days, 5, 365)
     rows = await _finmind_get(
         "TaiwanStockInstitutionalInvestorsBuySellWide",
         symbol,
         start,
         end,
-        force_refresh=force_refresh,
     )
     parsed = [_institutional_row(row) for row in rows]
 
@@ -501,18 +456,13 @@ async def _get_institutional_data(
     }
 
 
-async def _get_margin_data(
-    symbol: str,
-    days: int,
-    force_refresh: bool = False,
-) -> dict[str, Any]:
+async def _get_margin_data(symbol: str, days: int) -> dict[str, Any]:
     start, end = _days_range(days, 5, 365)
     rows = await _finmind_get(
         "TaiwanStockMarginPurchaseShortSale",
         symbol,
         start,
         end,
-        force_refresh=force_refresh,
     )
     if not rows:
         raise RuntimeError("查無融資融券資料，可能尚未更新或股票代號不正確。")
@@ -728,208 +678,6 @@ def _clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
 
 
-
-def _normalize_trade_date(value: Any) -> str | None:
-    """Normalize ISO, YYYYMMDD, and ROC YYYMMDD dates to YYYY-MM-DD."""
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.astimezone(TAIPEI_TZ).date().isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-
-    raw = str(value).strip()
-    if not raw:
-        return None
-
-    iso_match = re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", raw)
-    if iso_match:
-        year, month, day = map(int, iso_match.groups())
-        try:
-            return date(year, month, day).isoformat()
-        except ValueError:
-            return None
-
-    # Allow dates embedded in official report titles, e.g. 115年06月18日.
-    embedded = re.search(
-        r"(?<!\d)(\d{3,4})\s*[年/-]\s*(\d{1,2})\s*[月/-]\s*(\d{1,2})\s*日?",
-        raw,
-    )
-    if embedded:
-        year, month, day = map(int, embedded.groups())
-        if year < 1911:
-            year += 1911
-        try:
-            return date(year, month, day).isoformat()
-        except ValueError:
-            return None
-
-    digits = re.sub(r"\D", "", raw)
-    if len(digits) == 8:
-        try:
-            return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8])).isoformat()
-        except ValueError:
-            return None
-    if len(digits) == 7:
-        try:
-            return date(
-                int(digits[:3]) + 1911,
-                int(digits[3:5]),
-                int(digits[5:7]),
-            ).isoformat()
-        except ValueError:
-            return None
-    return None
-
-
-def _quote_reference_date(quote: dict[str, Any]) -> str | None:
-    for candidate in (
-        quote.get("date"),
-        (quote.get("lastTrade") or {}).get("date")
-        if isinstance(quote.get("lastTrade"), dict)
-        else None,
-    ):
-        normalized = _normalize_trade_date(candidate)
-        if normalized:
-            return normalized
-
-    updated = quote.get("lastUpdated")
-    try:
-        if updated is not None:
-            epoch = float(updated)
-            if epoch > 10_000_000_000:
-                epoch /= 1000.0
-            return datetime.fromtimestamp(epoch, TAIPEI_TZ).date().isoformat()
-    except (TypeError, ValueError, OSError, OverflowError):
-        pass
-    return None
-
-
-def _close_location(row: dict[str, Any]) -> float:
-    high = _safe_float(row.get("highPrice"))
-    low = _safe_float(row.get("lowPrice"))
-    close = _safe_float(row.get("closePrice"))
-    if high <= low:
-        return 0.5
-    return _clamp((close - low) / (high - low), 0.0, 1.0)
-
-
-def _quick_prefilter_score(row: dict[str, Any], strategy: str) -> float:
-    value = _safe_float(row.get("tradeValue"))
-    change = _safe_float(row.get("changePercent"))
-    close_loc = _close_location(row)
-    liquidity = math.log10(max(value, 1))
-    score = liquidity + close_loc * 2.5
-
-    if strategy == "pullback":
-        if -4.0 <= change <= 1.5:
-            score += 4.0 - abs(change + 0.5) * 0.4
-        elif change > 6.5:
-            score -= 5.0
-    elif strategy == "breakout":
-        score += _clamp(change, 0, 8) * 1.1
-        if change >= 9:
-            score -= 8
-    else:
-        if 0.8 <= change <= 6.5:
-            score += 5.0 + change * 0.5
-        elif -0.8 <= change < 0.8:
-            score += 2.0
-        elif change >= 9:
-            score -= 7.0
-        elif change <= -5:
-            score -= 5.0
-    return score
-
-
-def _main_uptrend_stage(score: float) -> tuple[int, str]:
-    normalized = int(round(_clamp(score, 0.0, 100.0)))
-    if normalized >= 78:
-        stage = "主升段啟動候選"
-    elif normalized >= 62:
-        stage = "轉強觀察"
-    else:
-        stage = "尚未確認"
-    return normalized, stage
-
-
-def _build_multilane_candidates(
-    rows: list[dict[str, Any]],
-    strategy: str,
-    limit: int,
-) -> list[dict[str, Any]]:
-    """Create a diversified same-day pool instead of one momentum-only ranking."""
-    selected: dict[str, dict[str, Any]] = {}
-    lane_size = max(12, math.ceil(limit * 0.55))
-
-    def add(items: list[dict[str, Any]], target_size: int) -> None:
-        for item in items:
-            selected[str(item.get("symbol"))] = item
-            if len(selected) >= target_size:
-                break
-
-    if strategy == "pullback":
-        lane1 = [row for row in rows if -4.0 <= _safe_float(row.get("changePercent")) <= 1.5]
-    elif strategy == "breakout":
-        lane1 = [row for row in rows if 1.5 <= _safe_float(row.get("changePercent")) <= 8.5]
-    else:
-        lane1 = [row for row in rows if 0.8 <= _safe_float(row.get("changePercent")) <= 7.5]
-    lane1.sort(
-        key=lambda row: (
-            _quick_prefilter_score(row, strategy),
-            _safe_float(row.get("tradeValue")),
-        ),
-        reverse=True,
-    )
-    add(lane1, lane_size)
-
-    strong_close = [
-        row for row in rows
-        if -1.5 <= _safe_float(row.get("changePercent")) <= 6.5
-        and _close_location(row) >= 0.72
-    ]
-    strong_close.sort(
-        key=lambda row: (_close_location(row), _safe_float(row.get("tradeValue"))),
-        reverse=True,
-    )
-    add(strong_close, lane_size * 2)
-
-    liquid = sorted(
-        rows,
-        key=lambda row: _safe_float(row.get("tradeValue")),
-        reverse=True,
-    )
-    add(liquid, lane_size * 3)
-
-    quiet_turn = [
-        row for row in rows
-        if -0.8 <= _safe_float(row.get("changePercent")) <= 3.0
-        and _close_location(row) >= 0.62
-    ]
-    quiet_turn.sort(
-        key=lambda row: (_close_location(row), _safe_float(row.get("tradeValue"))),
-        reverse=True,
-    )
-    add(quiet_turn, lane_size * 4)
-
-    ranked = sorted(
-        selected.values(),
-        key=lambda row: _quick_prefilter_score(row, strategy),
-        reverse=True,
-    )
-
-    if len(ranked) < limit:
-        present = {str(row.get("symbol")) for row in ranked}
-        remainder = [row for row in rows if str(row.get("symbol")) not in present]
-        remainder.sort(
-            key=lambda row: _quick_prefilter_score(row, strategy),
-            reverse=True,
-        )
-        ranked.extend(remainder[: limit - len(ranked)])
-
-    return ranked[:limit]
-
-
 async def _get_intraday_quote(symbol: str, force_refresh: bool = False) -> dict[str, Any]:
     symbol = _validate_symbol(symbol)
     return await _cached_call(
@@ -952,7 +700,7 @@ async def _official_http_json(
         CACHE_STATS["officialMarketUpstreamRequests"] += 1
         headers = {
             "Accept": "application/json",
-            "User-Agent": "TaiwanStockMCP/7.1-free (+official-fallback-screener)",
+            "User-Agent": "TaiwanStockMCP/6.0 (+public-market-screener)",
         }
         async with httpx.AsyncClient(timeout=35.0, follow_redirects=True) as client:
             response = await client.get(url, headers=headers)
@@ -1025,7 +773,7 @@ def _signed_market_change(row: dict[str, Any]) -> float:
     value = _market_number(raw)
     sign = str(_first_value(
         row,
-        "ChangeSign", "UpDown", "Trend", "漲跌符號", "漲跌註記", "漲跌(+/-)",
+        "ChangeSign", "UpDown", "Trend", "漲跌符號", "漲跌註記",
     ) or "").strip()
 
     negative_tokens = {"-", "－", "跌", "down", "DOWN", "red_down"}
@@ -1165,380 +913,19 @@ async def _get_official_market_quotes(
         )
 
     report_dates = sorted({
-        normalized_date
+        str(item.get("date"))
         for item in normalized
-        if (normalized_date := _normalize_trade_date(item.get("date")))
+        if item.get("date")
     })
-    if len(report_dates) > 1:
-        raise RuntimeError(
-            f"{market} 官方市場資料包含多個交易日期：{report_dates[-5:]}"
-        )
     return {
         "market": market,
-        "date": report_dates[0] if report_dates else None,
+        "date": report_dates[-1] if report_dates else None,
         "time": None,
         "data": normalized,
         "source": source,
         "fetchedAtTaipei": _taipei_now().isoformat(),
         "freshness": "官方端點最新公布的全市場日行情，不是盤中逐筆即時快照。",
     }
-
-
-
-
-def _plain_text(value: Any) -> str:
-    """Remove simple HTML wrappers occasionally returned by official endpoints."""
-    text = "" if value is None else str(value)
-    text = re.sub(r"<[^>]+>", "", text)
-    return text.replace("\u3000", " ").strip()
-
-
-def _normalized_field_name(value: Any) -> str:
-    return re.sub(r"[\s\u3000]", "", _plain_text(value)).lower()
-
-
-def _find_table_value(record: dict[str, Any], aliases: tuple[str, ...]) -> tuple[Any, str | None]:
-    normalized = {_normalized_field_name(key): key for key in record}
-    for alias in aliases:
-        key = normalized.get(_normalized_field_name(alias))
-        if key is not None:
-            return record.get(key), str(key)
-    return None, None
-
-
-def _official_table_records(payload: Any) -> list[dict[str, Any]]:
-    """Extract array-based table rows from TWSE/TPEx report JSON formats."""
-    records: list[dict[str, Any]] = []
-
-    def visit(node: Any, depth: int = 0) -> None:
-        if depth > 8:
-            return
-        if isinstance(node, dict):
-            fields = None
-            for key in ("fields", "Fields", "columns", "Columns", "columnNames"):
-                value = node.get(key)
-                if isinstance(value, list) and value:
-                    fields = [_plain_text(item) for item in value]
-                    break
-            data_rows = None
-            for key in ("data", "Data", "rows", "aaData"):
-                value = node.get(key)
-                if isinstance(value, list):
-                    data_rows = value
-                    break
-            if fields and data_rows:
-                field_tokens = {_normalized_field_name(item) for item in fields}
-                has_symbol = bool(field_tokens & {
-                    _normalized_field_name("證券代號"),
-                    _normalized_field_name("股票代號"),
-                    _normalized_field_name("代號"),
-                })
-                has_close = bool(field_tokens & {
-                    _normalized_field_name("收盤價"),
-                    _normalized_field_name("收盤"),
-                })
-                if has_symbol and has_close:
-                    for row in data_rows:
-                        if isinstance(row, dict):
-                            records.append(dict(row))
-                        elif isinstance(row, (list, tuple)):
-                            records.append({
-                                fields[index]: row[index] if index < len(row) else None
-                                for index in range(len(fields))
-                            })
-            for value in node.values():
-                if isinstance(value, (dict, list)):
-                    visit(value, depth + 1)
-        elif isinstance(node, list):
-            for value in node:
-                if isinstance(value, (dict, list)):
-                    visit(value, depth + 1)
-
-    visit(payload)
-    return records
-
-
-def _payload_trade_dates(payload: Any) -> list[str]:
-    dates: set[str] = set()
-
-    def maybe_add(value: Any) -> None:
-        normalized = _normalize_trade_date(value)
-        if normalized:
-            dates.add(normalized)
-
-    def visit(node: Any, depth: int = 0) -> None:
-        if depth > 8:
-            return
-        if isinstance(node, dict):
-            for key, value in node.items():
-                key_token = _normalized_field_name(key)
-                if any(token in key_token for token in ("date", "日期", "年月日")):
-                    maybe_add(value)
-                elif key_token in {"title", "subtitle", "說明", "名稱"}:
-                    maybe_add(value)
-                if isinstance(value, (dict, list)):
-                    visit(value, depth + 1)
-        elif isinstance(node, list):
-            for value in node:
-                if isinstance(value, (dict, list)):
-                    visit(value, depth + 1)
-
-    visit(payload)
-    return sorted(dates)
-
-
-def _fallback_record_to_official_row(
-    record: dict[str, Any],
-    market: str,
-    trade_date: str,
-) -> dict[str, Any] | None:
-    symbol, _ = _find_table_value(record, (
-        "證券代號", "股票代號", "代號", "Code", "StockCode",
-    ))
-    name, _ = _find_table_value(record, (
-        "證券名稱", "股票名稱", "名稱", "Name", "StockName",
-    ))
-    close, _ = _find_table_value(record, ("收盤價", "收盤", "ClosingPrice", "Close"))
-    open_price, _ = _find_table_value(record, ("開盤價", "開盤", "OpeningPrice", "Open"))
-    high, _ = _find_table_value(record, ("最高價", "最高", "HighestPrice", "High"))
-    low, _ = _find_table_value(record, ("最低價", "最低", "LowestPrice", "Low"))
-    volume, volume_key = _find_table_value(record, (
-        "成交股數", "成交量", "成交股數(股)", "成交量(股)",
-        "成交仟股", "成交千股", "成交量(千股)", "成交量(仟股)",
-    ))
-    trade_value, value_key = _find_table_value(record, (
-        "成交金額", "成交值", "成交金額(元)", "成交值(元)",
-        "成交仟元", "成交千元", "成交金額(千元)", "成交金額(仟元)",
-    ))
-    change, _ = _find_table_value(record, (
-        "漲跌價差", "漲跌", "Change", "ChangeAmount", "PriceChange",
-    ))
-    change_sign, _ = _find_table_value(record, (
-        "漲跌(+/-)", "漲跌符號", "漲跌註記", "ChangeSign", "UpDown",
-    ))
-
-    volume_number = _market_number(volume)
-    if volume_key and any(unit in _normalized_field_name(volume_key) for unit in ("千股", "仟股")):
-        volume_number *= 1000
-    value_number = _market_number(trade_value)
-    if value_key and any(unit in _normalized_field_name(value_key) for unit in ("千元", "仟元")):
-        value_number *= 1000
-
-    canonical = {
-        "Code": _plain_text(symbol),
-        "Name": _plain_text(name),
-        "ClosingPrice": _plain_text(close),
-        "OpeningPrice": _plain_text(open_price),
-        "HighestPrice": _plain_text(high),
-        "LowestPrice": _plain_text(low),
-        "TradeVolume": volume_number,
-        "TradeValue": value_number,
-        "Change": _plain_text(change),
-        "ChangeSign": _plain_text(change_sign),
-        "Date": trade_date,
-    }
-    return _normalize_official_row(canonical, market)
-
-
-def _fallback_dataset_quality(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    count = len(rows)
-    if count == 0:
-        return {
-            "count": 0,
-            "uniqueSymbols": 0,
-            "ohlcCoverage": 0.0,
-            "liquidityCoverage": 0.0,
-        }
-    unique_symbols = len({str(row.get("symbol")) for row in rows})
-    ohlc_count = sum(
-        1 for row in rows
-        if all(_safe_float(row.get(key)) > 0 for key in (
-            "openPrice", "highPrice", "lowPrice", "closePrice",
-        ))
-    )
-    liquidity_count = sum(
-        1 for row in rows
-        if _safe_float(row.get("tradeVolume")) > 0
-        and _safe_float(row.get("tradeValue")) > 0
-    )
-    return {
-        "count": count,
-        "uniqueSymbols": unique_symbols,
-        "ohlcCoverage": round(ohlc_count / count, 4),
-        "liquidityCoverage": round(liquidity_count / count, 4),
-    }
-
-
-async def _get_official_market_quotes_fallback(
-    market: str,
-    target_date: str,
-    force_refresh: bool = False,
-) -> dict[str, Any]:
-    """Fetch a specified trading date from a second free official endpoint."""
-    market = market.upper().strip()
-    normalized_target = _normalize_trade_date(target_date)
-    if not normalized_target:
-        raise ValueError("備援行情 target_date 格式不正確。")
-
-    if market == "TSE":
-        url = TWSE_DAILY_FALLBACK_URL.format(date=normalized_target.replace("-", ""))
-        source = "TWSE RWD MI_INDEX ALLBUT0999"
-        minimum_count = V7_MIN_TSE_COUNT
-    elif market == "OTC":
-        url = TPEX_DAILY_FALLBACK_URL.format(date=normalized_target.replace("-", "/"))
-        source = "TPEx afterTrading dailyQuotes"
-        minimum_count = V7_MIN_OTC_COUNT
-    else:
-        raise ValueError("market 僅支援 TSE 或 OTC。")
-
-    payload = await _official_http_json(
-        url,
-        cache_tag=f"fallback:{market}:{normalized_target}",
-        force_refresh=force_refresh,
-    )
-
-    if isinstance(payload, dict):
-        status = str(payload.get("stat") or payload.get("status") or "").strip().upper()
-        if status and status not in {"OK", "SUCCESS", "200"}:
-            raise RuntimeError(f"{market} 官方備援端點回傳狀態：{status}")
-
-    payload_dates = _payload_trade_dates(payload)
-    if normalized_target not in payload_dates:
-        raise RuntimeError(
-            f"{market} 官方備援資料日期驗證失敗；"
-            f"目標={normalized_target}，回傳日期={payload_dates or '無'}。"
-        )
-
-    table_records = _official_table_records(payload)
-    normalized_rows: list[dict[str, Any]] = []
-    seen_symbols: set[str] = set()
-    for record in table_records:
-        item = _fallback_record_to_official_row(record, market, normalized_target)
-        if item is None:
-            continue
-        symbol = str(item.get("symbol"))
-        if symbol in seen_symbols:
-            continue
-        seen_symbols.add(symbol)
-        normalized_rows.append(item)
-
-    quality = _fallback_dataset_quality(normalized_rows)
-    validation_errors: list[str] = []
-    if quality["count"] < minimum_count:
-        validation_errors.append(
-            f"普通股家數 {quality['count']} 低於門檻 {minimum_count}"
-        )
-    if quality["uniqueSymbols"] != quality["count"]:
-        validation_errors.append("股票代號有重複")
-    if quality["ohlcCoverage"] < 0.80:
-        validation_errors.append(
-            f"OHLC完整率僅 {quality['ohlcCoverage']:.1%}"
-        )
-    if quality["liquidityCoverage"] < 0.75:
-        validation_errors.append(
-            f"成交量／成交值完整率僅 {quality['liquidityCoverage']:.1%}"
-        )
-    if validation_errors:
-        raise RuntimeError(
-            f"{market} 官方備援資料未通過安全檢查：" + "；".join(validation_errors)
-        )
-
-    return {
-        "market": market,
-        "date": normalized_target,
-        "time": None,
-        "data": normalized_rows,
-        "source": source,
-        "fetchedAtTaipei": _taipei_now().isoformat(),
-        "freshness": "指定日期官方盤後行情備援資料。",
-        "fallback": True,
-        "fallbackTargetDate": normalized_target,
-        "validation": quality,
-    }
-
-
-async def _resolve_official_market_payloads(
-    requested_markets: list[str],
-    force_refresh: bool = False,
-) -> dict[str, Any]:
-    """Resolve all requested markets to one latest date, using official fallbacks when needed."""
-    primary_payloads = await asyncio.gather(
-        *[
-            _get_official_market_quotes(market, force_refresh=force_refresh)
-            for market in requested_markets
-        ]
-    )
-    primary_by_market = {
-        market: payload for market, payload in zip(requested_markets, primary_payloads)
-    }
-    primary_dates = {
-        market: _normalize_trade_date(payload.get("date"))
-        for market, payload in primary_by_market.items()
-    }
-    reference_date = await _get_reference_market_date(force_refresh=force_refresh)
-    target_candidates = [value for value in primary_dates.values() if value]
-    if reference_date:
-        target_candidates.append(reference_date)
-    target_date = max(target_candidates) if target_candidates else None
-
-    final_by_market = dict(primary_by_market)
-    fallback_attempts: list[dict[str, Any]] = []
-    fallback_markets: list[str] = []
-
-    if target_date:
-        for market in requested_markets:
-            if primary_dates.get(market) == target_date:
-                continue
-            attempt = {
-                "market": market,
-                "primaryDate": primary_dates.get(market),
-                "targetDate": target_date,
-                "used": False,
-            }
-            try:
-                fallback_payload = await _get_official_market_quotes_fallback(
-                    market,
-                    target_date,
-                    force_refresh=force_refresh,
-                )
-                final_by_market[market] = fallback_payload
-                attempt.update({
-                    "used": True,
-                    "source": fallback_payload.get("source"),
-                    "date": fallback_payload.get("date"),
-                    "validation": fallback_payload.get("validation"),
-                })
-                fallback_markets.append(market)
-            except Exception as exc:
-                attempt["error"] = str(exc)
-            fallback_attempts.append(attempt)
-
-    return {
-        "primaryByMarket": primary_by_market,
-        "finalByMarket": final_by_market,
-        "primaryMarketDates": primary_dates,
-        "referenceDate": reference_date,
-        "targetDate": target_date,
-        "fallbackUsed": bool(fallback_markets),
-        "fallbackMarkets": fallback_markets,
-        "fallbackAttempts": fallback_attempts,
-    }
-
-
-async def _acquire_history_rate_slot() -> None:
-    """Limit only actual Fugle historical upstream calls, not cache hits."""
-    while True:
-        async with _history_rate_lock:
-            now = time.monotonic()
-            cutoff = now - 60.0
-            _history_request_times[:] = [
-                stamp for stamp in _history_request_times if stamp > cutoff
-            ]
-            if len(_history_request_times) < V7_HISTORY_CALLS_PER_MINUTE:
-                _history_request_times.append(now)
-                return
-            delay = _history_request_times[0] + 60.0 - now
-        await asyncio.sleep(max(delay, 0.05))
 
 
 async def _get_historical_candles_raw(
@@ -1550,7 +937,7 @@ async def _get_historical_candles_raw(
 ) -> dict[str, Any]:
     symbol = _validate_symbol(symbol)
     timeframe = timeframe.upper().strip()
-    end = _taipei_now().date()
+    end = date.today()
     start = end - timedelta(days=days)
     params = {
         "from": start.isoformat(),
@@ -1560,15 +947,11 @@ async def _get_historical_candles_raw(
         "fields": "open,high,low,close,volume,turnover,change",
         "sort": "asc",
     }
-    async def fetch_history() -> dict[str, Any]:
-        await _acquire_history_rate_slot()
-        return await _fugle_get(f"historical/candles/{symbol}", params=params)
-
     return await _cached_call(
         "fugle:historical",
         {"symbol": symbol, **params},
         _historical_ttl(),
-        fetch_history,
+        lambda: _fugle_get(f"historical/candles/{symbol}", params=params),
         force_refresh=force_refresh,
     )
 
@@ -1585,69 +968,6 @@ async def _get_daily_candles_raw(
         adjusted=True,
         force_refresh=force_refresh,
     )
-
-
-
-async def _get_reference_market_date(force_refresh: bool = False) -> str | None:
-    """Use one free Fugle intraday quote to verify the official market date is latest."""
-    try:
-        quote = await _get_intraday_quote(
-            V7_REFERENCE_SYMBOL,
-            force_refresh=force_refresh,
-        )
-        reference = _quote_reference_date(quote)
-        if reference:
-            return reference
-    except Exception:
-        pass
-
-    # Fallback to a short historical query if the quote did not contain a usable date.
-    try:
-        raw = await _get_daily_candles_raw(
-            V7_REFERENCE_SYMBOL,
-            days=30,
-            force_refresh=force_refresh,
-        )
-        candles = raw.get("data") or []
-        if candles:
-            return _normalize_trade_date(candles[-1].get("date"))
-    except Exception:
-        pass
-    return None
-
-
-def _upsert_official_candle(
-    candles: list[dict[str, Any]],
-    snapshot: dict[str, Any],
-    scoring_date: str,
-) -> list[dict[str, Any]]:
-    close = _safe_float(snapshot.get("closePrice"))
-    if close <= 0:
-        raise RuntimeError(f"{snapshot.get('symbol')} 官方收盤價無效。")
-
-    today = {
-        "date": scoring_date,
-        "open": _safe_float(snapshot.get("openPrice"), close) or close,
-        "high": _safe_float(snapshot.get("highPrice"), close) or close,
-        "low": _safe_float(snapshot.get("lowPrice"), close) or close,
-        "close": close,
-        "volume": int(_safe_float(snapshot.get("tradeVolume"))),
-        "turnover": int(_safe_float(snapshot.get("tradeValue"))),
-        "change": _safe_float(snapshot.get("change")),
-    }
-
-    merged = [
-        dict(row)
-        for row in candles
-        if _normalize_trade_date(row.get("date")) != scoring_date
-    ]
-    for row in merged:
-        normalized = _normalize_trade_date(row.get("date"))
-        if normalized:
-            row["date"] = normalized
-    merged.append(today)
-    merged.sort(key=lambda row: str(row.get("date") or ""))
-    return merged
 
 
 def _technical_features(symbol: str, candles: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1867,15 +1187,11 @@ def _score_candidate(
     return round(score, 2), reasons[:6], risks[:5]
 
 
-async def _safe_chip_for_ranking(
-    symbol: str,
-    days: int = 45,
-    force_refresh: bool = False,
-) -> dict[str, Any]:
+async def _safe_chip_for_ranking(symbol: str, days: int = 45) -> dict[str, Any]:
     try:
         institutional, margin = await asyncio.gather(
-            _get_institutional_data(symbol, days, force_refresh=force_refresh),
-            _get_margin_data(symbol, days, force_refresh=force_refresh),
+            _get_institutional_data(symbol, days),
+            _get_margin_data(symbol, days),
         )
         five = institutional.get("cumulative", {}).get("last5TradingDays", {})
         foreign5 = int(five.get("foreignNetShares", 0))
@@ -1917,43 +1233,23 @@ async def _safe_chip_for_ranking(
 async def _analyze_candidate(
     snapshot: dict[str, Any],
     strategy: str,
-    scoring_date: str,
     semaphore: asyncio.Semaphore,
     force_refresh: bool = False,
 ) -> dict[str, Any]:
     symbol = _validate_symbol(str(snapshot.get("symbol", "")))
     async with semaphore:
-        raw = await _get_daily_candles_raw(
-            symbol,
-            180,
-            force_refresh=force_refresh,
-        )
-    candles = _upsert_official_candle(
-        raw.get("data", []),
-        snapshot,
-        scoring_date,
-    )
-    tech = _technical_features(symbol, candles)
-    latest_date = _normalize_trade_date(tech.get("latestDate"))
-    if latest_date != scoring_date:
-        raise RuntimeError(
-            f"技術資料日期不一致：{latest_date} != {scoring_date}"
-        )
-    tech["latestDate"] = scoring_date
+        raw = await _get_daily_candles_raw(symbol, 180, force_refresh=force_refresh)
+    tech = _technical_features(symbol, raw.get("data", []))
     score, reasons, risks = _score_candidate(snapshot, tech, strategy)
-    main_uptrend_score, stage = _main_uptrend_stage(score)
     return {
         "symbol": symbol,
         "name": snapshot.get("name"),
         "market": snapshot.get("market"),
-        "quoteDate": scoring_date,
         "closePrice": snapshot.get("closePrice"),
         "changePercent": snapshot.get("changePercent"),
         "tradeVolume": snapshot.get("tradeVolume"),
         "tradeValue": snapshot.get("tradeValue"),
         "score": score,
-        "mainUptrendScore": main_uptrend_score,
-        "stage": stage,
         "reasons": reasons,
         "risks": risks,
         "technical": tech,
@@ -1965,8 +1261,8 @@ def ping() -> dict:
     """檢查台股 MCP 伺服器是否正常運作。"""
     return {
         "ok": True,
-        "server": "Taiwan Stock MCP v7.1-free-official-fallback",
-        "version": "7.1.0-free",
+        "server": "Taiwan Stock MCP v8-free-score-tracker",
+        "version": "8.0.0-free",
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "tools": [
             "get_realtime_quote",
@@ -1981,6 +1277,13 @@ def ping() -> dict:
             "screen_market",
             "rank_screened_stocks",
             "get_stock_full_analysis",
+            "screen_market_v2",
+            "record_screen_result",
+            "get_backtest_summary",
+            "get_signal_performance",
+            "get_theme_score",
+            "update_theme_tags",
+            "get_risk_flags",
             "get_cache_status",
             "clear_cache",
         ],
@@ -2288,14 +1591,15 @@ async def screen_market(
     force_refresh: bool = False,
 ) -> dict:
     """
-    V7.1 免費版全市場篩選：先使用證交所／櫃買中心最新 OpenAPI；
-    若市場日期不同或落後 Fugle 參考交易日，會自動查詢可指定日期的第二官方端點。
-    只有在上市、上櫃都通過日期、家數與欄位完整性檢查後才會產生排名。
+    掃描上市與上櫃普通股。全市場初篩使用證交所／櫃買中心最新公開日行情，
+    不需要 Fugle Snapshot Quotes 付費權限；候選股深度技術分析仍使用
+    Fugle 個股歷史 K 線。
 
     strategy：balanced、breakout、early_stage、trend、pullback。
     markets：BOTH、TSE、OTC。
-    candidate_limit：深度技術分析檔數，免費版最多 55。
-    include_chip=true：只對技術初評前 top_n 檔補法人與融資籌碼。
+    include_chip=true 時，只為最後入選股補上法人與融資籌碼評分。
+
+    注意：官方全市場資料不是盤中逐筆即時快照，收盤後使用最完整。
     """
     strategy = strategy.lower().strip()
     markets = markets.upper().strip()
@@ -2306,161 +1610,62 @@ async def screen_market(
     if not 1 <= top_n <= 20:
         raise ValueError("top_n 請填 1 到 20。")
     if not top_n <= candidate_limit <= 55:
-        raise ValueError("candidate_limit 必須大於等於 top_n，且免費版最多 55。")
+        raise ValueError("candidate_limit 必須大於等於 top_n，且最多 55。")
     if min_trade_value < 0:
         raise ValueError("min_trade_value 不可為負數。")
     if min_price <= 0 or max_price <= min_price:
         raise ValueError("價格範圍設定不正確。")
 
     requested_markets = ["TSE", "OTC"] if markets == "BOTH" else [markets]
-    resolution = await _resolve_official_market_payloads(
-        requested_markets,
-        force_refresh=force_refresh,
+    market_payloads = await asyncio.gather(
+        *[
+            _get_official_market_quotes(
+                market,
+                force_refresh=force_refresh,
+            )
+            for market in requested_markets
+        ]
     )
-    primary_by_market = resolution["primaryByMarket"]
-    final_by_market = resolution["finalByMarket"]
-    primary_market_dates = resolution["primaryMarketDates"]
-    reference_date = resolution["referenceDate"]
 
+    universe: list[dict[str, Any]] = []
     as_of: list[dict[str, Any]] = []
-    market_dates: dict[str, str | None] = {}
-    market_counts: dict[str, int] = {}
-    full_universe: list[dict[str, Any]] = []
-
-    for market in requested_markets:
-        payload = final_by_market[market]
-        primary_payload = primary_by_market[market]
-        market_date = _normalize_trade_date(payload.get("date"))
-        market_dates[market] = market_date
-        rows = [dict(row) for row in payload.get("data", [])]
-        market_counts[market] = len(rows)
+    for market, payload in zip(requested_markets, market_payloads):
         as_of.append({
             "market": market,
-            "date": market_date,
+            "date": payload.get("date"),
             "source": payload.get("source"),
-            "primaryDate": _normalize_trade_date(primary_payload.get("date")),
-            "primarySource": primary_payload.get("source"),
-            "fallbackUsed": bool(payload.get("fallback")),
-            "fallbackTargetDate": payload.get("fallbackTargetDate"),
-            "validation": payload.get("validation"),
             "fetchedAtTaipei": payload.get("fetchedAtTaipei"),
         })
-        full_universe.extend(rows)
+        for row in payload.get("data", []):
+            close = _safe_float(row.get("closePrice"))
+            trade_value = _safe_float(row.get("tradeValue"))
+            if not min_price <= close <= max_price:
+                continue
+            if trade_value < min_trade_value:
+                continue
+            universe.append(dict(row))
 
-    distinct_dates = {value for value in market_dates.values() if value}
-    if len(distinct_dates) != 1 or any(value is None for value in market_dates.values()):
-        return {
-            "ok": False,
-            "serverVersion": "v7.1-free-official-fallback",
-            "errorCode": "MARKET_DATE_MISMATCH",
-            "message": (
-                "主要官方行情日期不同，且免費官方備援仍無法讓所有市場對齊；"
-                "本次拒絕產生排名。"
-            ),
-            "strategy": strategy,
-            "markets": requested_markets,
-            "primaryMarketDates": primary_market_dates,
-            "finalMarketDates": market_dates,
-            "referenceDate": reference_date,
-            "fallbackUsed": resolution["fallbackUsed"],
-            "fallbackMarkets": resolution["fallbackMarkets"],
-            "fallbackAttempts": resolution["fallbackAttempts"],
-            "asOf": as_of,
-            "results": [],
-            "errors": [],
-            "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
-        }
+    def prefilter_score(row: dict[str, Any]) -> float:
+        value = _safe_float(row.get("tradeValue"))
+        change = _safe_float(row.get("changePercent"))
+        liquidity = math.log10(max(value, 1))
+        momentum = _clamp(change, -3, 7) * 0.7
+        overheat_penalty = max(change - 8.0, 0) * 2.0
+        if strategy == "pullback":
+            momentum = -abs(change) * 0.25
+        elif strategy == "breakout":
+            momentum = _clamp(change, 0, 8) * 1.2
+        return liquidity + momentum - overheat_penalty
 
-    scoring_date = next(iter(distinct_dates))
-    warnings: list[str] = []
-    if reference_date and scoring_date < reference_date:
-        return {
-            "ok": False,
-            "serverVersion": "v7.1-free-official-fallback",
-            "errorCode": "OFFICIAL_DATA_NOT_LATEST",
-            "message": (
-                "主要與備援官方資料都尚未更新到最新交易日，本次拒絕排名；"
-                f"官方={scoring_date}，Fugle參考={reference_date}。"
-            ),
-            "strategy": strategy,
-            "markets": requested_markets,
-            "scoringDate": scoring_date,
-            "referenceDate": reference_date,
-            "primaryMarketDates": primary_market_dates,
-            "finalMarketDates": market_dates,
-            "fallbackUsed": resolution["fallbackUsed"],
-            "fallbackMarkets": resolution["fallbackMarkets"],
-            "fallbackAttempts": resolution["fallbackAttempts"],
-            "asOf": as_of,
-            "results": [],
-            "errors": [],
-            "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
-        }
-    if reference_date and scoring_date > reference_date:
-        warnings.append(
-            f"官方市場日期 {scoring_date} 晚於Fugle參考日期 {reference_date}；"
-            "以已通過雙市場驗證的官方日期為準。"
-        )
-    if not reference_date:
-        warnings.append("無法取得Fugle參考交易日；僅以官方市場日期一致性判斷。")
+    universe.sort(key=prefilter_score, reverse=True)
+    candidates = universe[:candidate_limit]
 
-    if markets == "BOTH":
-        minimum_count = V7_MIN_UNIVERSE_COUNT
-    elif markets == "TSE":
-        minimum_count = V7_MIN_TSE_COUNT
-    else:
-        minimum_count = V7_MIN_OTC_COUNT
-
-    if len(full_universe) < minimum_count:
-        return {
-            "ok": False,
-            "serverVersion": "v7.1-free-official-fallback",
-            "errorCode": "MARKET_UNIVERSE_INCOMPLETE",
-            "message": (
-                f"官方普通股資料僅 {len(full_universe)} 檔，"
-                f"低於安全門檻 {minimum_count} 檔，本次拒絕排名。"
-            ),
-            "strategy": strategy,
-            "markets": requested_markets,
-            "scoringDate": scoring_date,
-            "referenceDate": reference_date,
-            "primaryMarketDates": primary_market_dates,
-            "finalMarketDates": market_dates,
-            "fallbackUsed": resolution["fallbackUsed"],
-            "fallbackMarkets": resolution["fallbackMarkets"],
-            "fallbackAttempts": resolution["fallbackAttempts"],
-            "asOf": as_of,
-            "marketCounts": market_counts,
-            "results": [],
-            "errors": [],
-            "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
-        }
-
-    eligible: list[dict[str, Any]] = []
-    for row in full_universe:
-        close = _safe_float(row.get("closePrice"))
-        trade_value = _safe_float(row.get("tradeValue"))
-        if not min_price <= close <= max_price:
-            continue
-        if trade_value < min_trade_value:
-            continue
-        normalized = dict(row)
-        normalized["date"] = scoring_date
-        eligible.append(normalized)
-
-    candidates = _build_multilane_candidates(
-        eligible,
-        strategy,
-        candidate_limit,
-    )
-
-    semaphore = asyncio.Semaphore(V7_HISTORY_CONCURRENCY)
+    semaphore = asyncio.Semaphore(6)
     results = await asyncio.gather(
         *[
             _analyze_candidate(
                 row,
                 strategy,
-                scoring_date,
                 semaphore,
                 force_refresh=force_refresh,
             )
@@ -2487,26 +1692,15 @@ async def screen_market(
     selected = analyzed[:top_n]
 
     if include_chip and selected:
-        chip_semaphore = asyncio.Semaphore(V7_CHIP_CONCURRENCY)
-
-        async def load_chip(item: dict[str, Any]) -> dict[str, Any]:
-            async with chip_semaphore:
-                return await _safe_chip_for_ranking(
-                    item["symbol"],
-                    45,
-                    force_refresh=force_refresh,
-                )
-
-        chip_results = await asyncio.gather(*[load_chip(item) for item in selected])
+        chip_results = await asyncio.gather(
+            *[_safe_chip_for_ranking(item["symbol"], 45) for item in selected]
+        )
         for item, chip in zip(selected, chip_results):
             item["chip"] = chip
             item["score"] = round(
                 _safe_float(item.get("score"))
                 + _safe_float(chip.get("scoreAdjustment")),
                 2,
-            )
-            item["mainUptrendScore"], item["stage"] = _main_uptrend_stage(
-                _safe_float(item.get("score"))
             )
             item["reasons"] = (
                 item.get("reasons", []) + chip.get("reasons", [])
@@ -2523,31 +1717,16 @@ async def screen_market(
         item["rank"] = rank
 
     return {
-        "ok": True,
-        "serverVersion": "v7.1-free-official-fallback",
         "strategy": strategy,
         "markets": requested_markets,
-        "scoringDate": scoring_date,
-        "referenceDate": reference_date,
-        "allUniverseUsingSameDate": True,
-        "primaryMarketDates": primary_market_dates,
-        "finalMarketDates": market_dates,
-        "fallbackUsed": resolution["fallbackUsed"],
-        "fallbackMarkets": resolution["fallbackMarkets"],
-        "fallbackAttempts": resolution["fallbackAttempts"],
         "asOf": as_of,
-        "marketDataMode": "official_same_day_full_market_with_fallback",
+        "marketDataMode": "official_latest_daily_market",
         "marketDataFreshness": (
-            "先使用TWSE／TPEx最新OpenAPI；日期不同或落後時，"
-            "自動改查指定日期官方盤後端點，並驗證日期、家數、OHLC與成交資料。"
+            "全市場初篩依證交所／櫃買中心端點最新公布的日行情；"
+            "不是 Fugle 盤中 Snapshot。收盤後執行最完整。"
         ),
-        "marketCounts": market_counts,
-        "marketUniverseCount": len(full_universe),
-        "eligibleUniverseCount": len(eligible),
-        "snapshotUniverseCount": len(eligible),
-        "technicalCandidateLimit": candidate_limit,
+        "snapshotUniverseCount": len(universe),
         "deepAnalyzedCount": len(analyzed),
-        "chipAnalyzedCount": len(selected) if include_chip else 0,
         "candidateLimit": candidate_limit,
         "filters": {
             "minTradeValue": min_trade_value,
@@ -2556,21 +1735,19 @@ async def screen_market(
         },
         "includeChip": include_chip,
         "forceRefresh": force_refresh,
-        "warnings": warnings,
         "cacheNote": (
-            "主要官方行情、備援行情、歷史K線及籌碼使用快取；"
-            "force_refresh=true會略過快取。"
+            "官方市場行情、歷史 K 線與籌碼依 TTL 使用快取；"
+            "force_refresh=true 可略過快取。"
         ),
         "results": selected,
         "errors": errors[:15],
         "method": (
-            "雙官方來源同日全市場行情多通道初篩，候選股併入當日官方K棒後"
-            "重算技術指標；技術前N名再補法人與融資籌碼。"
+            "證交所／櫃買中心最新公開日行情預篩，"
+            "再對候選股計算 180 日技術指標；不是報酬保證。"
         ),
         "source": (
-            "TWSE STOCK_DAY_ALL / MI_INDEX + TPEx mainboard close / dailyQuotes；"
-            "候選股歷史K線使用Fugle MarketData API v1.0；"
-            "include_chip時另用FinMind API v4"
+            "TWSE OpenAPI + TPEx OpenAPI；候選股歷史 K 線使用 "
+            "Fugle MarketData API v1.0；include_chip 時另用 FinMind API v4"
         ),
         "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
     }
@@ -2766,8 +1943,7 @@ async def get_cache_status() -> dict:
             "officialMarketDuringMarket": 900,
             "historicalDuringMarket": 300,
             "afterCloseQuoteMax": 3600,
-            "postCloseUpdateWindowOfficialAndHistorical": 300,
-            "after1830OfficialMarketAndHistorical": "until next weekday 08:30 Asia/Taipei",
+            "afterCloseOfficialMarketAndHistorical": "until next weekday 08:30 Asia/Taipei",
             "finmindUpdateWindow": 1200,
             "finmindDaytime": 7200,
             "finmindNight": 36000,
@@ -2826,6 +2002,595 @@ async def clear_cache(scope: str = "all") -> dict:
         "redisDeleted": redis_deleted,
         "timeTaipei": _taipei_now().isoformat(),
     }
+
+# =========================
+# V8 free-score-tracker add-ons
+# =========================
+THEMES_FILE = os.environ.get("THEMES_FILE", "themes.json")
+RISK_RULES_FILE = os.environ.get("RISK_RULES_FILE", "risk_rules.json")
+BACKTEST_MAX_RECORDS = int(os.environ.get("BACKTEST_MAX_RECORDS", "300"))
+
+_V8_MEMORY_STORE: dict[str, Any] = {
+    "themeTags": None,
+    "riskRules": None,
+    "screenRecords": [],
+}
+
+
+def _read_json_file(filename: str, default: Any) -> Any:
+    try:
+        path = os.path.join(os.getcwd(), filename)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+    except Exception:
+        pass
+    return default
+
+
+async def _v8_redis_get_json(key: str) -> Any | None:
+    client = await _get_redis_client()
+    if client is None:
+        return None
+    try:
+        raw = await client.get(f"{CACHE_PREFIX}:v8store:{key}")
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+async def _v8_redis_set_json(key: str, value: Any, ttl: int | None = None) -> bool:
+    client = await _get_redis_client()
+    if client is None:
+        return False
+    try:
+        redis_key = f"{CACHE_PREFIX}:v8store:{key}"
+        if ttl is None:
+            await client.set(redis_key, _json_dumps(value))
+        else:
+            await client.set(redis_key, _json_dumps(value), ex=max(1, int(ttl)))
+        return True
+    except Exception:
+        return False
+
+
+def _normalize_theme_map(value: Any) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for raw_symbol, raw_tags in value.items():
+        try:
+            symbol = _validate_symbol(str(raw_symbol))
+        except Exception:
+            continue
+        if isinstance(raw_tags, str):
+            tags = [part.strip() for part in re.split(r"[,，、/]+", raw_tags) if part.strip()]
+        elif isinstance(raw_tags, list):
+            tags = [str(item).strip() for item in raw_tags if str(item).strip()]
+        else:
+            tags = []
+        if tags:
+            out[symbol] = list(dict.fromkeys(tags))
+    return out
+
+
+async def _get_theme_map() -> dict[str, list[str]]:
+    remote = await _v8_redis_get_json("themeTags")
+    if remote is not None:
+        return _normalize_theme_map(remote)
+    if _V8_MEMORY_STORE.get("themeTags") is None:
+        _V8_MEMORY_STORE["themeTags"] = _normalize_theme_map(_read_json_file(THEMES_FILE, {}))
+    return dict(_V8_MEMORY_STORE.get("themeTags") or {})
+
+
+async def _set_theme_map(theme_map: dict[str, list[str]]) -> dict[str, Any]:
+    normalized = _normalize_theme_map(theme_map)
+    _V8_MEMORY_STORE["themeTags"] = normalized
+    persisted = await _v8_redis_set_json("themeTags", normalized)
+    return {"savedToRedis": persisted, "count": len(normalized)}
+
+
+async def _get_risk_rules() -> dict[str, Any]:
+    remote = await _v8_redis_get_json("riskRules")
+    if isinstance(remote, dict):
+        return remote
+    if _V8_MEMORY_STORE.get("riskRules") is None:
+        _V8_MEMORY_STORE["riskRules"] = _read_json_file(RISK_RULES_FILE, {})
+    rules = _V8_MEMORY_STORE.get("riskRules") or {}
+    return rules if isinstance(rules, dict) else {}
+
+
+def _same_theme_symbols(symbol: str, theme_map: dict[str, list[str]]) -> list[str]:
+    tags = set(theme_map.get(symbol, []))
+    if not tags:
+        return []
+    peers = []
+    for other_symbol, other_tags in theme_map.items():
+        if other_symbol != symbol and tags.intersection(other_tags):
+            peers.append(other_symbol)
+    return peers
+
+
+async def _get_market_universe_for_theme(markets: str = "BOTH", force_refresh: bool = False) -> list[dict[str, Any]]:
+    markets = markets.upper().strip()
+    requested_markets = ["TSE", "OTC"] if markets == "BOTH" else [markets]
+    payloads = await asyncio.gather(
+        *[_get_official_market_quotes(market, force_refresh=force_refresh) for market in requested_markets],
+        return_exceptions=True,
+    )
+    rows: list[dict[str, Any]] = []
+    for payload in payloads:
+        if isinstance(payload, Exception):
+            continue
+        rows.extend(payload.get("data", []))
+    return rows
+
+
+async def _compute_theme_score(symbol: str, markets: str = "BOTH", force_refresh: bool = False) -> dict[str, Any]:
+    symbol = _validate_symbol(symbol)
+    theme_map = await _get_theme_map()
+    tags = theme_map.get(symbol, [])
+    if not tags:
+        return {
+            "available": False,
+            "scoreAdjustment": 0.0,
+            "tags": [],
+            "reasons": [],
+            "risks": ["尚未建立題材標籤"],
+        }
+
+    peers = set(_same_theme_symbols(symbol, theme_map))
+    universe = await _get_market_universe_for_theme(markets, force_refresh=force_refresh)
+    peer_rows = [row for row in universe if str(row.get("symbol")) in peers]
+    if not peer_rows:
+        return {
+            "available": True,
+            "scoreAdjustment": min(4.0, len(tags) * 1.0),
+            "tags": tags,
+            "peerCount": len(peers),
+            "activePeerCount": 0,
+            "reasons": ["已有題材標籤，但同題材樣本不足"],
+            "risks": [],
+        }
+
+    rising = [row for row in peer_rows if _safe_float(row.get("changePercent")) > 0]
+    strong = [row for row in peer_rows if _safe_float(row.get("changePercent")) >= 5]
+    limit_like = [row for row in peer_rows if _safe_float(row.get("changePercent")) >= 8.5]
+    avg_change = mean([_safe_float(row.get("changePercent")) for row in peer_rows]) if peer_rows else 0.0
+    total_value = sum(_safe_float(row.get("tradeValue")) for row in peer_rows)
+
+    score = 0.0
+    reasons: list[str] = []
+    risks: list[str] = []
+    rising_ratio = len(rising) / len(peer_rows) if peer_rows else 0.0
+    if rising_ratio >= 0.6:
+        score += 5
+        reasons.append("同題材多數股票上漲")
+    elif rising_ratio <= 0.3:
+        score -= 3
+        risks.append("同題材漲勢不整齊")
+    if avg_change >= 2:
+        score += 4
+        reasons.append("同題材平均漲幅明顯")
+    elif avg_change < -1:
+        score -= 3
+        risks.append("同題材平均轉弱")
+    if strong:
+        score += min(5, len(strong) * 2)
+        reasons.append("同題材出現強勢股")
+    if limit_like:
+        score += 4
+        reasons.append("同題材接近漲停股帶動熱度")
+    if total_value >= 5_000_000_000:
+        score += 2
+        reasons.append("同題材成交值活躍")
+
+    score = _clamp(score, -8, 15)
+    top_peers = sorted(peer_rows, key=lambda row: _safe_float(row.get("changePercent")), reverse=True)[:5]
+    return {
+        "available": True,
+        "scoreAdjustment": round(score, 2),
+        "tags": tags,
+        "peerCount": len(peers),
+        "activePeerCount": len(peer_rows),
+        "risingPeerCount": len(rising),
+        "strongPeerCount": len(strong),
+        "averagePeerChangePercent": _round(avg_change),
+        "peerTradeValue": int(total_value),
+        "topPeers": [
+            {
+                "symbol": row.get("symbol"),
+                "name": row.get("name"),
+                "changePercent": row.get("changePercent"),
+                "tradeValue": row.get("tradeValue"),
+            }
+            for row in top_peers
+        ],
+        "reasons": reasons[:5],
+        "risks": risks[:5],
+    }
+
+
+async def _compute_risk_flags(symbol: str, text: str = "") -> dict[str, Any]:
+    symbol = _validate_symbol(symbol)
+    rules = await _get_risk_rules()
+    exclude_keywords = [str(x) for x in rules.get("exclude_keywords", [])]
+    warning_keywords = [str(x) for x in rules.get("warning_keywords", [])]
+    symbol_risks = rules.get("symbol_risks", {}) if isinstance(rules.get("symbol_risks", {}), dict) else {}
+    score_penalty = rules.get("score_penalty", {}) if isinstance(rules.get("score_penalty", {}), dict) else {}
+
+    haystack = text or ""
+    matched_exclude = [kw for kw in exclude_keywords if kw and kw in haystack]
+    matched_warning = [kw for kw in warning_keywords if kw and kw in haystack]
+    manual = symbol_risks.get(symbol, [])
+    if isinstance(manual, str):
+        manual = [manual]
+    elif not isinstance(manual, list):
+        manual = []
+
+    penalty = 0.0
+    if matched_exclude:
+        penalty -= 30
+    if matched_warning:
+        penalty -= min(20, 5 * len(matched_warning))
+    if manual:
+        penalty -= min(20, 6 * len(manual))
+    # 靜態規則表可放入自訂項目，例如 {"attention_stock": -8}
+    if manual:
+        for item in manual:
+            key = str(item).strip()
+            if key in score_penalty:
+                penalty += _safe_float(score_penalty.get(key))
+
+    action = "allow"
+    if matched_exclude:
+        action = "exclude"
+    elif matched_warning or manual:
+        action = "warning"
+
+    return {
+        "symbol": symbol,
+        "action": action,
+        "scoreAdjustment": round(penalty, 2),
+        "matchedExcludeKeywords": matched_exclude,
+        "matchedWarningKeywords": matched_warning,
+        "manualRisks": manual,
+        "note": "V8 免費版風險過濾以自訂關鍵字與手動風險清單為主；即時公告解析可在下一版再加強。",
+    }
+
+
+def _date_key_from_screen_payload(payload: dict[str, Any]) -> str:
+    as_of = payload.get("asOf") or []
+    if isinstance(as_of, list) and as_of:
+        first_date = as_of[0].get("date") if isinstance(as_of[0], dict) else None
+        if first_date:
+            return re.sub(r"[^0-9]", "", str(first_date))[:8]
+    return _taipei_now().strftime("%Y%m%d")
+
+
+async def _load_screen_records() -> list[dict[str, Any]]:
+    remote = await _v8_redis_get_json("screenRecords")
+    if isinstance(remote, list):
+        _V8_MEMORY_STORE["screenRecords"] = remote[-BACKTEST_MAX_RECORDS:]
+    return list(_V8_MEMORY_STORE.get("screenRecords") or [])
+
+
+async def _save_screen_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+    records = records[-BACKTEST_MAX_RECORDS:]
+    _V8_MEMORY_STORE["screenRecords"] = records
+    persisted = await _v8_redis_set_json("screenRecords", records)
+    return {"savedToRedis": persisted, "recordCount": len(records)}
+
+
+async def _record_screen_payload(payload: dict[str, Any], note: str = "") -> dict[str, Any]:
+    records = await _load_screen_records()
+    date_key = _date_key_from_screen_payload(payload)
+    strategy = str(payload.get("strategy", "unknown"))
+    run_id = f"RUN-{date_key}-{strategy}-{len(records)+1:04d}"
+    items = []
+    for item in payload.get("results", []):
+        symbol = str(item.get("symbol"))
+        rank = int(item.get("rank", len(items) + 1) or len(items) + 1)
+        signal_id = f"SIG-{date_key}-{strategy}-{rank:02d}-{symbol}"
+        items.append({
+            "signalId": signal_id,
+            "rank": rank,
+            "symbol": symbol,
+            "name": item.get("name"),
+            "score": item.get("score"),
+            "closePrice": item.get("closePrice"),
+            "reasons": item.get("reasons", []),
+            "risks": item.get("risks", []),
+            "theme": item.get("theme"),
+            "riskFlags": item.get("riskFlags"),
+            "technical": item.get("technical", {}),
+        })
+    record = {
+        "runId": run_id,
+        "dateKey": date_key,
+        "strategy": strategy,
+        "markets": payload.get("markets"),
+        "createdAtTaipei": _taipei_now().isoformat(),
+        "note": note,
+        "items": items,
+    }
+    records.append(record)
+    storage = await _save_screen_records(records)
+    return {"ok": True, "runId": run_id, "dateKey": date_key, "itemCount": len(items), **storage}
+
+
+def _parse_date_key(date_key: str) -> date | None:
+    try:
+        digits = re.sub(r"[^0-9]", "", str(date_key))[:8]
+        return datetime.strptime(digits, "%Y%m%d").date()
+    except Exception:
+        return None
+
+
+def _returns_from_candles(candles: list[dict[str, Any]], signal_date: date | None, horizons: list[int]) -> dict[str, Any]:
+    valid = []
+    for row in candles:
+        try:
+            d = datetime.fromisoformat(str(row.get("date"))[:10]).date()
+            c = _safe_float(row.get("close"))
+            h = _safe_float(row.get("high"))
+            l = _safe_float(row.get("low"))
+            if c > 0:
+                valid.append({"date": d, "close": c, "high": h, "low": l})
+        except Exception:
+            continue
+    if not valid:
+        return {"available": False, "error": "no candle data"}
+    start_index = None
+    if signal_date is not None:
+        for i, row in enumerate(valid):
+            if row["date"] >= signal_date:
+                start_index = i
+                break
+    if start_index is None:
+        return {"available": False, "error": "signal date not found"}
+    base = valid[start_index]["close"]
+    out: dict[str, Any] = {
+        "available": True,
+        "baseDate": valid[start_index]["date"].isoformat(),
+        "baseClose": _round(base),
+        "returns": {},
+    }
+    future = valid[start_index + 1:]
+    if future:
+        max_high = max(row["high"] for row in future[: max(horizons)])
+        min_low = min(row["low"] for row in future[: max(horizons)])
+        out["maxFavorablePercent"] = _round((max_high / base - 1) * 100)
+        out["maxAdversePercent"] = _round((min_low / base - 1) * 100)
+    for horizon in horizons:
+        idx = start_index + horizon
+        key = f"d{horizon}"
+        if idx < len(valid):
+            out["returns"][key] = _round((valid[idx]["close"] / base - 1) * 100)
+        else:
+            out["returns"][key] = None
+    return out
+
+
+async def _performance_for_signal(record: dict[str, Any], item: dict[str, Any], horizons: list[int]) -> dict[str, Any]:
+    symbol = _validate_symbol(str(item.get("symbol")))
+    signal_date = _parse_date_key(str(record.get("dateKey")))
+    raw = await _get_daily_candles_raw(symbol, days=365)
+    perf = _returns_from_candles(raw.get("data", []), signal_date, horizons)
+    return {
+        "signalId": item.get("signalId"),
+        "runId": record.get("runId"),
+        "dateKey": record.get("dateKey"),
+        "strategy": record.get("strategy"),
+        "rank": item.get("rank"),
+        "symbol": symbol,
+        "name": item.get("name"),
+        "score": item.get("score"),
+        **perf,
+    }
+
+
+@mcp.tool()
+async def get_theme_score(symbol: str, markets: str = "BOTH", force_refresh: bool = False) -> dict:
+    """取得單檔股票的題材標籤與同題材強度分數。"""
+    symbol = _validate_symbol(symbol)
+    return await _compute_theme_score(symbol, markets=markets, force_refresh=force_refresh)
+
+
+@mcp.tool()
+async def update_theme_tags(symbol: str, tags: list[str], mode: str = "replace") -> dict:
+    """
+    新增或更新股票題材標籤。mode 支援 replace、append、remove。
+    優先保存到 Redis；若未設定 Redis，僅在服務重啟前暫存於記憶體。
+    """
+    symbol = _validate_symbol(symbol)
+    mode = mode.lower().strip()
+    if mode not in {"replace", "append", "remove"}:
+        raise ValueError("mode 僅支援 replace、append、remove。")
+    cleaned_tags = [str(tag).strip() for tag in tags if str(tag).strip()]
+    theme_map = await _get_theme_map()
+    existing = theme_map.get(symbol, [])
+    if mode == "replace":
+        theme_map[symbol] = list(dict.fromkeys(cleaned_tags))
+    elif mode == "append":
+        theme_map[symbol] = list(dict.fromkeys(existing + cleaned_tags))
+    else:
+        remove_set = set(cleaned_tags)
+        theme_map[symbol] = [tag for tag in existing if tag not in remove_set]
+        if not theme_map[symbol]:
+            theme_map.pop(symbol, None)
+    storage = await _set_theme_map(theme_map)
+    return {"ok": True, "symbol": symbol, "tags": theme_map.get(symbol, []), **storage}
+
+
+@mcp.tool()
+async def get_risk_flags(symbol: str, text: str = "") -> dict:
+    """
+    依 risk_rules.json 與手動風險清單檢查單檔風險。
+    text 可貼公告或新聞標題；免費版尚未自動抓完整公告全文。
+    """
+    symbol = _validate_symbol(symbol)
+    return await _compute_risk_flags(symbol, text=text)
+
+
+@mcp.tool()
+async def screen_market_v2(
+    strategy: str = "early_stage",
+    markets: str = "BOTH",
+    top_n: int = 10,
+    candidate_limit: int = 60,
+    min_trade_value: int = 100000000,
+    min_price: float = 10.0,
+    max_price: float = 5000.0,
+    include_chip: bool = True,
+    include_theme: bool = True,
+    include_risk: bool = True,
+    record_result: bool = True,
+    force_refresh: bool = False,
+) -> dict:
+    """
+    V8 勝率加強版選股：先沿用 screen_market 做技術與籌碼篩選，
+    再加入題材/族群熱度與風險扣分，並可自動記錄結果供後續回測。
+    """
+    base = await screen_market(
+        strategy=strategy,
+        markets=markets,
+        top_n=top_n,
+        candidate_limit=min(candidate_limit, 55),
+        min_trade_value=min_trade_value,
+        min_price=min_price,
+        max_price=max_price,
+        include_chip=include_chip,
+        force_refresh=force_refresh,
+    )
+    enhanced = []
+    for item in base.get("results", []):
+        item = dict(item)
+        original_score = _safe_float(item.get("score"))
+        total_adjustment = 0.0
+        if include_theme:
+            theme = await _compute_theme_score(str(item.get("symbol")), markets=markets, force_refresh=force_refresh)
+            item["theme"] = theme
+            total_adjustment += _safe_float(theme.get("scoreAdjustment"))
+            item["reasons"] = (item.get("reasons", []) + theme.get("reasons", []))[:10]
+            item["risks"] = (item.get("risks", []) + theme.get("risks", []))[:8]
+        if include_risk:
+            # 目前以手動 risk_rules 與既有風險文字做關鍵字檢查。
+            risk_text = " ".join([str(x) for x in item.get("risks", [])])
+            risk = await _compute_risk_flags(str(item.get("symbol")), text=risk_text)
+            item["riskFlags"] = risk
+            total_adjustment += _safe_float(risk.get("scoreAdjustment"))
+            if risk.get("action") == "exclude":
+                item["excludedByRisk"] = True
+        item["baseScore"] = round(original_score, 2)
+        item["v8Adjustment"] = round(total_adjustment, 2)
+        item["score"] = round(original_score + total_adjustment, 2)
+        enhanced.append(item)
+
+    enhanced = [item for item in enhanced if not item.get("excludedByRisk")]
+    enhanced.sort(key=lambda row: _safe_float(row.get("score")), reverse=True)
+    for rank, item in enumerate(enhanced, start=1):
+        item["rank"] = rank
+    base["results"] = enhanced[:top_n]
+    base["v8"] = {
+        "version": "8.0.0-free",
+        "includeTheme": include_theme,
+        "includeRisk": include_risk,
+        "recordResult": record_result,
+        "note": "V8 免費版先強化盤後選股、題材分數、手動風險過濾與回測追蹤；不是獲利保證。",
+    }
+    if record_result:
+        base["record"] = await _record_screen_payload(base, note="screen_market_v2 auto record")
+    return base
+
+
+@mcp.tool()
+async def record_screen_result(screen_result: dict, note: str = "") -> dict:
+    """手動記錄一次 screen_market 或 screen_market_v2 的結果，供後續回測統計。"""
+    if not isinstance(screen_result, dict) or not isinstance(screen_result.get("results"), list):
+        raise ValueError("screen_result 必須是包含 results 陣列的選股結果。")
+    return await _record_screen_payload(screen_result, note=note)
+
+
+@mcp.tool()
+async def get_backtest_summary(strategy: str = "early_stage", lookback_records: int = 60) -> dict:
+    """
+    統計已記錄選股訊號的隔日、3日、5日表現。
+    需要先用 screen_market_v2(record_result=true) 或 record_screen_result 累積資料。
+    """
+    strategy = strategy.lower().strip()
+    records = await _load_screen_records()
+    matched = [record for record in records if str(record.get("strategy", "")).lower() == strategy]
+    matched = matched[-max(1, min(lookback_records, 120)):]
+    if not matched:
+        return {
+            "available": False,
+            "strategy": strategy,
+            "recordCount": 0,
+            "message": "目前尚未累積此策略的選股紀錄。請先用 screen_market_v2 並設定 record_result=true。",
+        }
+    tasks = []
+    for record in matched:
+        for item in record.get("items", []):
+            tasks.append(_performance_for_signal(record, item, horizons=[1, 3, 5]))
+    raw = await asyncio.gather(*tasks, return_exceptions=True)
+    rows = [row for row in raw if isinstance(row, dict) and row.get("available")]
+    if not rows:
+        return {
+            "available": False,
+            "strategy": strategy,
+            "recordCount": len(matched),
+            "message": "已找到紀錄，但歷史K線尚不足以計算報酬，可能是訊號太新或資料尚未更新。",
+        }
+
+    def collect(key: str) -> list[float]:
+        values = []
+        for row in rows:
+            value = (row.get("returns") or {}).get(key)
+            if isinstance(value, (int, float)):
+                values.append(float(value))
+        return values
+
+    summary: dict[str, Any] = {}
+    for key in ["d1", "d3", "d5"]:
+        values = collect(key)
+        if values:
+            summary[key] = {
+                "sampleSize": len(values),
+                "winRatePercent": _round(sum(1 for value in values if value > 0) / len(values) * 100),
+                "averageReturnPercent": _round(mean(values)),
+                "medianReturnPercent": _round(sorted(values)[len(values)//2]),
+                "bestPercent": _round(max(values)),
+                "worstPercent": _round(min(values)),
+            }
+        else:
+            summary[key] = {"sampleSize": 0}
+
+    adverse = [row.get("maxAdversePercent") for row in rows if isinstance(row.get("maxAdversePercent"), (int, float))]
+    favorable = [row.get("maxFavorablePercent") for row in rows if isinstance(row.get("maxFavorablePercent"), (int, float))]
+    return {
+        "available": True,
+        "strategy": strategy,
+        "recordCount": len(matched),
+        "signalCount": len(rows),
+        "summary": summary,
+        "averageMaxFavorablePercent": _round(mean(favorable)) if favorable else None,
+        "averageMaxAdversePercent": _round(mean(adverse)) if adverse else None,
+        "recentSignals": rows[-10:],
+        "note": "此回測使用已記錄訊號與後續日K收盤價估算，尚未扣除交易成本、滑價與實際進出場規則。",
+    }
+
+
+@mcp.tool()
+async def get_signal_performance(signal_id: str) -> dict:
+    """查詢單一已記錄訊號的後續表現。"""
+    signal_id = str(signal_id).strip()
+    records = await _load_screen_records()
+    for record in records:
+        for item in record.get("items", []):
+            if str(item.get("signalId")) == signal_id:
+                return await _performance_for_signal(record, item, horizons=[1, 3, 5, 10])
+    return {"available": False, "signalId": signal_id, "message": "找不到此 signal_id。"}
 
 
 if __name__ == "__main__":
