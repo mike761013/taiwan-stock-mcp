@@ -1,0 +1,44 @@
+{
+  "enabled": true,
+  "watchlist": [
+    {
+      "symbol": "2313",
+      "name": "華通",
+      "breakout_price": null,
+      "stop_loss_price": null
+    },
+    {
+      "symbol": "4977",
+      "name": "眾達-KY",
+      "breakout_price": null,
+      "stop_loss_price": null
+    },
+    {
+      "symbol": "6213",
+      "name": "聯茂",
+      "breakout_price": null,
+      "stop_loss_price": null
+    },
+    {
+      "symbol": "3583",
+      "name": "辛耘",
+      "breakout_price": null,
+      "stop_loss_price": null
+    },
+    {
+      "symbol": "2408",
+      "name": "南亞科",
+      "breakout_price": null,
+      "stop_loss_price": null
+    }
+  ],
+  "rules": {
+    "breakout_from_open_percent": 2.0,
+    "drop_from_open_percent": -2.0,
+    "new_high_extension_percent": 0.8,
+    "cooldown_seconds": 300,
+    "poll_seconds": 15,
+    "market_only": true
+  },
+  "message": "免費版建議最多5檔，且先用 REST 每15秒輪詢。若未來升級 Fugle 方案，可改成 WebSocket。"
+}
