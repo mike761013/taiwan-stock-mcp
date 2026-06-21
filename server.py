@@ -2616,14 +2616,15 @@ async def get_telegram_setup_status(limit: int = 5) -> dict:
     chat_value = os.environ.get("TELEGRAM_CHAT_ID", "")
 
     debug_env = {
-        "telegramBotTokenInEnv": "TELEGRAM_BOT_TOKEN" in os.environ,
-        "telegramBotTokenLength": len(token_value),
-        "telegramBotTokenStrippedLength": len(token_value.strip()),
-        "telegramChatIdInEnv": "TELEGRAM_CHAT_ID" in os.environ,
-        "telegramChatIdLength": len(chat_value),
-        "telegramChatIdStrippedLength": len(chat_value.strip()),
-        "testEnv": os.environ.get("TEST_ENV", "NOT_FOUND"),
-    }
+    "telegramBotTokenInEnv": "TELEGRAM_BOT_TOKEN" in os.environ,
+    "telegramBotTokenLength": len(token_value),
+    "telegramBotTokenStrippedLength": len(token_value.strip()),
+    "telegramChatIdInEnv": "TELEGRAM_CHAT_ID" in os.environ,
+    "telegramChatIdLength": len(chat_value),
+    "telegramChatIdStrippedLength": len(chat_value.strip()),
+    "testEnv": os.environ.get("TEST_ENV", "NOT_FOUND"),
+    "matchedEnvKeys": sorted([k for k in os.environ.keys() if "TELEGRAM" in k or "TEST" in k or "FUGLE" in k or "FINMIND" in k]),
+}
 
     token_configured = bool(token_value.strip())
     chat_configured = bool(chat_value.strip())
