@@ -1,0 +1,28 @@
+{
+  "exclude_keywords": [
+    "處置",
+    "分盤交易",
+    "減資",
+    "私募",
+    "財報重編"
+  ],
+  "warning_keywords": [
+    "現金增資",
+    "可轉債",
+    "大股東申讓",
+    "注意股",
+    "借券賣出增加",
+    "融資暴增",
+    "營收年減",
+    "虧損擴大"
+  ],
+  "score_penalty": {
+    "cash_capital_increase": -10,
+    "attention_stock": -8,
+    "disposition_stock": -30,
+    "insider_sell": -12,
+    "margin_spike": -8,
+    "convertible_bond_pressure": -8
+  },
+  "symbol_risks": {}
+}
