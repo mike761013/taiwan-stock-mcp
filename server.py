@@ -2596,6 +2596,53 @@ async def get_signal_performance(signal_id: str) -> dict:
 # === V9 Dynamic Monitor Config Tools ===
 # 這段工具讓 ChatGPT 可以直接更新 Background Worker 的動態監控設定。
 # 需搭配 monitor_config_store.py，並且 Web Service / Background Worker 都設定同一組 REDIS_URL。
+# 2026-06-22：更新成功後會同步嘗試發送 Telegram 確認通知。
+
+async def _notify_monitor_config_changed(config: dict[str, Any], action: str = "監控設定已更新") -> dict:
+    """設定更新後，送一則 Telegram 確認通知。失敗不影響設定本身。"""
+    try:
+        from notifications import send_telegram_message
+
+        watchlist = config.get("watchlist") or []
+        rules = config.get("rules") or {}
+
+        lines = []
+        for item in watchlist:
+            symbol = str(item.get("symbol", "")).strip()
+            name = str(item.get("name") or symbol).strip()
+            if symbol:
+                lines.append(f"• {symbol} {name}")
+
+        market_only = rules.get("market_only")
+        market_only_text = "是" if market_only else "否"
+
+        message = (
+            "【台股監控設定已更新】\n"
+            f"{action}\n\n"
+            f"監控檔數：{len(watchlist)}\n"
+            "監控清單：\n"
+            f"{chr(10).join(lines) if lines else '無'}\n\n"
+            f"輪詢秒數：{rules.get('poll_seconds', '未設定')} 秒\n"
+            f"冷卻秒數：{rules.get('cooldown_seconds', '未設定')} 秒\n"
+            f"開盤漲幅提醒：{rules.get('breakout_from_open_percent', '未設定')}%\n"
+            f"開盤跌幅提醒：{rules.get('drop_from_open_percent', '未設定')}%\n"
+            f"創高延伸提醒：{rules.get('new_high_extension_percent', '未設定')}%\n"
+            f"僅盤中監控：{market_only_text}"
+        )
+
+        data = await send_telegram_message(message)
+        return {
+            "ok": True,
+            "telegramOk": bool(data.get("ok")),
+            "message": "Telegram 確認通知已送出。",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "telegramOk": False,
+            "message": f"Telegram 確認通知發送失敗：{exc}",
+        }
+
 
 @mcp.tool()
 async def get_dynamic_monitor_config() -> dict:
@@ -2649,11 +2696,17 @@ async def update_monitor_config(
             "message": f"更新監控設定失敗：{exc}",
         }
 
+    telegram_result = await _notify_monitor_config_changed(
+        config,
+        action="ChatGPT 已更新監控設定。",
+    )
+
     return {
         "ok": True,
         "redisKey": REDIS_KEY,
         "config": config,
-        "message": "監控設定已更新。Background Worker 會在下一輪輪詢讀到新設定。",
+        "telegram": telegram_result,
+        "message": "監控設定已更新。Background Worker 會在下一輪輪詢讀到新設定，並已嘗試發送 Telegram 確認通知。",
     }
 
 
@@ -2679,13 +2732,18 @@ async def set_monitor_watchlist(watchlist: str, poll_seconds: int | None = None)
             "message": f"設定監控清單失敗：{exc}",
         }
 
+    telegram_result = await _notify_monitor_config_changed(
+        config,
+        action="ChatGPT 已更新監控清單。",
+    )
+
     return {
         "ok": True,
         "redisKey": REDIS_KEY,
         "config": config,
-        "message": "監控清單已更新。Background Worker 會在下一輪輪詢讀到新設定。",
+        "telegram": telegram_result,
+        "message": "監控清單已更新。Background Worker 會在下一輪輪詢讀到新設定，並已嘗試發送 Telegram 確認通知。",
     }
-
 
 
 if __name__ == "__main__":
