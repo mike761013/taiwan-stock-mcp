@@ -27,7 +27,7 @@ TPEX_DAILY_CLOSE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_
 
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
-CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v6")
+CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v8")
 CACHE_MAX_ITEMS = int(os.environ.get("CACHE_MAX_ITEMS", "2500"))
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 
@@ -1261,7 +1261,8 @@ def ping() -> dict:
     """檢查台股 MCP 伺服器是否正常運作。"""
     return {
         "ok": True,
-        "server": "Taiwan Stock MCP v6-official-market",
+        "server": "Taiwan Stock MCP v8-free-score-tracker",
+        "version": "8.0.0-free",
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "tools": [
             "get_realtime_quote",
@@ -1276,6 +1277,13 @@ def ping() -> dict:
             "screen_market",
             "rank_screened_stocks",
             "get_stock_full_analysis",
+            "screen_market_v2",
+            "record_screen_result",
+            "get_backtest_summary",
+            "get_signal_performance",
+            "get_theme_score",
+            "update_theme_tags",
+            "get_risk_flags",
             "get_cache_status",
             "clear_cache",
         ],
@@ -1994,6 +2002,595 @@ async def clear_cache(scope: str = "all") -> dict:
         "redisDeleted": redis_deleted,
         "timeTaipei": _taipei_now().isoformat(),
     }
+
+# =========================
+# V8 free-score-tracker add-ons
+# =========================
+THEMES_FILE = os.environ.get("THEMES_FILE", "themes.json")
+RISK_RULES_FILE = os.environ.get("RISK_RULES_FILE", "risk_rules.json")
+BACKTEST_MAX_RECORDS = int(os.environ.get("BACKTEST_MAX_RECORDS", "300"))
+
+_V8_MEMORY_STORE: dict[str, Any] = {
+    "themeTags": None,
+    "riskRules": None,
+    "screenRecords": [],
+}
+
+
+def _read_json_file(filename: str, default: Any) -> Any:
+    try:
+        path = os.path.join(os.getcwd(), filename)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+    except Exception:
+        pass
+    return default
+
+
+async def _v8_redis_get_json(key: str) -> Any | None:
+    client = await _get_redis_client()
+    if client is None:
+        return None
+    try:
+        raw = await client.get(f"{CACHE_PREFIX}:v8store:{key}")
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+async def _v8_redis_set_json(key: str, value: Any, ttl: int | None = None) -> bool:
+    client = await _get_redis_client()
+    if client is None:
+        return False
+    try:
+        redis_key = f"{CACHE_PREFIX}:v8store:{key}"
+        if ttl is None:
+            await client.set(redis_key, _json_dumps(value))
+        else:
+            await client.set(redis_key, _json_dumps(value), ex=max(1, int(ttl)))
+        return True
+    except Exception:
+        return False
+
+
+def _normalize_theme_map(value: Any) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for raw_symbol, raw_tags in value.items():
+        try:
+            symbol = _validate_symbol(str(raw_symbol))
+        except Exception:
+            continue
+        if isinstance(raw_tags, str):
+            tags = [part.strip() for part in re.split(r"[,，、/]+", raw_tags) if part.strip()]
+        elif isinstance(raw_tags, list):
+            tags = [str(item).strip() for item in raw_tags if str(item).strip()]
+        else:
+            tags = []
+        if tags:
+            out[symbol] = list(dict.fromkeys(tags))
+    return out
+
+
+async def _get_theme_map() -> dict[str, list[str]]:
+    remote = await _v8_redis_get_json("themeTags")
+    if remote is not None:
+        return _normalize_theme_map(remote)
+    if _V8_MEMORY_STORE.get("themeTags") is None:
+        _V8_MEMORY_STORE["themeTags"] = _normalize_theme_map(_read_json_file(THEMES_FILE, {}))
+    return dict(_V8_MEMORY_STORE.get("themeTags") or {})
+
+
+async def _set_theme_map(theme_map: dict[str, list[str]]) -> dict[str, Any]:
+    normalized = _normalize_theme_map(theme_map)
+    _V8_MEMORY_STORE["themeTags"] = normalized
+    persisted = await _v8_redis_set_json("themeTags", normalized)
+    return {"savedToRedis": persisted, "count": len(normalized)}
+
+
+async def _get_risk_rules() -> dict[str, Any]:
+    remote = await _v8_redis_get_json("riskRules")
+    if isinstance(remote, dict):
+        return remote
+    if _V8_MEMORY_STORE.get("riskRules") is None:
+        _V8_MEMORY_STORE["riskRules"] = _read_json_file(RISK_RULES_FILE, {})
+    rules = _V8_MEMORY_STORE.get("riskRules") or {}
+    return rules if isinstance(rules, dict) else {}
+
+
+def _same_theme_symbols(symbol: str, theme_map: dict[str, list[str]]) -> list[str]:
+    tags = set(theme_map.get(symbol, []))
+    if not tags:
+        return []
+    peers = []
+    for other_symbol, other_tags in theme_map.items():
+        if other_symbol != symbol and tags.intersection(other_tags):
+            peers.append(other_symbol)
+    return peers
+
+
+async def _get_market_universe_for_theme(markets: str = "BOTH", force_refresh: bool = False) -> list[dict[str, Any]]:
+    markets = markets.upper().strip()
+    requested_markets = ["TSE", "OTC"] if markets == "BOTH" else [markets]
+    payloads = await asyncio.gather(
+        *[_get_official_market_quotes(market, force_refresh=force_refresh) for market in requested_markets],
+        return_exceptions=True,
+    )
+    rows: list[dict[str, Any]] = []
+    for payload in payloads:
+        if isinstance(payload, Exception):
+            continue
+        rows.extend(payload.get("data", []))
+    return rows
+
+
+async def _compute_theme_score(symbol: str, markets: str = "BOTH", force_refresh: bool = False) -> dict[str, Any]:
+    symbol = _validate_symbol(symbol)
+    theme_map = await _get_theme_map()
+    tags = theme_map.get(symbol, [])
+    if not tags:
+        return {
+            "available": False,
+            "scoreAdjustment": 0.0,
+            "tags": [],
+            "reasons": [],
+            "risks": ["尚未建立題材標籤"],
+        }
+
+    peers = set(_same_theme_symbols(symbol, theme_map))
+    universe = await _get_market_universe_for_theme(markets, force_refresh=force_refresh)
+    peer_rows = [row for row in universe if str(row.get("symbol")) in peers]
+    if not peer_rows:
+        return {
+            "available": True,
+            "scoreAdjustment": min(4.0, len(tags) * 1.0),
+            "tags": tags,
+            "peerCount": len(peers),
+            "activePeerCount": 0,
+            "reasons": ["已有題材標籤，但同題材樣本不足"],
+            "risks": [],
+        }
+
+    rising = [row for row in peer_rows if _safe_float(row.get("changePercent")) > 0]
+    strong = [row for row in peer_rows if _safe_float(row.get("changePercent")) >= 5]
+    limit_like = [row for row in peer_rows if _safe_float(row.get("changePercent")) >= 8.5]
+    avg_change = mean([_safe_float(row.get("changePercent")) for row in peer_rows]) if peer_rows else 0.0
+    total_value = sum(_safe_float(row.get("tradeValue")) for row in peer_rows)
+
+    score = 0.0
+    reasons: list[str] = []
+    risks: list[str] = []
+    rising_ratio = len(rising) / len(peer_rows) if peer_rows else 0.0
+    if rising_ratio >= 0.6:
+        score += 5
+        reasons.append("同題材多數股票上漲")
+    elif rising_ratio <= 0.3:
+        score -= 3
+        risks.append("同題材漲勢不整齊")
+    if avg_change >= 2:
+        score += 4
+        reasons.append("同題材平均漲幅明顯")
+    elif avg_change < -1:
+        score -= 3
+        risks.append("同題材平均轉弱")
+    if strong:
+        score += min(5, len(strong) * 2)
+        reasons.append("同題材出現強勢股")
+    if limit_like:
+        score += 4
+        reasons.append("同題材接近漲停股帶動熱度")
+    if total_value >= 5_000_000_000:
+        score += 2
+        reasons.append("同題材成交值活躍")
+
+    score = _clamp(score, -8, 15)
+    top_peers = sorted(peer_rows, key=lambda row: _safe_float(row.get("changePercent")), reverse=True)[:5]
+    return {
+        "available": True,
+        "scoreAdjustment": round(score, 2),
+        "tags": tags,
+        "peerCount": len(peers),
+        "activePeerCount": len(peer_rows),
+        "risingPeerCount": len(rising),
+        "strongPeerCount": len(strong),
+        "averagePeerChangePercent": _round(avg_change),
+        "peerTradeValue": int(total_value),
+        "topPeers": [
+            {
+                "symbol": row.get("symbol"),
+                "name": row.get("name"),
+                "changePercent": row.get("changePercent"),
+                "tradeValue": row.get("tradeValue"),
+            }
+            for row in top_peers
+        ],
+        "reasons": reasons[:5],
+        "risks": risks[:5],
+    }
+
+
+async def _compute_risk_flags(symbol: str, text: str = "") -> dict[str, Any]:
+    symbol = _validate_symbol(symbol)
+    rules = await _get_risk_rules()
+    exclude_keywords = [str(x) for x in rules.get("exclude_keywords", [])]
+    warning_keywords = [str(x) for x in rules.get("warning_keywords", [])]
+    symbol_risks = rules.get("symbol_risks", {}) if isinstance(rules.get("symbol_risks", {}), dict) else {}
+    score_penalty = rules.get("score_penalty", {}) if isinstance(rules.get("score_penalty", {}), dict) else {}
+
+    haystack = text or ""
+    matched_exclude = [kw for kw in exclude_keywords if kw and kw in haystack]
+    matched_warning = [kw for kw in warning_keywords if kw and kw in haystack]
+    manual = symbol_risks.get(symbol, [])
+    if isinstance(manual, str):
+        manual = [manual]
+    elif not isinstance(manual, list):
+        manual = []
+
+    penalty = 0.0
+    if matched_exclude:
+        penalty -= 30
+    if matched_warning:
+        penalty -= min(20, 5 * len(matched_warning))
+    if manual:
+        penalty -= min(20, 6 * len(manual))
+    # 靜態規則表可放入自訂項目，例如 {"attention_stock": -8}
+    if manual:
+        for item in manual:
+            key = str(item).strip()
+            if key in score_penalty:
+                penalty += _safe_float(score_penalty.get(key))
+
+    action = "allow"
+    if matched_exclude:
+        action = "exclude"
+    elif matched_warning or manual:
+        action = "warning"
+
+    return {
+        "symbol": symbol,
+        "action": action,
+        "scoreAdjustment": round(penalty, 2),
+        "matchedExcludeKeywords": matched_exclude,
+        "matchedWarningKeywords": matched_warning,
+        "manualRisks": manual,
+        "note": "V8 免費版風險過濾以自訂關鍵字與手動風險清單為主；即時公告解析可在下一版再加強。",
+    }
+
+
+def _date_key_from_screen_payload(payload: dict[str, Any]) -> str:
+    as_of = payload.get("asOf") or []
+    if isinstance(as_of, list) and as_of:
+        first_date = as_of[0].get("date") if isinstance(as_of[0], dict) else None
+        if first_date:
+            return re.sub(r"[^0-9]", "", str(first_date))[:8]
+    return _taipei_now().strftime("%Y%m%d")
+
+
+async def _load_screen_records() -> list[dict[str, Any]]:
+    remote = await _v8_redis_get_json("screenRecords")
+    if isinstance(remote, list):
+        _V8_MEMORY_STORE["screenRecords"] = remote[-BACKTEST_MAX_RECORDS:]
+    return list(_V8_MEMORY_STORE.get("screenRecords") or [])
+
+
+async def _save_screen_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+    records = records[-BACKTEST_MAX_RECORDS:]
+    _V8_MEMORY_STORE["screenRecords"] = records
+    persisted = await _v8_redis_set_json("screenRecords", records)
+    return {"savedToRedis": persisted, "recordCount": len(records)}
+
+
+async def _record_screen_payload(payload: dict[str, Any], note: str = "") -> dict[str, Any]:
+    records = await _load_screen_records()
+    date_key = _date_key_from_screen_payload(payload)
+    strategy = str(payload.get("strategy", "unknown"))
+    run_id = f"RUN-{date_key}-{strategy}-{len(records)+1:04d}"
+    items = []
+    for item in payload.get("results", []):
+        symbol = str(item.get("symbol"))
+        rank = int(item.get("rank", len(items) + 1) or len(items) + 1)
+        signal_id = f"SIG-{date_key}-{strategy}-{rank:02d}-{symbol}"
+        items.append({
+            "signalId": signal_id,
+            "rank": rank,
+            "symbol": symbol,
+            "name": item.get("name"),
+            "score": item.get("score"),
+            "closePrice": item.get("closePrice"),
+            "reasons": item.get("reasons", []),
+            "risks": item.get("risks", []),
+            "theme": item.get("theme"),
+            "riskFlags": item.get("riskFlags"),
+            "technical": item.get("technical", {}),
+        })
+    record = {
+        "runId": run_id,
+        "dateKey": date_key,
+        "strategy": strategy,
+        "markets": payload.get("markets"),
+        "createdAtTaipei": _taipei_now().isoformat(),
+        "note": note,
+        "items": items,
+    }
+    records.append(record)
+    storage = await _save_screen_records(records)
+    return {"ok": True, "runId": run_id, "dateKey": date_key, "itemCount": len(items), **storage}
+
+
+def _parse_date_key(date_key: str) -> date | None:
+    try:
+        digits = re.sub(r"[^0-9]", "", str(date_key))[:8]
+        return datetime.strptime(digits, "%Y%m%d").date()
+    except Exception:
+        return None
+
+
+def _returns_from_candles(candles: list[dict[str, Any]], signal_date: date | None, horizons: list[int]) -> dict[str, Any]:
+    valid = []
+    for row in candles:
+        try:
+            d = datetime.fromisoformat(str(row.get("date"))[:10]).date()
+            c = _safe_float(row.get("close"))
+            h = _safe_float(row.get("high"))
+            l = _safe_float(row.get("low"))
+            if c > 0:
+                valid.append({"date": d, "close": c, "high": h, "low": l})
+        except Exception:
+            continue
+    if not valid:
+        return {"available": False, "error": "no candle data"}
+    start_index = None
+    if signal_date is not None:
+        for i, row in enumerate(valid):
+            if row["date"] >= signal_date:
+                start_index = i
+                break
+    if start_index is None:
+        return {"available": False, "error": "signal date not found"}
+    base = valid[start_index]["close"]
+    out: dict[str, Any] = {
+        "available": True,
+        "baseDate": valid[start_index]["date"].isoformat(),
+        "baseClose": _round(base),
+        "returns": {},
+    }
+    future = valid[start_index + 1:]
+    if future:
+        max_high = max(row["high"] for row in future[: max(horizons)])
+        min_low = min(row["low"] for row in future[: max(horizons)])
+        out["maxFavorablePercent"] = _round((max_high / base - 1) * 100)
+        out["maxAdversePercent"] = _round((min_low / base - 1) * 100)
+    for horizon in horizons:
+        idx = start_index + horizon
+        key = f"d{horizon}"
+        if idx < len(valid):
+            out["returns"][key] = _round((valid[idx]["close"] / base - 1) * 100)
+        else:
+            out["returns"][key] = None
+    return out
+
+
+async def _performance_for_signal(record: dict[str, Any], item: dict[str, Any], horizons: list[int]) -> dict[str, Any]:
+    symbol = _validate_symbol(str(item.get("symbol")))
+    signal_date = _parse_date_key(str(record.get("dateKey")))
+    raw = await _get_daily_candles_raw(symbol, days=365)
+    perf = _returns_from_candles(raw.get("data", []), signal_date, horizons)
+    return {
+        "signalId": item.get("signalId"),
+        "runId": record.get("runId"),
+        "dateKey": record.get("dateKey"),
+        "strategy": record.get("strategy"),
+        "rank": item.get("rank"),
+        "symbol": symbol,
+        "name": item.get("name"),
+        "score": item.get("score"),
+        **perf,
+    }
+
+
+@mcp.tool()
+async def get_theme_score(symbol: str, markets: str = "BOTH", force_refresh: bool = False) -> dict:
+    """取得單檔股票的題材標籤與同題材強度分數。"""
+    symbol = _validate_symbol(symbol)
+    return await _compute_theme_score(symbol, markets=markets, force_refresh=force_refresh)
+
+
+@mcp.tool()
+async def update_theme_tags(symbol: str, tags: list[str], mode: str = "replace") -> dict:
+    """
+    新增或更新股票題材標籤。mode 支援 replace、append、remove。
+    優先保存到 Redis；若未設定 Redis，僅在服務重啟前暫存於記憶體。
+    """
+    symbol = _validate_symbol(symbol)
+    mode = mode.lower().strip()
+    if mode not in {"replace", "append", "remove"}:
+        raise ValueError("mode 僅支援 replace、append、remove。")
+    cleaned_tags = [str(tag).strip() for tag in tags if str(tag).strip()]
+    theme_map = await _get_theme_map()
+    existing = theme_map.get(symbol, [])
+    if mode == "replace":
+        theme_map[symbol] = list(dict.fromkeys(cleaned_tags))
+    elif mode == "append":
+        theme_map[symbol] = list(dict.fromkeys(existing + cleaned_tags))
+    else:
+        remove_set = set(cleaned_tags)
+        theme_map[symbol] = [tag for tag in existing if tag not in remove_set]
+        if not theme_map[symbol]:
+            theme_map.pop(symbol, None)
+    storage = await _set_theme_map(theme_map)
+    return {"ok": True, "symbol": symbol, "tags": theme_map.get(symbol, []), **storage}
+
+
+@mcp.tool()
+async def get_risk_flags(symbol: str, text: str = "") -> dict:
+    """
+    依 risk_rules.json 與手動風險清單檢查單檔風險。
+    text 可貼公告或新聞標題；免費版尚未自動抓完整公告全文。
+    """
+    symbol = _validate_symbol(symbol)
+    return await _compute_risk_flags(symbol, text=text)
+
+
+@mcp.tool()
+async def screen_market_v2(
+    strategy: str = "early_stage",
+    markets: str = "BOTH",
+    top_n: int = 10,
+    candidate_limit: int = 60,
+    min_trade_value: int = 100000000,
+    min_price: float = 10.0,
+    max_price: float = 5000.0,
+    include_chip: bool = True,
+    include_theme: bool = True,
+    include_risk: bool = True,
+    record_result: bool = True,
+    force_refresh: bool = False,
+) -> dict:
+    """
+    V8 勝率加強版選股：先沿用 screen_market 做技術與籌碼篩選，
+    再加入題材/族群熱度與風險扣分，並可自動記錄結果供後續回測。
+    """
+    base = await screen_market(
+        strategy=strategy,
+        markets=markets,
+        top_n=top_n,
+        candidate_limit=min(candidate_limit, 55),
+        min_trade_value=min_trade_value,
+        min_price=min_price,
+        max_price=max_price,
+        include_chip=include_chip,
+        force_refresh=force_refresh,
+    )
+    enhanced = []
+    for item in base.get("results", []):
+        item = dict(item)
+        original_score = _safe_float(item.get("score"))
+        total_adjustment = 0.0
+        if include_theme:
+            theme = await _compute_theme_score(str(item.get("symbol")), markets=markets, force_refresh=force_refresh)
+            item["theme"] = theme
+            total_adjustment += _safe_float(theme.get("scoreAdjustment"))
+            item["reasons"] = (item.get("reasons", []) + theme.get("reasons", []))[:10]
+            item["risks"] = (item.get("risks", []) + theme.get("risks", []))[:8]
+        if include_risk:
+            # 目前以手動 risk_rules 與既有風險文字做關鍵字檢查。
+            risk_text = " ".join([str(x) for x in item.get("risks", [])])
+            risk = await _compute_risk_flags(str(item.get("symbol")), text=risk_text)
+            item["riskFlags"] = risk
+            total_adjustment += _safe_float(risk.get("scoreAdjustment"))
+            if risk.get("action") == "exclude":
+                item["excludedByRisk"] = True
+        item["baseScore"] = round(original_score, 2)
+        item["v8Adjustment"] = round(total_adjustment, 2)
+        item["score"] = round(original_score + total_adjustment, 2)
+        enhanced.append(item)
+
+    enhanced = [item for item in enhanced if not item.get("excludedByRisk")]
+    enhanced.sort(key=lambda row: _safe_float(row.get("score")), reverse=True)
+    for rank, item in enumerate(enhanced, start=1):
+        item["rank"] = rank
+    base["results"] = enhanced[:top_n]
+    base["v8"] = {
+        "version": "8.0.0-free",
+        "includeTheme": include_theme,
+        "includeRisk": include_risk,
+        "recordResult": record_result,
+        "note": "V8 免費版先強化盤後選股、題材分數、手動風險過濾與回測追蹤；不是獲利保證。",
+    }
+    if record_result:
+        base["record"] = await _record_screen_payload(base, note="screen_market_v2 auto record")
+    return base
+
+
+@mcp.tool()
+async def record_screen_result(screen_result: dict, note: str = "") -> dict:
+    """手動記錄一次 screen_market 或 screen_market_v2 的結果，供後續回測統計。"""
+    if not isinstance(screen_result, dict) or not isinstance(screen_result.get("results"), list):
+        raise ValueError("screen_result 必須是包含 results 陣列的選股結果。")
+    return await _record_screen_payload(screen_result, note=note)
+
+
+@mcp.tool()
+async def get_backtest_summary(strategy: str = "early_stage", lookback_records: int = 60) -> dict:
+    """
+    統計已記錄選股訊號的隔日、3日、5日表現。
+    需要先用 screen_market_v2(record_result=true) 或 record_screen_result 累積資料。
+    """
+    strategy = strategy.lower().strip()
+    records = await _load_screen_records()
+    matched = [record for record in records if str(record.get("strategy", "")).lower() == strategy]
+    matched = matched[-max(1, min(lookback_records, 120)):]
+    if not matched:
+        return {
+            "available": False,
+            "strategy": strategy,
+            "recordCount": 0,
+            "message": "目前尚未累積此策略的選股紀錄。請先用 screen_market_v2 並設定 record_result=true。",
+        }
+    tasks = []
+    for record in matched:
+        for item in record.get("items", []):
+            tasks.append(_performance_for_signal(record, item, horizons=[1, 3, 5]))
+    raw = await asyncio.gather(*tasks, return_exceptions=True)
+    rows = [row for row in raw if isinstance(row, dict) and row.get("available")]
+    if not rows:
+        return {
+            "available": False,
+            "strategy": strategy,
+            "recordCount": len(matched),
+            "message": "已找到紀錄，但歷史K線尚不足以計算報酬，可能是訊號太新或資料尚未更新。",
+        }
+
+    def collect(key: str) -> list[float]:
+        values = []
+        for row in rows:
+            value = (row.get("returns") or {}).get(key)
+            if isinstance(value, (int, float)):
+                values.append(float(value))
+        return values
+
+    summary: dict[str, Any] = {}
+    for key in ["d1", "d3", "d5"]:
+        values = collect(key)
+        if values:
+            summary[key] = {
+                "sampleSize": len(values),
+                "winRatePercent": _round(sum(1 for value in values if value > 0) / len(values) * 100),
+                "averageReturnPercent": _round(mean(values)),
+                "medianReturnPercent": _round(sorted(values)[len(values)//2]),
+                "bestPercent": _round(max(values)),
+                "worstPercent": _round(min(values)),
+            }
+        else:
+            summary[key] = {"sampleSize": 0}
+
+    adverse = [row.get("maxAdversePercent") for row in rows if isinstance(row.get("maxAdversePercent"), (int, float))]
+    favorable = [row.get("maxFavorablePercent") for row in rows if isinstance(row.get("maxFavorablePercent"), (int, float))]
+    return {
+        "available": True,
+        "strategy": strategy,
+        "recordCount": len(matched),
+        "signalCount": len(rows),
+        "summary": summary,
+        "averageMaxFavorablePercent": _round(mean(favorable)) if favorable else None,
+        "averageMaxAdversePercent": _round(mean(adverse)) if adverse else None,
+        "recentSignals": rows[-10:],
+        "note": "此回測使用已記錄訊號與後續日K收盤價估算，尚未扣除交易成本、滑價與實際進出場規則。",
+    }
+
+
+@mcp.tool()
+async def get_signal_performance(signal_id: str) -> dict:
+    """查詢單一已記錄訊號的後續表現。"""
+    signal_id = str(signal_id).strip()
+    records = await _load_screen_records()
+    for record in records:
+        for item in record.get("items", []):
+            if str(item.get("signalId")) == signal_id:
+                return await _performance_for_signal(record, item, horizons=[1, 3, 5, 10])
+    return {"available": False, "signalId": signal_id, "message": "找不到此 signal_id。"}
 
 
 if __name__ == "__main__":
