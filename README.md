@@ -1,102 +1,62 @@
-# 台股 MCP V7.1：免費官方雙來源同日篩選
+# Taiwan Stock MCP V9 - Monitor Alerts
 
-V7.1 保留 V7 的免費全市場掃描，並新增 TWSE／TPEx 第二官方盤後端點。
-主要 OpenAPI 日期不同或落後時，程式會自動嘗試指定日期備援，不需要任何新 API Key。
+V9 在 V8 勝率追蹤器上新增：
 
-## 行情流程
+- Telegram 手機通知測試
+- 盤中監測 Background Worker
+- 監測設定檔 monitor_rules.json
+- 下單預覽 preview_order（只計算，不送單）
 
-1. 主要上市來源：TWSE OpenAPI `STOCK_DAY_ALL`
-2. 主要上櫃來源：TPEx OpenAPI `tpex_mainboard_daily_close_quotes`
-3. 若主要來源日期不同，或落後 Fugle 參考交易日：
-   - 上市備援：TWSE `MI_INDEX` 指定日期盤後行情
-   - 上櫃備援：TPEx `dailyQuotes` 指定日期盤後行情
-4. 備援資料必須通過：
-   - 回傳日期等於目標交易日
-   - 普通股家數高於安全門檻
-   - 股票代號不重複
-   - OHLC 完整率至少 80%
-   - 成交量／成交值完整率至少 75%
-5. 全市場日期一致後，才進行多通道初篩。
-6. 候選股以 Fugle 歷史 K 線做深度技術分析，並併入當日官方 K 棒。
-7. `include_chip=true` 時，只對技術前 `top_n` 檔補 FinMind 籌碼。
+## 主要檔案
 
-若主要與備援都無法對齊日期，仍會拒絕排名，不會混用不同交易日資料。
+- `server.py`：ChatGPT MCP 主服務，新增 `send_test_notification`、`get_telegram_setup_status`、`get_monitor_config`、`preview_order`
+- `notifications.py`：Telegram Bot 發送通知
+- `monitor_worker.py`：Render Background Worker 使用，盤中監測最多 5 檔
+- `monitor_rules.json`：監測清單與條件
+- `order_preview.py`：下單預覽成本與風險試算
 
-## 版本辨識
+## Web Service Start Command
 
-`ping` 應回傳：
-
-```text
-Taiwan Stock MCP v7.1-free-official-fallback
-version=7.1.0-free
+```bash
+python server.py
 ```
 
-成功篩選時新增：
+## Background Worker Start Command
 
-- `primaryMarketDates`
-- `finalMarketDates`
-- `fallbackUsed`
-- `fallbackMarkets`
-- `fallbackAttempts`
-- `asOf[].primarySource`
-- `asOf[].source`
-- `asOf[].validation`
+```bash
+python monitor_worker.py
+```
 
-## Render 環境變數
+## 必要環境變數
 
-沿用 V7 原設定即可，不需新增官方 API Key：
+原本 V8 已有：
 
 ```text
 FUGLE_API_KEY
 FINMIND_TOKEN
-REDIS_URL（如有）
-PYTHON_VERSION=3.12.13
-V7_HISTORY_CALLS_PER_MINUTE=55
-V7_HISTORY_CONCURRENCY=3
-V7_CHIP_CONCURRENCY=2
-V7_MIN_UNIVERSE_COUNT=1800
-V7_MIN_TSE_COUNT=950
-V7_MIN_OTC_COUNT=750
-V7_REFERENCE_SYMBOL=2330
+REDIS_URL
+TZ=Asia/Taipei
 ```
 
-## 更新既有 V7
-
-1. 解壓縮 ZIP。
-2. 到目前 Render 服務所使用的 GitHub 分支 `v7-free-official-same-day`。
-3. 上傳並覆蓋根目錄檔案。
-4. Commit changes。
-5. Render 通常會自動重新部署；沒有自動部署時手動執行 Deploy latest commit。
-6. MCP URL 不變，ChatGPT App 不必重建。
-7. 先執行 `PING`，確認版本為 `7.1.0-free`。
-
-## 測試指令
+V9 手機通知新增：
 
 ```text
-使用 screen_market，
-strategy=early_stage，
-markets=BOTH，
-top_n=10，
-candidate_limit=40，
-include_chip=true，
-force_refresh=true
+TELEGRAM_BOT_TOKEN=你的 BotFather token
+TELEGRAM_CHAT_ID=你的 chat id
 ```
 
-若備援成功，結果應顯示：
+V9 盤中監測 Background Worker 建議：
 
 ```text
-ok=true
-fallbackUsed=true
-fallbackMarkets=["TSE"] 或 ["OTC"]
-primaryMarketDates 與 finalMarketDates 不同
-allUniverseUsingSameDate=true
+MONITOR_ENABLED=true
+MONITOR_MODE=paper
+MONITOR_WATCHLIST=2313,4977,6213,3583,2408
+MONITOR_POLL_SECONDS=15
+ALERT_COOLDOWN_SECONDS=300
+MONITOR_MARKET_ONLY=true
+SEND_STARTUP_NOTIFICATION=true
 ```
 
-若備援端點也尚未發布完整資料，會保留 `MARKET_DATE_MISMATCH` 或
-`OFFICIAL_DATA_NOT_LATEST` 防呆。
+## 注意
 
-## 離線測試
-
-```bash
-python test_v71_free.py
-```
+免費 Fugle 方案建議最多監測 5 檔。V9 預設只發通知，不會也不能送出券商委託。
