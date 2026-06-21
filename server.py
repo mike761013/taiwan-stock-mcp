@@ -2609,14 +2609,21 @@ async def send_test_notification(message: str = "") -> dict:
 
 
 @mcp.tool()
-@mcp.tool()
 async def get_telegram_setup_status(limit: int = 5) -> dict:
     from notifications import get_telegram_updates, _get_secret_value
 
     token_value = _get_secret_value("TELEGRAM_BOT_TOKEN")
     chat_value = _get_secret_value("TELEGRAM_CHAT_ID")
 
+    secret_candidates = [
+        "/etc/secrets/telegram.env",
+        "/etc/secrets/telegram_env",
+        "telegram.env",
+        "telegram_env",
+    ]
+
     debug_env = {
+        "cwd": os.getcwd(),
         "telegramBotTokenInEnv": "TELEGRAM_BOT_TOKEN" in os.environ,
         "telegramBotTokenLength": len(os.environ.get("TELEGRAM_BOT_TOKEN", "")),
         "telegramBotTokenStrippedLength": len(os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()),
@@ -2628,7 +2635,16 @@ async def get_telegram_setup_status(limit: int = 5) -> dict:
             k for k in os.environ.keys()
             if "TELEGRAM" in k or "TEST" in k or "FUGLE" in k or "FINMIND" in k
         ]),
-        "telegramSecretFileExists": os.path.exists("/etc/secrets/telegram.env") or os.path.exists("telegram.env"),
+        "etcSecretsExists": os.path.exists("/etc/secrets"),
+        "etcSecretsFiles": sorted(os.listdir("/etc/secrets")) if os.path.exists("/etc/secrets") else [],
+        "rootFilesMatchingTelegram": sorted([
+            name for name in os.listdir(os.getcwd())
+            if "telegram" in name.lower()
+        ]),
+        "secretCandidateExists": {
+            path: os.path.exists(path) for path in secret_candidates
+        },
+        "telegramSecretFileExists": any(os.path.exists(path) for path in secret_candidates),
         "telegramBotTokenFromSecretLength": len(_get_secret_value("TELEGRAM_BOT_TOKEN")),
         "telegramChatIdFromSecretLength": len(_get_secret_value("TELEGRAM_CHAT_ID")),
     }
