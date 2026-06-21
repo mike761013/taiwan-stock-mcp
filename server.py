@@ -2595,3 +2595,95 @@ async def get_signal_performance(signal_id: str) -> dict:
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
+
+# === V9 Dynamic Monitor Config Tools ===
+# 貼到 server.py 裡任一個 @mcp.tool() 區塊附近即可，通常放在 get_monitor_config 後面最直覺。
+
+@mcp.tool()
+async def get_dynamic_monitor_config() -> dict:
+    """V9：查看 Redis 動態監控設定。"""
+    from monitor_config_store import get_effective_config, redis_configured, REDIS_KEY
+
+    config = await get_effective_config()
+    return {
+        "ok": True,
+        "redisConfigured": redis_configured(),
+        "redisKey": REDIS_KEY,
+        "config": config,
+        "message": "這是 Background Worker 會讀取的動態監控設定。",
+    }
+
+
+@mcp.tool()
+async def update_monitor_config(
+    watchlist: str | None = None,
+    poll_seconds: int | None = None,
+    cooldown_seconds: int | None = None,
+    enabled: bool | None = None,
+    market_only: bool | None = None,
+    breakout_from_open_percent: float | None = None,
+    drop_from_open_percent: float | None = None,
+    new_high_extension_percent: float | None = None,
+) -> dict:
+    """V9：更新盤中監控設定。watchlist 格式例：2313:華通,4977:眾達-KY"""
+    from monitor_config_store import update_dynamic_config, redis_configured, REDIS_KEY
+
+    if not redis_configured():
+        return {
+            "ok": False,
+            "message": "REDIS_URL 尚未設定。請先在 Web Service 與 Background Worker 都設定同一組 REDIS_URL。",
+        }
+
+    try:
+        config = await update_dynamic_config(
+            watchlist=watchlist,
+            poll_seconds=poll_seconds,
+            cooldown_seconds=cooldown_seconds,
+            enabled=enabled,
+            market_only=market_only,
+            breakout_from_open_percent=breakout_from_open_percent,
+            drop_from_open_percent=drop_from_open_percent,
+            new_high_extension_percent=new_high_extension_percent,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "message": f"更新監控設定失敗：{exc}",
+        }
+
+    return {
+        "ok": True,
+        "redisKey": REDIS_KEY,
+        "config": config,
+        "message": "監控設定已更新。Background Worker 會在下一輪輪詢讀到新設定。",
+    }
+
+
+@mcp.tool()
+async def set_monitor_watchlist(watchlist: str, poll_seconds: int | None = None) -> dict:
+    """V9：快速設定監控清單，可選擇一起改秒數。例：2313:華通,4977:眾達-KY"""
+    from monitor_config_store import update_dynamic_config, redis_configured, REDIS_KEY
+
+    if not redis_configured():
+        return {
+            "ok": False,
+            "message": "REDIS_URL 尚未設定。請先在 Web Service 與 Background Worker 都設定同一組 REDIS_URL。",
+        }
+
+    try:
+        config = await update_dynamic_config(
+            watchlist=watchlist,
+            poll_seconds=poll_seconds,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "message": f"設定監控清單失敗：{exc}",
+        }
+
+    return {
+        "ok": True,
+        "redisKey": REDIS_KEY,
+        "config": config,
+        "message": "監控清單已更新。Background Worker 會在下一輪輪詢讀到新設定。",
+    }
