@@ -7,17 +7,49 @@ import httpx
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 TELEGRAM_API_BASE = "https://api.telegram.org"
+def _read_secret_file_value(key: str) -> str:
+    """Read KEY=value from Render Secret File fallback.
+
+    Render Secret Files are commonly mounted at /etc/secrets/<filename>.
+    This function only returns the requested value and never prints secrets.
+    """
+    candidates = [
+        "/etc/secrets/telegram.env",
+        "telegram.env",
+    ]
+
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    if k.strip() == key:
+                        return v.strip().strip('"').strip("'")
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+
+    return ""
+
+
+def _get_secret_value(key: str) -> str:
+    """Prefer Render env var, fallback to Render Secret File."""
+    return os.environ.get(key, "").strip() or _read_secret_file_value(key)
 
 
 def _telegram_token() -> str:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+   token = _get_secret_value("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("尚未設定 TELEGRAM_BOT_TOKEN。請到 Render Environment 新增此變數。")
     return token
 
 
 def _telegram_chat_id() -> str:
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    chat_id = _get_secret_value("TELEGRAM_CHAT_ID")
     if not chat_id:
         raise RuntimeError("尚未設定 TELEGRAM_CHAT_ID。請先對 Bot 傳 /start，取得 chat id 後放到 Render Environment。")
     return chat_id

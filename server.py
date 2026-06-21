@@ -2610,10 +2610,10 @@ async def send_test_notification(message: str = "") -> dict:
 
 @mcp.tool()
 async def get_telegram_setup_status(limit: int = 5) -> dict:
-    from notifications import get_telegram_updates
+    from notifications import get_telegram_updates, _get_secret_value
 
-    token_value = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_value = os.environ.get("TELEGRAM_CHAT_ID", "")
+    token_value = _get_secret_value("TELEGRAM_BOT_TOKEN")
+    chat_value = _get_secret_value("TELEGRAM_CHAT_ID")
 
     debug_env = {
     "telegramBotTokenInEnv": "TELEGRAM_BOT_TOKEN" in os.environ,
@@ -2625,6 +2625,9 @@ async def get_telegram_setup_status(limit: int = 5) -> dict:
     "testEnv": os.environ.get("TEST_ENV", "NOT_FOUND"),
     "matchedEnvKeys": sorted([k for k in os.environ.keys() if "TELEGRAM" in k or "TEST" in k or "FUGLE" in k or "FINMIND" in k]),
 }
+    "telegramSecretFileExists": os.path.exists("/etc/secrets/telegram.env") or os.path.exists("telegram.env"),
+    "telegramBotTokenFromSecretLength": len(_get_secret_value("TELEGRAM_BOT_TOKEN")),
+    "telegramChatIdFromSecretLength": len(_get_secret_value("TELEGRAM_CHAT_ID")),
 
     token_configured = bool(token_value.strip())
     chat_configured = bool(chat_value.strip())
