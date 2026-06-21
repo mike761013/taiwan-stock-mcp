@@ -2690,3 +2690,4 @@ async def set_monitor_watchlist(watchlist: str, poll_seconds: int | None = None)
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
+
