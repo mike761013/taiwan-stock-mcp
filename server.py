@@ -27,7 +27,7 @@ TPEX_DAILY_CLOSE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_
 
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
-CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v8")
+CACHE_PREFIX = os.environ.get("CACHE_PREFIX", "twstock:mcp:v9")
 CACHE_MAX_ITEMS = int(os.environ.get("CACHE_MAX_ITEMS", "2500"))
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 
@@ -1261,8 +1261,8 @@ def ping() -> dict:
     """檢查台股 MCP 伺服器是否正常運作。"""
     return {
         "ok": True,
-        "server": "Taiwan Stock MCP v8-free-score-tracker",
-        "version": "8.0.0-free",
+        "server": "Taiwan Stock MCP v9-monitor-alerts",
+        "version": "9.0.0-monitor",
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "tools": [
             "get_realtime_quote",
@@ -2493,7 +2493,7 @@ async def screen_market_v2(
         item["rank"] = rank
     base["results"] = enhanced[:top_n]
     base["v8"] = {
-        "version": "8.0.0-free",
+        "version": "9.0.0-monitor",
         "includeTheme": include_theme,
         "includeRisk": include_risk,
         "recordResult": record_result,
@@ -2591,6 +2591,100 @@ async def get_signal_performance(signal_id: str) -> dict:
             if str(item.get("signalId")) == signal_id:
                 return await _performance_for_signal(record, item, horizons=[1, 3, 5, 10])
     return {"available": False, "signalId": signal_id, "message": "找不到此 signal_id。"}
+
+
+@mcp.tool()
+async def send_test_notification(message: str = "") -> dict:
+    """V9：傳送一則 Telegram 測試通知。需要先設定 TELEGRAM_BOT_TOKEN 與 TELEGRAM_CHAT_ID。"""
+    from notifications import build_test_message, send_telegram_message
+    text = message.strip() if isinstance(message, str) and message.strip() else build_test_message()
+    data = await send_telegram_message(text)
+    return {
+        "ok": True,
+        "message": "Telegram 測試通知已送出。請檢查手機 Telegram。",
+        "telegramOk": bool(data.get("ok")),
+        "chatIdConfigured": bool(os.environ.get("TELEGRAM_CHAT_ID")),
+        "botTokenConfigured": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
+    }
+
+
+@mcp.tool()
+async def get_telegram_setup_status(limit: int = 5) -> dict:
+    """V9：查看 Telegram Bot 是否可連線，並列出最近 updates 中可用的 chat.id。"""
+    from notifications import get_telegram_updates
+    token_configured = bool(os.environ.get("TELEGRAM_BOT_TOKEN"))
+    chat_configured = bool(os.environ.get("TELEGRAM_CHAT_ID"))
+    if not token_configured:
+        return {
+            "ok": False,
+            "botTokenConfigured": False,
+            "message": "尚未設定 TELEGRAM_BOT_TOKEN。請先用 BotFather 建立 Bot 並把 Token 放到 Render Environment。",
+        }
+    updates = await get_telegram_updates(limit=limit)
+    chats = []
+    for item in updates.get("result", []):
+        msg = item.get("message") or item.get("edited_message") or {}
+        chat = msg.get("chat") or {}
+        if chat.get("id") is not None:
+            chats.append({
+                "chatId": chat.get("id"),
+                "type": chat.get("type"),
+                "firstName": chat.get("first_name"),
+                "username": chat.get("username"),
+                "text": msg.get("text"),
+            })
+    return {
+        "ok": True,
+        "botTokenConfigured": token_configured,
+        "chatIdConfigured": chat_configured,
+        "configuredChatId": os.environ.get("TELEGRAM_CHAT_ID", ""),
+        "recentChats": chats[-10:],
+        "message": "若 recentChats 有 chatId，請把它填到 Render 的 TELEGRAM_CHAT_ID。若沒有，請先到 Telegram 對 Bot 傳 /start。",
+    }
+
+
+@mcp.tool()
+async def get_monitor_config() -> dict:
+    """V9：查看盤中監測設定與 Render 環境變數是否齊全。"""
+    path = os.environ.get("MONITOR_RULES_FILE", "monitor_rules.json")
+    config: dict[str, Any] = {}
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    env_watchlist = os.environ.get("MONITOR_WATCHLIST", "")
+    return {
+        "ok": True,
+        "version": "9.0.0-monitor",
+        "rulesFile": path,
+        "rulesFileExists": os.path.exists(path),
+        "config": config,
+        "environment": {
+            "MONITOR_ENABLED": os.environ.get("MONITOR_ENABLED", ""),
+            "MONITOR_WATCHLIST": env_watchlist,
+            "MONITOR_POLL_SECONDS": os.environ.get("MONITOR_POLL_SECONDS", ""),
+            "ALERT_COOLDOWN_SECONDS": os.environ.get("ALERT_COOLDOWN_SECONDS", ""),
+            "TELEGRAM_BOT_TOKEN_configured": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
+            "TELEGRAM_CHAT_ID_configured": bool(os.environ.get("TELEGRAM_CHAT_ID")),
+            "FUGLE_API_KEY_configured": bool(os.environ.get("FUGLE_API_KEY")),
+        },
+        "note": "免費版建議最多5檔，每檔用成交/報價輪詢；正式盤中監測由 Render Background Worker 執行。",
+    }
+
+
+@mcp.tool()
+async def preview_order(
+    symbol: str,
+    side: str,
+    entry_price: float,
+    stop_price: float,
+    budget: float = 50000,
+    max_risk: float = 500,
+    day_trade: bool = True,
+    odd_lot: bool = True,
+) -> dict:
+    """V9：下單預覽，只計算股數、成本與風險，不會送出委託。"""
+    from order_preview import build_order_preview
+    return build_order_preview(symbol, side, entry_price, stop_price, budget, max_risk, day_trade, odd_lot)
 
 
 if __name__ == "__main__":
