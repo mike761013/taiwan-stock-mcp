@@ -14,16 +14,29 @@ REDIS_KEY = os.environ.get("MONITOR_CONFIG_REDIS_KEY", "taiwan_stock_monitor_con
 DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": True,
     "watchlist": [
-        {"symbol": "2313", "name": "華通", "breakout_price": None, "stop_loss_price": None},
-        {"symbol": "4977", "name": "眾達-KY", "breakout_price": None, "stop_loss_price": None},
+        {"symbol": "2408", "name": "南亞科", "breakout_price": None, "stop_loss_price": None},
+        {"symbol": "6213", "name": "聯茂", "breakout_price": None, "stop_loss_price": None},
     ],
     "rules": {
         "breakout_from_open_percent": 2.0,
         "drop_from_open_percent": -2.0,
         "new_high_extension_percent": 0.8,
         "cooldown_seconds": 300,
-        "poll_seconds": 15,
+        "poll_seconds": 3,
         "market_only": True,
+
+        # signal_mode:
+        #   alert     = 舊版：條件一觸發就通知
+        #   confirmed = 新版建議：先觀察，條件持續成立一段時間才通知
+        #   both      = 先通知異動，之後再通知二次確認
+        "signal_mode": "confirmed",
+
+        # 條件成立後，要持續成立幾秒才發「二次確認」通知。
+        "confirm_seconds": 45,
+
+        # 避免太晚追高：向上訊號若距開盤漲幅已超過這個數字，就不發二次確認。
+        # 這不是停損或停利，只是降低追高提醒。
+        "max_confirm_from_open_percent": 6.0,
     },
 }
 
@@ -163,6 +176,9 @@ async def update_dynamic_config(
     breakout_from_open_percent: float | None = None,
     drop_from_open_percent: float | None = None,
     new_high_extension_percent: float | None = None,
+    signal_mode: str | None = None,
+    confirm_seconds: int | None = None,
+    max_confirm_from_open_percent: float | None = None,
 ) -> dict[str, Any]:
     current = await get_effective_config()
 
@@ -200,5 +216,20 @@ async def update_dynamic_config(
 
     if new_high_extension_percent is not None:
         rules["new_high_extension_percent"] = float(new_high_extension_percent)
+
+    if signal_mode is not None:
+        signal_mode = str(signal_mode).strip().lower()
+        if signal_mode not in {"alert", "confirmed", "both"}:
+            raise ValueError("signal_mode 僅支援 alert、confirmed、both")
+        rules["signal_mode"] = signal_mode
+
+    if confirm_seconds is not None:
+        confirm_seconds = int(confirm_seconds)
+        if confirm_seconds < 0:
+            raise ValueError("confirm_seconds 不能小於 0")
+        rules["confirm_seconds"] = confirm_seconds
+
+    if max_confirm_from_open_percent is not None:
+        rules["max_confirm_from_open_percent"] = float(max_confirm_from_open_percent)
 
     return await save_dynamic_config(current)

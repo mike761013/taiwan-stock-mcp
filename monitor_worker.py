@@ -1,235 +1,372 @@
-import json
-import os
-from pathlib import Path
+import asyncio
+from datetime import datetime, time
 from typing import Any
+from zoneinfo import ZoneInfo
 
-import redis.asyncio as redis
-
-
-RULES_FILE = os.environ.get("MONITOR_RULES_FILE", "monitor_rules.json")
-REDIS_URL = os.environ.get("REDIS_URL", "").strip()
-REDIS_KEY = os.environ.get("MONITOR_CONFIG_REDIS_KEY", "taiwan_stock_monitor_config_v9")
+from notifications import send_telegram_message
+from monitor_config_store import get_effective_config
+from server import get_realtime_quote
 
 
-DEFAULT_CONFIG: dict[str, Any] = {
-    "enabled": True,
-    "watchlist": [
-        {"symbol": "2408", "name": "南亞科", "breakout_price": None, "stop_loss_price": None},
-        {"symbol": "6213", "name": "聯茂", "breakout_price": None, "stop_loss_price": None},
-    ],
-    "rules": {
-        "breakout_from_open_percent": 2.0,
-        "drop_from_open_percent": -2.0,
-        "new_high_extension_percent": 0.8,
-        "cooldown_seconds": 300,
-        "poll_seconds": 3,
-        "market_only": True,
-
-        # signal_mode:
-        #   alert     = 舊版：條件一觸發就通知
-        #   confirmed = 新版建議：先觀察，條件持續成立一段時間才通知
-        #   both      = 先通知異動，之後再通知二次確認
-        "signal_mode": "confirmed",
-
-        # 條件成立後，要持續成立幾秒才發「二次確認」通知。
-        "confirm_seconds": 45,
-
-        # 避免太晚追高：向上訊號若距開盤漲幅已超過這個數字，就不發二次確認。
-        # 這不是停損或停利，只是降低追高提醒。
-        "max_confirm_from_open_percent": 6.0,
-    },
-}
+TAIPEI = ZoneInfo("Asia/Taipei")
 
 
-def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    result = json.loads(json.dumps(base, ensure_ascii=False))
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = _deep_merge(result[key], value)
-        else:
-            result[key] = value
-    return result
+def is_tw_market_time() -> bool:
+    now = datetime.now(TAIPEI)
+    if now.weekday() >= 5:
+        return False
+    return time(9, 0) <= now.time() <= time(13, 30)
 
 
-def parse_watchlist(value: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if isinstance(value, list):
-        items = []
-        for item in value:
-            symbol = str(item.get("symbol", "")).strip()
-            if not symbol:
-                continue
-            items.append({
-                "symbol": symbol,
-                "name": str(item.get("name") or symbol).strip(),
-                "breakout_price": item.get("breakout_price"),
-                "stop_loss_price": item.get("stop_loss_price"),
-            })
-        return items
-
-    items = []
-    for raw in str(value or "").split(","):
-        raw = raw.strip()
-        if not raw:
-            continue
-        if ":" in raw:
-            symbol, name = raw.split(":", 1)
-        else:
-            symbol, name = raw, raw
-        symbol = symbol.strip()
-        name = name.strip() or symbol
-        if symbol:
-            items.append({
-                "symbol": symbol,
-                "name": name,
-                "breakout_price": None,
-                "stop_loss_price": None,
-            })
-    return items
+def walk_values(obj):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield str(k), v
+            yield from walk_values(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from walk_values(item)
 
 
-def load_file_config() -> dict[str, Any]:
-    config = json.loads(json.dumps(DEFAULT_CONFIG, ensure_ascii=False))
-
-    path = Path(RULES_FILE)
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                config = _deep_merge(config, loaded)
-        except Exception as exc:
-            print(f"[monitor-config] failed to read {RULES_FILE}: {exc}", flush=True)
-
-    # Environment overrides, useful for Render one-off settings.
-    if os.environ.get("MONITOR_ENABLED"):
-        config["enabled"] = os.environ["MONITOR_ENABLED"].strip().lower() in {"1", "true", "yes", "on"}
-
-    if os.environ.get("MONITOR_WATCHLIST"):
-        parsed = parse_watchlist(os.environ["MONITOR_WATCHLIST"])
-        if parsed:
-            config["watchlist"] = parsed
-
-    if os.environ.get("MONITOR_POLL_SECONDS"):
-        config.setdefault("rules", {})["poll_seconds"] = int(os.environ["MONITOR_POLL_SECONDS"])
-
-    if os.environ.get("ALERT_COOLDOWN_SECONDS"):
-        config.setdefault("rules", {})["cooldown_seconds"] = int(os.environ["ALERT_COOLDOWN_SECONDS"])
-
-    return config
-
-
-def redis_configured() -> bool:
-    return bool(REDIS_URL)
-
-
-async def _redis_client():
-    if not REDIS_URL:
+def to_float(value):
+    if value is None:
         return None
-    return redis.from_url(REDIS_URL, decode_responses=True)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = value.replace(",", "").replace("%", "").strip()
+        if cleaned in {"", "-", "null", "None"}:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    return None
 
 
-async def get_effective_config() -> dict[str, Any]:
-    base_config = load_file_config()
+def find_number(data, preferred_keys):
+    preferred = {k.lower() for k in preferred_keys}
 
-    client = await _redis_client()
-    if client is None:
-        return base_config
+    for k, v in walk_values(data):
+        key = k.lower()
+        if key in preferred:
+            num = to_float(v)
+            if num is not None:
+                return num
 
+    for k, v in walk_values(data):
+        key = k.lower()
+        if any(p in key for p in preferred):
+            num = to_float(v)
+            if num is not None:
+                return num
+
+    return None
+
+
+def extract_quote_numbers(data: dict) -> tuple[float | None, float | None, float | None]:
+    price = find_number(data, [
+        "price", "lastPrice", "last_price", "close", "closePrice", "tradePrice",
+        "last", "成交價", "現價", "最新價"
+    ])
+    open_price = find_number(data, [
+        "open", "openPrice", "open_price", "開盤價", "開盤"
+    ])
+    high_price = find_number(data, [
+        "high", "highPrice", "high_price", "最高價", "最高"
+    ])
+    return price, open_price, high_price
+
+
+async def safe_quote(symbol: str) -> dict:
     try:
-        raw = await client.get(REDIS_KEY)
-        await client.aclose()
-    except Exception as exc:
-        print(f"[monitor-config] redis read failed: {exc}", flush=True)
-        return base_config
-
-    if not raw:
-        return base_config
-
-    try:
-        dynamic_config = json.loads(raw)
-    except Exception as exc:
-        print(f"[monitor-config] redis json parse failed: {exc}", flush=True)
-        return base_config
-
-    if not isinstance(dynamic_config, dict):
-        return base_config
-
-    return _deep_merge(base_config, dynamic_config)
+        return await get_realtime_quote(symbol=symbol)
+    except TypeError:
+        try:
+            return await get_realtime_quote(stock_id=symbol)
+        except TypeError:
+            return await get_realtime_quote(symbol)
 
 
-async def save_dynamic_config(config: dict[str, Any]) -> dict[str, Any]:
-    client = await _redis_client()
-    if client is None:
-        raise RuntimeError("REDIS_URL 尚未設定。請先在 Web Service 與 Background Worker 都設定同一組 REDIS_URL。")
-
-    await client.set(REDIS_KEY, json.dumps(config, ensure_ascii=False))
-    await client.aclose()
-    return config
+def _pct_from_open(price: float | None, open_price: float | None) -> float | None:
+    if price is None or open_price in (None, 0):
+        return None
+    return (price - open_price) / open_price * 100
 
 
-async def update_dynamic_config(
+def _signal_still_valid(
+    signal: dict[str, Any],
+    price: float | None,
+    open_price: float | None,
+    high_price: float | None,
+    rules: dict[str, Any],
+) -> tuple[bool, str]:
+    if price is None:
+        return False, "沒有現價"
+
+    kind = signal.get("kind")
+    pct = _pct_from_open(price, open_price)
+
+    breakout_from_open_percent = float(rules.get("breakout_from_open_percent", 2.0))
+    drop_from_open_percent = float(rules.get("drop_from_open_percent", -2.0))
+    max_confirm_from_open_percent = float(rules.get("max_confirm_from_open_percent", 6.0))
+
+    # 向上訊號：避免太晚追高，超過 max_confirm_from_open_percent 就不發二次確認。
+    if kind in {"up_from_open", "new_high_extension", "custom_breakout"}:
+        if pct is not None and pct > max_confirm_from_open_percent:
+            return False, f"漲幅已達 {pct:.2f}%，超過二次確認追價上限 {max_confirm_from_open_percent:.2f}%"
+
+    if kind == "up_from_open":
+        return (pct is not None and pct >= breakout_from_open_percent), "漲幅仍維持在門檻上方"
+
+    if kind == "down_from_open":
+        return (pct is not None and pct <= drop_from_open_percent), "跌幅仍維持在門檻下方"
+
+    if kind == "new_high_extension":
+        trigger_price = to_float(signal.get("trigger_price"))
+        if trigger_price is None:
+            return False, "沒有觸發價"
+        # 用現價確認，不只用日高，避免碰一下高點後回落仍通知。
+        return price >= trigger_price, "現價仍站在創高觸發價上方"
+
+    if kind == "custom_breakout":
+        bp = to_float(signal.get("breakout_price"))
+        return (bp is not None and price >= bp), "現價仍站在指定突破價上方"
+
+    if kind == "custom_stop_loss":
+        sp = to_float(signal.get("stop_loss_price"))
+        return (sp is not None and price <= sp), "現價仍跌破指定停損價"
+
+    return True, "訊號仍成立"
+
+
+async def _send_alert(
     *,
-    watchlist: str | list[dict[str, Any]] | None = None,
-    poll_seconds: int | None = None,
-    cooldown_seconds: int | None = None,
-    enabled: bool | None = None,
-    market_only: bool | None = None,
-    breakout_from_open_percent: float | None = None,
-    drop_from_open_percent: float | None = None,
-    new_high_extension_percent: float | None = None,
-    signal_mode: str | None = None,
-    confirm_seconds: int | None = None,
-    max_confirm_from_open_percent: float | None = None,
-) -> dict[str, Any]:
-    current = await get_effective_config()
+    symbol: str,
+    name: str,
+    title: str,
+    reason: str,
+    price: float | None,
+    open_price: float | None,
+    now: datetime,
+    extra: str = "",
+) -> None:
+    price_text = "-" if price is None else f"{price:.2f}"
+    open_text = "-" if open_price is None else f"{open_price:.2f}"
+    extra_block = f"\n{extra}" if extra else ""
 
-    if watchlist is not None:
-        parsed = parse_watchlist(watchlist)
-        if not parsed:
-            raise ValueError("watchlist 解析後是空的。格式範例：2313:華通,4977:眾達-KY")
-        current["watchlist"] = parsed
+    await send_telegram_message(
+        f"【台股 MCP V9 監控】\n"
+        f"{title}\n"
+        f"{symbol} {name}\n"
+        f"訊號：{reason}\n"
+        f"現價：{price_text}\n"
+        f"開盤：{open_text}"
+        f"{extra_block}\n"
+        f"時間：{now.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
 
-    if enabled is not None:
-        current["enabled"] = bool(enabled)
 
-    rules = current.setdefault("rules", {})
+async def main():
+    last_alert_at: dict[str, datetime] = {}
+    seen_high: dict[str, float] = {}
+    pending_signals: dict[str, dict[str, Any]] = {}
 
-    if poll_seconds is not None:
-        poll_seconds = int(poll_seconds)
-        if poll_seconds < 1:
-            raise ValueError("poll_seconds 不能小於 1")
-        rules["poll_seconds"] = poll_seconds
+    config = await get_effective_config()
+    rules = config.get("rules", {})
+    await send_telegram_message(
+        "【台股 MCP V9 監控啟動】\n"
+        f"監控檔數：{len(config.get('watchlist', []))}\n"
+        f"輪詢秒數：{rules.get('poll_seconds', 15)}\n"
+        f"訊號模式：{rules.get('signal_mode', 'confirmed')}\n"
+        f"二次確認：{rules.get('confirm_seconds', 45)} 秒\n"
+        "現在已支援二次確認，降低把異動誤當進場點的機率。"
+    )
 
-    if cooldown_seconds is not None:
-        cooldown_seconds = int(cooldown_seconds)
-        if cooldown_seconds < 0:
-            raise ValueError("cooldown_seconds 不能小於 0")
-        rules["cooldown_seconds"] = cooldown_seconds
+    print("[monitor] started with dynamic config + confirmed signal support", flush=True)
 
-    if market_only is not None:
-        rules["market_only"] = bool(market_only)
+    while True:
+        try:
+            config = await get_effective_config()
+            rules = config.get("rules", {})
+            watchlist = config.get("watchlist", [])
 
-    if breakout_from_open_percent is not None:
-        rules["breakout_from_open_percent"] = float(breakout_from_open_percent)
+            poll_seconds = int(rules.get("poll_seconds", 15))
+            cooldown_seconds = int(rules.get("cooldown_seconds", 300))
+            market_only = bool(rules.get("market_only", True))
+            enabled = bool(config.get("enabled", True))
 
-    if drop_from_open_percent is not None:
-        rules["drop_from_open_percent"] = float(drop_from_open_percent)
+            breakout_from_open_percent = float(rules.get("breakout_from_open_percent", 2.0))
+            drop_from_open_percent = float(rules.get("drop_from_open_percent", -2.0))
+            new_high_extension_percent = float(rules.get("new_high_extension_percent", 0.8))
 
-    if new_high_extension_percent is not None:
-        rules["new_high_extension_percent"] = float(new_high_extension_percent)
+            signal_mode = str(rules.get("signal_mode", "confirmed")).strip().lower()
+            if signal_mode not in {"alert", "confirmed", "both"}:
+                signal_mode = "confirmed"
+            confirm_seconds = int(rules.get("confirm_seconds", 45))
 
-    if signal_mode is not None:
-        signal_mode = str(signal_mode).strip().lower()
-        if signal_mode not in {"alert", "confirmed", "both"}:
-            raise ValueError("signal_mode 僅支援 alert、confirmed、both")
-        rules["signal_mode"] = signal_mode
+            if not enabled:
+                print("[monitor] disabled; sleeping", flush=True)
+                await asyncio.sleep(max(poll_seconds, 5))
+                continue
 
-    if confirm_seconds is not None:
-        confirm_seconds = int(confirm_seconds)
-        if confirm_seconds < 0:
-            raise ValueError("confirm_seconds 不能小於 0")
-        rules["confirm_seconds"] = confirm_seconds
+            if market_only and not is_tw_market_time():
+                now = datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[monitor] outside market hours {now}; sleeping", flush=True)
+                await asyncio.sleep(60)
+                continue
 
-    if max_confirm_from_open_percent is not None:
-        rules["max_confirm_from_open_percent"] = float(max_confirm_from_open_percent)
+            active_pending_keys: set[str] = set()
 
-    return await save_dynamic_config(current)
+            for item in watchlist:
+                symbol = str(item.get("symbol", "")).strip()
+                name = str(item.get("name") or symbol).strip()
+
+                if not symbol:
+                    continue
+
+                quote = await safe_quote(symbol)
+                price, open_price, high_price = extract_quote_numbers(quote)
+
+                now = datetime.now(TAIPEI)
+                print(f"[monitor] {symbol} {name}: price={price}, open={open_price}, high={high_price}", flush=True)
+
+                signals: list[dict[str, Any]] = []
+                pct_from_open = _pct_from_open(price, open_price)
+
+                if pct_from_open is not None:
+                    if pct_from_open >= breakout_from_open_percent:
+                        signals.append({
+                            "kind": "up_from_open",
+                            "reason": f"開盤漲幅達 {pct_from_open:.2f}%",
+                            "trigger_price": price,
+                        })
+
+                    if pct_from_open <= drop_from_open_percent:
+                        signals.append({
+                            "kind": "down_from_open",
+                            "reason": f"開盤跌幅達 {pct_from_open:.2f}%",
+                            "trigger_price": price,
+                        })
+
+                ref_high = high_price or price
+                if ref_high is not None:
+                    previous_high = seen_high.get(symbol)
+                    if previous_high is None:
+                        seen_high[symbol] = ref_high
+                    elif ref_high >= previous_high * (1 + new_high_extension_percent / 100):
+                        signals.append({
+                            "kind": "new_high_extension",
+                            "reason": f"創監控新高，較前高 {previous_high:.2f} 延伸 {new_high_extension_percent:.2f}% 以上",
+                            "trigger_price": price,
+                        })
+                        seen_high[symbol] = ref_high
+                    elif ref_high > previous_high:
+                        seen_high[symbol] = ref_high
+
+                breakout_price = item.get("breakout_price")
+                stop_loss_price = item.get("stop_loss_price")
+
+                if price is not None and breakout_price:
+                    bp = to_float(breakout_price)
+                    if bp is not None and price >= bp:
+                        signals.append({
+                            "kind": "custom_breakout",
+                            "reason": f"突破指定價 {bp}",
+                            "trigger_price": price,
+                            "breakout_price": bp,
+                        })
+
+                if price is not None and stop_loss_price:
+                    sp = to_float(stop_loss_price)
+                    if sp is not None and price <= sp:
+                        signals.append({
+                            "kind": "custom_stop_loss",
+                            "reason": f"跌破指定停損價 {sp}",
+                            "trigger_price": price,
+                            "stop_loss_price": sp,
+                        })
+
+                for signal in signals:
+                    kind = str(signal.get("kind"))
+                    signal_key = f"{symbol}:{kind}"
+                    active_pending_keys.add(signal_key)
+
+                    # 舊版模式或 both：條件剛觸發就提醒「異動」，但仍不是進場建議。
+                    if signal_mode in {"alert", "both"}:
+                        alert_key = f"{signal_key}:raw"
+                        last_at = last_alert_at.get(alert_key)
+                        if not last_at or (now - last_at).total_seconds() >= cooldown_seconds:
+                            last_alert_at[alert_key] = now
+                            await _send_alert(
+                                symbol=symbol,
+                                name=name,
+                                title="異動提醒，非下單建議",
+                                reason=str(signal.get("reason")),
+                                price=price,
+                                open_price=open_price,
+                                now=now,
+                            )
+
+                    # 新版二次確認：條件要持續成立 confirm_seconds 才提醒。
+                    if signal_mode in {"confirmed", "both"}:
+                        pending = pending_signals.get(signal_key)
+                        if pending is None:
+                            signal["first_seen_at"] = now.isoformat()
+                            pending_signals[signal_key] = signal
+                            print(f"[monitor] pending {signal_key}: {signal.get('reason')}", flush=True)
+                            continue
+
+                        first_seen = datetime.fromisoformat(str(pending.get("first_seen_at")))
+                        elapsed = (now - first_seen).total_seconds()
+                        pending["reason"] = signal.get("reason")
+                        pending["trigger_price"] = signal.get("trigger_price")
+
+                        if elapsed < confirm_seconds:
+                            continue
+
+                        valid, note = _signal_still_valid(pending, price, open_price, high_price, rules)
+                        if not valid:
+                            print(f"[monitor] pending rejected {signal_key}: {note}", flush=True)
+                            pending_signals.pop(signal_key, None)
+                            continue
+
+                        alert_key = f"{signal_key}:confirmed"
+                        last_at = last_alert_at.get(alert_key)
+                        if last_at and (now - last_at).total_seconds() < cooldown_seconds:
+                            continue
+
+                        last_alert_at[alert_key] = now
+                        pending_signals.pop(signal_key, None)
+
+                        await _send_alert(
+                            symbol=symbol,
+                            name=name,
+                            title="二次確認成立，請人工判斷是否可進場",
+                            reason=str(pending.get("reason")),
+                            price=price,
+                            open_price=open_price,
+                            now=now,
+                            extra=f"確認時間：{confirm_seconds} 秒\n確認說明：{note}\n提醒：這不是自動下單建議，仍需看量價、大盤與停損位置。",
+                        )
+
+                await asyncio.sleep(0.2)
+
+            # 清掉已經不再成立的 pending signal。
+            for key in list(pending_signals.keys()):
+                symbol = key.split(":", 1)[0]
+                if symbol in {str(item.get("symbol", "")).strip() for item in watchlist} and key not in active_pending_keys:
+                    pending_signals.pop(key, None)
+
+        except Exception as exc:
+            print(f"[monitor] error: {exc}", flush=True)
+            try:
+                await send_telegram_message(f"【台股 MCP V9 監控錯誤】\n{exc}")
+            except Exception as notify_exc:
+                print(f"[monitor] notify error: {notify_exc}", flush=True)
+
+        await asyncio.sleep(max(int((await get_effective_config()).get("rules", {}).get("poll_seconds", 15)), 1))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
