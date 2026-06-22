@@ -44,6 +44,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "entry_min_from_open_percent": 1.2,
         "entry_max_from_open_percent": 5.5,
 
+        # 開低走高 / 收復缺口模式。
+        # 例如昨收100、開盤96、拉到99.5：
+        # from_open=+3.65%，gap_recovery=87.5%，距參考價=-0.5%，會符合預警。
+        "gap_recovery_enabled": True,
+        "gap_recovery_min_from_open_percent": 2.0,
+        "gap_recovery_min_recovered_percent": 60.0,
+        "gap_recovery_near_reference_percent": 1.0,
+        "gap_recovery_max_above_reference_percent": 2.0,
+
         # 漲停或接近漲停時，不再重複通知。
         "suppress_limit_up_repeats": True,
         "send_limit_up_notice_once": False,
@@ -198,6 +207,11 @@ async def update_dynamic_config(
     entry_signal_only: bool | None = None,
     entry_min_from_open_percent: float | None = None,
     entry_max_from_open_percent: float | None = None,
+    gap_recovery_enabled: bool | None = None,
+    gap_recovery_min_from_open_percent: float | None = None,
+    gap_recovery_min_recovered_percent: float | None = None,
+    gap_recovery_near_reference_percent: float | None = None,
+    gap_recovery_max_above_reference_percent: float | None = None,
     suppress_limit_up_repeats: bool | None = None,
     send_limit_up_notice_once: bool | None = None,
     limit_up_near_percent: float | None = None,
@@ -235,6 +249,7 @@ async def update_dynamic_config(
     bool_fields = {
         "entry_filter_enabled": entry_filter_enabled,
         "entry_signal_only": entry_signal_only,
+        "gap_recovery_enabled": gap_recovery_enabled,
         "suppress_limit_up_repeats": suppress_limit_up_repeats,
         "send_limit_up_notice_once": send_limit_up_notice_once,
     }

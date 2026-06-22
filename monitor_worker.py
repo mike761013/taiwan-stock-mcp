@@ -175,6 +175,62 @@ def _calc_trade_plan(price: float | None, open_price: float | None, rules: dict[
     }
 
 
+
+def _gap_recovery_signal(
+    *,
+    price: float | None,
+    open_price: float | None,
+    reference_price: float | None,
+    rules: dict[str, Any],
+) -> tuple[bool, str, dict[str, Any]]:
+    """偵測開低走高：開低後收復跌幅，接近昨收/參考價。"""
+    if not bool(rules.get("gap_recovery_enabled", True)):
+        return False, "未啟用開低走高模式", {}
+
+    if price is None or open_price is None or reference_price is None:
+        return False, "缺少現價、開盤價或參考價", {}
+
+    if not (open_price < reference_price):
+        return False, "不是開低盤", {}
+
+    gap = reference_price - open_price
+    if gap <= 0:
+        return False, "開低缺口不成立", {}
+
+    from_open = (price - open_price) / open_price * 100
+    recovered = (price - open_price) / gap * 100
+    distance_to_reference = (price - reference_price) / reference_price * 100
+
+    min_from_open = float(rules.get("gap_recovery_min_from_open_percent", 2.0))
+    min_recovered = float(rules.get("gap_recovery_min_recovered_percent", 60.0))
+    near_reference = float(rules.get("gap_recovery_near_reference_percent", 1.0))
+    max_above_reference = float(rules.get("gap_recovery_max_above_reference_percent", 2.0))
+
+    if from_open < min_from_open:
+        return False, f"開低後反彈 {from_open:.2f}% 未達 {min_from_open:.2f}%", {}
+
+    if recovered < min_recovered:
+        return False, f"開低缺口只收復 {recovered:.1f}% 未達 {min_recovered:.1f}%", {}
+
+    if distance_to_reference < -near_reference:
+        return False, f"距參考價仍有 {distance_to_reference:.2f}%，尚未接近翻紅區", {}
+
+    if distance_to_reference > max_above_reference:
+        return False, f"已高於參考價 {distance_to_reference:.2f}%，可能偏追高", {}
+
+    reason = (
+        f"開低走高，開低後拉升 {from_open:.2f}%，"
+        f"收復缺口 {recovered:.1f}%，"
+        f"距參考價 {distance_to_reference:.2f}%"
+    )
+    meta = {
+        "from_open_percent": from_open,
+        "gap_recovered_percent": recovered,
+        "distance_to_reference_percent": distance_to_reference,
+    }
+    return True, reason, meta
+
+
 def _entry_filter(
     *,
     signal: dict[str, Any],
@@ -191,7 +247,7 @@ def _entry_filter(
         return False, "沒有現價"
 
     kind = str(signal.get("kind"))
-    if kind not in {"up_from_open", "new_high_extension", "custom_breakout"}:
+    if kind not in {"up_from_open", "new_high_extension", "custom_breakout", "gap_recovery"}:
         return False, "不是偏多進場訊號"
 
     limit_state, limit_reason = _is_limit_up_state(
@@ -202,6 +258,12 @@ def _entry_filter(
     )
     if limit_state and bool(rules.get("suppress_limit_up_repeats", True)):
         return False, f"{limit_reason}，不發進場候選通知"
+
+    if kind == "gap_recovery":
+        from_open = signal.get("from_open_percent")
+        recovered = signal.get("gap_recovered_percent")
+        dist_ref = signal.get("distance_to_reference_percent")
+        return True, f"開低走高符合條件：開低後拉升 {float(from_open):.2f}%，收復缺口 {float(recovered):.1f}%，距參考價 {float(dist_ref):.2f}%"
 
     pct_open = _pct_from_open(price, open_price)
     min_pct = float(rules.get("entry_min_from_open_percent", 1.2))
@@ -240,6 +302,15 @@ def _signal_still_valid(
 
     if kind == "down_from_open":
         return (pct is not None and pct <= drop_from_open_percent), "跌幅仍維持在門檻下方"
+
+    if kind == "gap_recovery":
+        ok, note, _ = _gap_recovery_signal(
+            price=price,
+            open_price=open_price,
+            reference_price=reference_price,
+            rules=rules,
+        )
+        return ok, note
 
     if kind == "new_high_extension":
         trigger_price = to_float(signal.get("trigger_price"))
@@ -401,6 +472,21 @@ async def main():
                             "trigger_price": price,
                         })
 
+                if price is not None and open_price is not None and reference_price is not None:
+                    ok_gap, gap_reason, gap_meta = _gap_recovery_signal(
+                        price=price,
+                        open_price=open_price,
+                        reference_price=reference_price,
+                        rules=rules,
+                    )
+                    if ok_gap:
+                        signals.append({
+                            "kind": "gap_recovery",
+                            "reason": gap_reason,
+                            "trigger_price": price,
+                            **gap_meta,
+                        })
+
                 ref_high = high_price or price
                 if ref_high is not None:
                     previous_high = seen_high.get(symbol)
@@ -521,7 +607,7 @@ async def main():
                                 continue
 
                             plan = _calc_trade_plan(price, open_price, rules)
-                            title = "進場候選通知，請人工確認"
+                            title = "開低走高進場候選通知，請人工確認" if str(pending.get("kind")) == "gap_recovery" else "進場候選通知，請人工確認"
                             extra = (
                                 f"確認時間：{confirm_seconds} 秒\n"
                                 f"進場條件：{entry_note}\n"

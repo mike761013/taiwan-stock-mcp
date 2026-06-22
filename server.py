@@ -2628,6 +2628,10 @@ async def _notify_monitor_config_changed(config: dict[str, Any], action: str = "
             f"訊號模式：{rules.get('signal_mode', '未設定')}\n"
             f"二次確認秒數：{rules.get('confirm_seconds', '未設定')} 秒\n"
             f"進場區間：{rules.get('entry_min_from_open_percent', '未設定')}%～{rules.get('entry_max_from_open_percent', '未設定')}%\n"
+            f"開低走高模式：{rules.get('gap_recovery_enabled', '未設定')}\n"
+            f"開低後拉升門檻：{rules.get('gap_recovery_min_from_open_percent', '未設定')}%\n"
+            f"缺口收復門檻：{rules.get('gap_recovery_min_recovered_percent', '未設定')}%\n"
+            f"接近參考價門檻：{rules.get('gap_recovery_near_reference_percent', '未設定')}%\n"
             f"漲停抑制：{rules.get('suppress_limit_up_repeats', '未設定')}\n"
             f"漲停判斷門檻：{rules.get('limit_up_near_percent', '未設定')}%\n"
             f"預估停損：{rules.get('entry_stop_loss_percent', '未設定')}%\n"
@@ -2683,6 +2687,11 @@ async def update_monitor_config(
     entry_signal_only: bool | None = None,
     entry_min_from_open_percent: float | None = None,
     entry_max_from_open_percent: float | None = None,
+    gap_recovery_enabled: bool | None = None,
+    gap_recovery_min_from_open_percent: float | None = None,
+    gap_recovery_min_recovered_percent: float | None = None,
+    gap_recovery_near_reference_percent: float | None = None,
+    gap_recovery_max_above_reference_percent: float | None = None,
     suppress_limit_up_repeats: bool | None = None,
     send_limit_up_notice_once: bool | None = None,
     limit_up_near_percent: float | None = None,
@@ -2718,6 +2727,11 @@ async def update_monitor_config(
             entry_signal_only=entry_signal_only,
             entry_min_from_open_percent=entry_min_from_open_percent,
             entry_max_from_open_percent=entry_max_from_open_percent,
+            gap_recovery_enabled=gap_recovery_enabled,
+            gap_recovery_min_from_open_percent=gap_recovery_min_from_open_percent,
+            gap_recovery_min_recovered_percent=gap_recovery_min_recovered_percent,
+            gap_recovery_near_reference_percent=gap_recovery_near_reference_percent,
+            gap_recovery_max_above_reference_percent=gap_recovery_max_above_reference_percent,
             suppress_limit_up_repeats=suppress_limit_up_repeats,
             send_limit_up_notice_once=send_limit_up_notice_once,
             limit_up_near_percent=limit_up_near_percent,
