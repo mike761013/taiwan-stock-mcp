@@ -2596,7 +2596,8 @@ async def get_signal_performance(signal_id: str) -> dict:
 # === V9 Dynamic Monitor Config Tools ===
 # 這段工具讓 ChatGPT 可以直接更新 Background Worker 的動態監控設定。
 # 需搭配 monitor_config_store.py，並且 Web Service / Background Worker 都設定同一組 REDIS_URL。
-# 2026-06-22：更新成功後會同步嘗試發送 Telegram 確認通知。
+# 更新成功後會同步嘗試發送 Telegram 確認通知。
+# 2026-06-22：新增 entry 模式、漲停重複通知抑制、預估停利/停損參數。
 
 async def _notify_monitor_config_changed(config: dict[str, Any], action: str = "監控設定已更新") -> dict:
     """設定更新後，送一則 Telegram 確認通知。失敗不影響設定本身。"""
@@ -2624,6 +2625,13 @@ async def _notify_monitor_config_changed(config: dict[str, Any], action: str = "
             f"{chr(10).join(lines) if lines else '無'}\n\n"
             f"輪詢秒數：{rules.get('poll_seconds', '未設定')} 秒\n"
             f"冷卻秒數：{rules.get('cooldown_seconds', '未設定')} 秒\n"
+            f"訊號模式：{rules.get('signal_mode', '未設定')}\n"
+            f"二次確認秒數：{rules.get('confirm_seconds', '未設定')} 秒\n"
+            f"進場區間：{rules.get('entry_min_from_open_percent', '未設定')}%～{rules.get('entry_max_from_open_percent', '未設定')}%\n"
+            f"漲停抑制：{rules.get('suppress_limit_up_repeats', '未設定')}\n"
+            f"漲停判斷門檻：{rules.get('limit_up_near_percent', '未設定')}%\n"
+            f"預估停損：{rules.get('entry_stop_loss_percent', '未設定')}%\n"
+            f"預估停利：{rules.get('take_profit_r_multiple', '未設定')}R\n"
             f"開盤漲幅提醒：{rules.get('breakout_from_open_percent', '未設定')}%\n"
             f"開盤跌幅提醒：{rules.get('drop_from_open_percent', '未設定')}%\n"
             f"創高延伸提醒：{rules.get('new_high_extension_percent', '未設定')}%\n"
@@ -2669,8 +2677,23 @@ async def update_monitor_config(
     breakout_from_open_percent: float | None = None,
     drop_from_open_percent: float | None = None,
     new_high_extension_percent: float | None = None,
+    signal_mode: str | None = None,
+    confirm_seconds: int | None = None,
+    entry_filter_enabled: bool | None = None,
+    entry_signal_only: bool | None = None,
+    entry_min_from_open_percent: float | None = None,
+    entry_max_from_open_percent: float | None = None,
+    suppress_limit_up_repeats: bool | None = None,
+    send_limit_up_notice_once: bool | None = None,
+    limit_up_near_percent: float | None = None,
+    entry_stop_loss_percent: float | None = None,
+    take_profit_r_multiple: float | None = None,
 ) -> dict:
-    """V9：更新盤中監控設定。watchlist 格式例：2313:華通,4977:眾達-KY"""
+    """
+    V9：更新盤中監控設定。
+    watchlist 格式例：2408:南亞科,6213:聯茂
+    signal_mode 支援 alert、confirmed、both、entry。
+    """
     from monitor_config_store import update_dynamic_config, redis_configured, REDIS_KEY
 
     if not redis_configured():
@@ -2689,6 +2712,17 @@ async def update_monitor_config(
             breakout_from_open_percent=breakout_from_open_percent,
             drop_from_open_percent=drop_from_open_percent,
             new_high_extension_percent=new_high_extension_percent,
+            signal_mode=signal_mode,
+            confirm_seconds=confirm_seconds,
+            entry_filter_enabled=entry_filter_enabled,
+            entry_signal_only=entry_signal_only,
+            entry_min_from_open_percent=entry_min_from_open_percent,
+            entry_max_from_open_percent=entry_max_from_open_percent,
+            suppress_limit_up_repeats=suppress_limit_up_repeats,
+            send_limit_up_notice_once=send_limit_up_notice_once,
+            limit_up_near_percent=limit_up_near_percent,
+            entry_stop_loss_percent=entry_stop_loss_percent,
+            take_profit_r_multiple=take_profit_r_multiple,
         )
     except Exception as exc:
         return {
@@ -2712,7 +2746,7 @@ async def update_monitor_config(
 
 @mcp.tool()
 async def set_monitor_watchlist(watchlist: str, poll_seconds: int | None = None) -> dict:
-    """V9：快速設定監控清單，可選擇一起改秒數。例：2313:華通,4977:眾達-KY"""
+    """V9：快速設定監控清單，可選擇一起改秒數。例：2408:南亞科,6213:聯茂"""
     from monitor_config_store import update_dynamic_config, redis_configured, REDIS_KEY
 
     if not redis_configured():

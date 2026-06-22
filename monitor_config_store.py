@@ -29,7 +29,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         #   alert     = 舊版：條件一觸發就通知
         #   confirmed = 新版建議：先觀察，條件持續成立一段時間才通知
         #   both      = 先通知異動，之後再通知二次確認
-        "signal_mode": "confirmed",
+        "signal_mode": "entry",
 
         # 條件成立後，要持續成立幾秒才發「二次確認」通知。
         "confirm_seconds": 45,
@@ -37,6 +37,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # 避免太晚追高：向上訊號若距開盤漲幅已超過這個數字，就不發二次確認。
         # 這不是停損或停利，只是降低追高提醒。
         "max_confirm_from_open_percent": 6.0,
+
+        # 進場候選模式：降低「異動」誤當「可進場」的機率。
+        "entry_filter_enabled": True,
+        "entry_signal_only": True,
+        "entry_min_from_open_percent": 1.2,
+        "entry_max_from_open_percent": 5.5,
+
+        # 漲停或接近漲停時，不再重複通知。
+        "suppress_limit_up_repeats": True,
+        "send_limit_up_notice_once": False,
+        "limit_up_near_percent": 9.5,
+
+        # 通知內的預估停利 / 停損。
+        "entry_stop_loss_percent": 2.0,
+        "take_profit_r_multiple": 1.8,
     },
 }
 
@@ -179,6 +194,15 @@ async def update_dynamic_config(
     signal_mode: str | None = None,
     confirm_seconds: int | None = None,
     max_confirm_from_open_percent: float | None = None,
+    entry_filter_enabled: bool | None = None,
+    entry_signal_only: bool | None = None,
+    entry_min_from_open_percent: float | None = None,
+    entry_max_from_open_percent: float | None = None,
+    suppress_limit_up_repeats: bool | None = None,
+    send_limit_up_notice_once: bool | None = None,
+    limit_up_near_percent: float | None = None,
+    entry_stop_loss_percent: float | None = None,
+    take_profit_r_multiple: float | None = None,
 ) -> dict[str, Any]:
     current = await get_effective_config()
 
@@ -208,6 +232,16 @@ async def update_dynamic_config(
     if market_only is not None:
         rules["market_only"] = bool(market_only)
 
+    bool_fields = {
+        "entry_filter_enabled": entry_filter_enabled,
+        "entry_signal_only": entry_signal_only,
+        "suppress_limit_up_repeats": suppress_limit_up_repeats,
+        "send_limit_up_notice_once": send_limit_up_notice_once,
+    }
+    for key, value in bool_fields.items():
+        if value is not None:
+            rules[key] = bool(value)
+
     if breakout_from_open_percent is not None:
         rules["breakout_from_open_percent"] = float(breakout_from_open_percent)
 
@@ -219,8 +253,8 @@ async def update_dynamic_config(
 
     if signal_mode is not None:
         signal_mode = str(signal_mode).strip().lower()
-        if signal_mode not in {"alert", "confirmed", "both"}:
-            raise ValueError("signal_mode 僅支援 alert、confirmed、both")
+        if signal_mode not in {"alert", "confirmed", "both", "entry"}:
+            raise ValueError("signal_mode 僅支援 alert、confirmed、both、entry")
         rules["signal_mode"] = signal_mode
 
     if confirm_seconds is not None:
