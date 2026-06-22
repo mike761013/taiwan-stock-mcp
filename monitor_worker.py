@@ -1,253 +1,235 @@
-import asyncio
 import json
 import os
-import re
-from dataclasses import dataclass, field
-from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
-import httpx
-
-from notifications import send_telegram_message
-
-TAIPEI_TZ = ZoneInfo("Asia/Taipei")
-FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
-RULES_FILE = Path(os.environ.get("MONITOR_RULES_FILE", "monitor_rules.json"))
+import redis.asyncio as redis
 
 
-def _api_key() -> str:
-    key = os.environ.get("FUGLE_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("尚未設定 FUGLE_API_KEY。")
-    return key
+RULES_FILE = os.environ.get("MONITOR_RULES_FILE", "monitor_rules.json")
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
+REDIS_KEY = os.environ.get("MONITOR_CONFIG_REDIS_KEY", "taiwan_stock_monitor_config_v9")
 
 
-def _load_rules() -> dict[str, Any]:
-    if RULES_FILE.exists():
-        return json.loads(RULES_FILE.read_text(encoding="utf-8"))
-    return {"enabled": True, "watchlist": [], "rules": {}}
+DEFAULT_CONFIG: dict[str, Any] = {
+    "enabled": True,
+    "watchlist": [
+        {"symbol": "2408", "name": "南亞科", "breakout_price": None, "stop_loss_price": None},
+        {"symbol": "6213", "name": "聯茂", "breakout_price": None, "stop_loss_price": None},
+    ],
+    "rules": {
+        "breakout_from_open_percent": 2.0,
+        "drop_from_open_percent": -2.0,
+        "new_high_extension_percent": 0.8,
+        "cooldown_seconds": 300,
+        "poll_seconds": 3,
+        "market_only": True,
+
+        # signal_mode:
+        #   alert     = 舊版：條件一觸發就通知
+        #   confirmed = 新版建議：先觀察，條件持續成立一段時間才通知
+        #   both      = 先通知異動，之後再通知二次確認
+        "signal_mode": "confirmed",
+
+        # 條件成立後，要持續成立幾秒才發「二次確認」通知。
+        "confirm_seconds": 45,
+
+        # 避免太晚追高：向上訊號若距開盤漲幅已超過這個數字，就不發二次確認。
+        # 這不是停損或停利，只是降低追高提醒。
+        "max_confirm_from_open_percent": 6.0,
+    },
+}
 
 
-def _env_watchlist() -> list[dict[str, Any]]:
-    raw = os.environ.get("MONITOR_WATCHLIST", "").strip()
-    if not raw:
-        return []
-    rows = []
-    for item in raw.split(","):
-        symbol = item.strip().upper()
-        if re.fullmatch(r"[0-9A-Z]{4,7}", symbol):
-            rows.append({"symbol": symbol, "name": ""})
-    return rows
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result = json.loads(json.dumps(base, ensure_ascii=False))
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
 
-def _watchlist(config: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = _env_watchlist() or config.get("watchlist") or []
-    clean = []
-    seen = set()
-    for row in rows:
-        if isinstance(row, str):
-            symbol = row.strip().upper()
-            row = {"symbol": symbol, "name": ""}
-        symbol = str(row.get("symbol", "")).strip().upper()
-        if not re.fullmatch(r"[0-9A-Z]{4,7}", symbol):
+def parse_watchlist(value: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            symbol = str(item.get("symbol", "")).strip()
+            if not symbol:
+                continue
+            items.append({
+                "symbol": symbol,
+                "name": str(item.get("name") or symbol).strip(),
+                "breakout_price": item.get("breakout_price"),
+                "stop_loss_price": item.get("stop_loss_price"),
+            })
+        return items
+
+    items = []
+    for raw in str(value or "").split(","):
+        raw = raw.strip()
+        if not raw:
             continue
-        if symbol in seen:
-            continue
-        seen.add(symbol)
-        clean.append(row | {"symbol": symbol})
-    return clean[:5]
+        if ":" in raw:
+            symbol, name = raw.split(":", 1)
+        else:
+            symbol, name = raw, raw
+        symbol = symbol.strip()
+        name = name.strip() or symbol
+        if symbol:
+            items.append({
+                "symbol": symbol,
+                "name": name,
+                "breakout_price": None,
+                "stop_loss_price": None,
+            })
+    return items
 
 
-def _to_float(value: Any) -> float | None:
-    if value is None:
+def load_file_config() -> dict[str, Any]:
+    config = json.loads(json.dumps(DEFAULT_CONFIG, ensure_ascii=False))
+
+    path = Path(RULES_FILE)
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                config = _deep_merge(config, loaded)
+        except Exception as exc:
+            print(f"[monitor-config] failed to read {RULES_FILE}: {exc}", flush=True)
+
+    # Environment overrides, useful for Render one-off settings.
+    if os.environ.get("MONITOR_ENABLED"):
+        config["enabled"] = os.environ["MONITOR_ENABLED"].strip().lower() in {"1", "true", "yes", "on"}
+
+    if os.environ.get("MONITOR_WATCHLIST"):
+        parsed = parse_watchlist(os.environ["MONITOR_WATCHLIST"])
+        if parsed:
+            config["watchlist"] = parsed
+
+    if os.environ.get("MONITOR_POLL_SECONDS"):
+        config.setdefault("rules", {})["poll_seconds"] = int(os.environ["MONITOR_POLL_SECONDS"])
+
+    if os.environ.get("ALERT_COOLDOWN_SECONDS"):
+        config.setdefault("rules", {})["cooldown_seconds"] = int(os.environ["ALERT_COOLDOWN_SECONDS"])
+
+    return config
+
+
+def redis_configured() -> bool:
+    return bool(REDIS_URL)
+
+
+async def _redis_client():
+    if not REDIS_URL:
         return None
+    return redis.from_url(REDIS_URL, decode_responses=True)
+
+
+async def get_effective_config() -> dict[str, Any]:
+    base_config = load_file_config()
+
+    client = await _redis_client()
+    if client is None:
+        return base_config
+
     try:
-        return float(str(value).replace(",", ""))
-    except Exception:
-        return None
+        raw = await client.get(REDIS_KEY)
+        await client.aclose()
+    except Exception as exc:
+        print(f"[monitor-config] redis read failed: {exc}", flush=True)
+        return base_config
+
+    if not raw:
+        return base_config
+
+    try:
+        dynamic_config = json.loads(raw)
+    except Exception as exc:
+        print(f"[monitor-config] redis json parse failed: {exc}", flush=True)
+        return base_config
+
+    if not isinstance(dynamic_config, dict):
+        return base_config
+
+    return _deep_merge(base_config, dynamic_config)
 
 
-def _price_from_quote(q: dict[str, Any]) -> float | None:
-    last_trade = q.get("lastTrade") if isinstance(q.get("lastTrade"), dict) else {}
-    for key in ["lastPrice", "closePrice", "avgPrice", "price"]:
-        value = _to_float(q.get(key))
-        if value and value > 0:
-            return value
-    value = _to_float(last_trade.get("price"))
-    if value and value > 0:
-        return value
-    return None
+async def save_dynamic_config(config: dict[str, Any]) -> dict[str, Any]:
+    client = await _redis_client()
+    if client is None:
+        raise RuntimeError("REDIS_URL 尚未設定。請先在 Web Service 與 Background Worker 都設定同一組 REDIS_URL。")
+
+    await client.set(REDIS_KEY, json.dumps(config, ensure_ascii=False))
+    await client.aclose()
+    return config
 
 
-def _volume_from_quote(q: dict[str, Any]) -> int | None:
-    total = q.get("total") if isinstance(q.get("total"), dict) else {}
-    for source in [total, q]:
-        for key in ["tradeVolume", "volume", "totalVolume"]:
-            value = _to_float(source.get(key))
-            if value is not None:
-                return int(value)
-    return None
+async def update_dynamic_config(
+    *,
+    watchlist: str | list[dict[str, Any]] | None = None,
+    poll_seconds: int | None = None,
+    cooldown_seconds: int | None = None,
+    enabled: bool | None = None,
+    market_only: bool | None = None,
+    breakout_from_open_percent: float | None = None,
+    drop_from_open_percent: float | None = None,
+    new_high_extension_percent: float | None = None,
+    signal_mode: str | None = None,
+    confirm_seconds: int | None = None,
+    max_confirm_from_open_percent: float | None = None,
+) -> dict[str, Any]:
+    current = await get_effective_config()
 
+    if watchlist is not None:
+        parsed = parse_watchlist(watchlist)
+        if not parsed:
+            raise ValueError("watchlist 解析後是空的。格式範例：2313:華通,4977:眾達-KY")
+        current["watchlist"] = parsed
 
-def _base_from_quote(q: dict[str, Any], price: float) -> float:
-    for key in ["openPrice", "referencePrice", "previousClose"]:
-        value = _to_float(q.get(key))
-        if value and value > 0:
-            return value
-    return price
+    if enabled is not None:
+        current["enabled"] = bool(enabled)
 
+    rules = current.setdefault("rules", {})
 
-def _market_is_open() -> bool:
-    now = datetime.now(TAIPEI_TZ)
-    if now.weekday() >= 5:
-        return False
-    return dt_time(9, 0) <= now.time() <= dt_time(13, 35)
+    if poll_seconds is not None:
+        poll_seconds = int(poll_seconds)
+        if poll_seconds < 1:
+            raise ValueError("poll_seconds 不能小於 1")
+        rules["poll_seconds"] = poll_seconds
 
+    if cooldown_seconds is not None:
+        cooldown_seconds = int(cooldown_seconds)
+        if cooldown_seconds < 0:
+            raise ValueError("cooldown_seconds 不能小於 0")
+        rules["cooldown_seconds"] = cooldown_seconds
 
-async def _fugle_quote(symbol: str) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        response = await client.get(
-            f"{FUGLE_BASE_URL}/intraday/quote/{symbol}",
-            headers={"X-API-KEY": _api_key()},
-        )
-    if response.status_code == 429:
-        raise RuntimeError("Fugle API 達到頻率上限，請調高 MONITOR_POLL_SECONDS。")
-    if response.status_code == 403:
-        raise RuntimeError("目前 Fugle 方案沒有此資料權限。")
-    response.raise_for_status()
-    return response.json()
+    if market_only is not None:
+        rules["market_only"] = bool(market_only)
 
+    if breakout_from_open_percent is not None:
+        rules["breakout_from_open_percent"] = float(breakout_from_open_percent)
 
-@dataclass
-class SymbolState:
-    base_price: float | None = None
-    high_seen: float | None = None
-    low_seen: float | None = None
-    last_volume: int | None = None
-    last_alert_at: dict[str, float] = field(default_factory=dict)
+    if drop_from_open_percent is not None:
+        rules["drop_from_open_percent"] = float(drop_from_open_percent)
 
+    if new_high_extension_percent is not None:
+        rules["new_high_extension_percent"] = float(new_high_extension_percent)
 
-class Monitor:
-    def __init__(self):
-        self.config = _load_rules()
-        self.rules = self.config.get("rules") or {}
-        self.watchlist = _watchlist(self.config)
-        self.states: dict[str, SymbolState] = {str(row["symbol"]): SymbolState() for row in self.watchlist}
-        self.poll_seconds = int(os.environ.get("MONITOR_POLL_SECONDS") or self.rules.get("poll_seconds") or 15)
-        self.cooldown_seconds = int(os.environ.get("ALERT_COOLDOWN_SECONDS") or self.rules.get("cooldown_seconds") or 300)
-        self.market_only = str(os.environ.get("MONITOR_MARKET_ONLY", self.rules.get("market_only", True))).lower() not in {"0", "false", "no"}
-        self.breakout_pct = float(os.environ.get("MONITOR_BREAKOUT_PCT") or self.rules.get("breakout_from_open_percent") or 2.0)
-        self.drop_pct = float(os.environ.get("MONITOR_DROP_PCT") or self.rules.get("drop_from_open_percent") or -2.0)
-        self.new_high_extension_pct = float(os.environ.get("MONITOR_NEW_HIGH_EXTENSION_PCT") or self.rules.get("new_high_extension_percent") or 0.8)
+    if signal_mode is not None:
+        signal_mode = str(signal_mode).strip().lower()
+        if signal_mode not in {"alert", "confirmed", "both"}:
+            raise ValueError("signal_mode 僅支援 alert、confirmed、both")
+        rules["signal_mode"] = signal_mode
 
-    async def send_startup(self):
-        if str(os.environ.get("SEND_STARTUP_NOTIFICATION", "true")).lower() in {"0", "false", "no"}:
-            return
-        symbols = ", ".join(row["symbol"] for row in self.watchlist) or "尚未設定"
-        msg = (
-            "【台股 MCP V9 監測啟動】\n"
-            f"時間：{datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"監測清單：{symbols}\n"
-            f"輪詢秒數：{self.poll_seconds}\n"
-            "模式：paper，只發通知，不會下單。"
-        )
-        await send_telegram_message(msg)
+    if confirm_seconds is not None:
+        confirm_seconds = int(confirm_seconds)
+        if confirm_seconds < 0:
+            raise ValueError("confirm_seconds 不能小於 0")
+        rules["confirm_seconds"] = confirm_seconds
 
-    def _cooldown_ok(self, symbol: str, key: str) -> bool:
-        now = datetime.now(TAIPEI_TZ).timestamp()
-        state = self.states.setdefault(symbol, SymbolState())
-        last = state.last_alert_at.get(key, 0)
-        if now - last < self.cooldown_seconds:
-            return False
-        state.last_alert_at[key] = now
-        return True
+    if max_confirm_from_open_percent is not None:
+        rules["max_confirm_from_open_percent"] = float(max_confirm_from_open_percent)
 
-    async def check_symbol(self, row: dict[str, Any]):
-        symbol = row["symbol"]
-        name = row.get("name") or ""
-        q = await _fugle_quote(symbol)
-        price = _price_from_quote(q)
-        if not price:
-            return
-        volume = _volume_from_quote(q)
-        state = self.states.setdefault(symbol, SymbolState())
-        if state.base_price is None:
-            state.base_price = _base_from_quote(q, price)
-        previous_high = state.high_seen
-        if state.high_seen is None or price > state.high_seen:
-            state.high_seen = price
-        if state.low_seen is None or price < state.low_seen:
-            state.low_seen = price
-
-        alerts = []
-        base = state.base_price or price
-        chg_pct = (price / base - 1) * 100 if base else 0
-
-        breakout_price = _to_float(row.get("breakout_price"))
-        stop_loss_price = _to_float(row.get("stop_loss_price"))
-        if breakout_price and price >= breakout_price and self._cooldown_ok(symbol, "fixed_breakout"):
-            alerts.append(f"突破指定價 {breakout_price}")
-        if stop_loss_price and price <= stop_loss_price and self._cooldown_ok(symbol, "fixed_stop"):
-            alerts.append(f"跌破指定停損 {stop_loss_price}")
-        if chg_pct >= self.breakout_pct and self._cooldown_ok(symbol, "open_breakout"):
-            alerts.append(f"較開盤/參考價上漲 {chg_pct:.2f}%")
-        if chg_pct <= self.drop_pct and self._cooldown_ok(symbol, "open_drop"):
-            alerts.append(f"較開盤/參考價下跌 {chg_pct:.2f}%")
-        if previous_high and price >= previous_high * (1 + self.new_high_extension_pct / 100) and self._cooldown_ok(symbol, "new_high_extension"):
-            alerts.append(f"盤中新高再延伸 {self.new_high_extension_pct:.2f}%")
-
-        if not alerts:
-            state.last_volume = volume
-            return
-        msg = (
-            f"【盤中訊號】{name} {symbol}\n"
-            f"時間：{datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')}\n"
-            f"現價：{price}\n"
-            f"基準價：{base}\n"
-            f"漲跌幅：{chg_pct:.2f}%\n"
-            f"今日觀察高/低：{state.high_seen} / {state.low_seen}\n"
-            f"成交量：{volume if volume is not None else 'N/A'}\n"
-            f"觸發：{'; '.join(alerts)}\n\n"
-            "提醒：這是紙上監測通知，不會下單。請回 ChatGPT 做下單預覽，或自行到券商 App 確認。"
-        )
-        await send_telegram_message(msg)
-        state.last_volume = volume
-
-    async def run_forever(self):
-        if not self.watchlist:
-            raise RuntimeError("沒有監測清單。請設定 MONITOR_WATCHLIST 或 monitor_rules.json。")
-        await self.send_startup()
-        while True:
-            try:
-                if self.market_only and not _market_is_open():
-                    await asyncio.sleep(60)
-                    continue
-                tasks = [self.check_symbol(row) for row in self.watchlist]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for result in results:
-                    if isinstance(result, Exception):
-                        print(f"[monitor] symbol check error: {result}", flush=True)
-                await asyncio.sleep(max(5, self.poll_seconds))
-            except Exception as exc:
-                print(f"[monitor] loop error: {exc}", flush=True)
-                try:
-                    await send_telegram_message(f"【台股 MCP V9 監測錯誤】\n{exc}")
-                except Exception as notify_exc:
-                    print(f"[monitor] notify error: {notify_exc}", flush=True)
-                await asyncio.sleep(60)
-
-
-async def main():
-    config = _load_rules()
-    if str(os.environ.get("MONITOR_ENABLED", config.get("enabled", True))).lower() in {"0", "false", "no"}:
-        print("MONITOR_ENABLED=false，監測未啟動。", flush=True)
-        while True:
-            await asyncio.sleep(300)
-    monitor = Monitor()
-    await monitor.run_forever()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    return await save_dynamic_config(current)
