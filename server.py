@@ -23,6 +23,7 @@ PORT = int(os.environ.get("PORT", "8000"))
 FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 TWSE_DAILY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+TWSE_MI_INDEX_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
 TPEX_DAILY_CLOSE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 
 
@@ -774,6 +775,7 @@ def _signed_market_change(row: dict[str, Any]) -> float:
     sign = str(_first_value(
         row,
         "ChangeSign", "UpDown", "Trend", "漲跌符號", "漲跌註記",
+        "漲跌(+/-)", "+/-",
     ) or "").strip()
 
     negative_tokens = {"-", "－", "跌", "down", "DOWN", "red_down"}
@@ -802,6 +804,169 @@ def _response_rows(payload: Any) -> list[dict[str, Any]]:
             if value and isinstance(value[0], dict):
                 numbered.extend(value)
     return numbered
+
+
+
+
+def _normalize_market_date(value: Any) -> str | None:
+    """Normalize TW official dates to ROC yyyMMdd format, e.g. 1150626.
+
+    Accepts ROC formats such as 1150626 / 115/06/26 and Gregorian formats
+    such as 20260626 / 2026-06-26.
+    """
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # Prefer explicit Gregorian year when present.
+    match = re.search(r"(20\d{2})\D*([01]?\d)\D*([0-3]?\d)", text)
+    if match:
+        year = int(match.group(1)) - 1911
+        month = int(match.group(2))
+        day = int(match.group(3))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{year:03d}{month:02d}{day:02d}"
+
+    # ROC with separators, e.g. 115/06/26 or 115年06月26日.
+    match = re.search(r"(\d{2,3})\D+([01]?\d)\D+([0-3]?\d)", text)
+    if match:
+        year = int(match.group(1))
+        month = int(match.group(2))
+        day = int(match.group(3))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{year:03d}{month:02d}{day:02d}"
+
+    digits = re.sub(r"\D", "", text)
+    if len(digits) >= 8 and digits[:4].startswith("20"):
+        year = int(digits[:4]) - 1911
+        return f"{year:03d}{digits[4:8]}"
+    if len(digits) >= 7:
+        return digits[:7]
+    return None
+
+
+def _roc_to_gregorian_yyyymmdd(value: Any) -> str | None:
+    roc = _normalize_market_date(value)
+    if not roc or len(roc) < 7:
+        return None
+    try:
+        year = int(roc[:3]) + 1911
+        month = int(roc[3:5])
+        day = int(roc[5:7])
+        return f"{year:04d}{month:02d}{day:02d}"
+    except Exception:
+        return None
+
+
+def _market_date_sort_key(value: Any) -> int:
+    roc = _normalize_market_date(value)
+    gregorian = _roc_to_gregorian_yyyymmdd(roc)
+    try:
+        return int(gregorian or 0)
+    except Exception:
+        return 0
+
+
+def _latest_market_date(values: list[Any]) -> str | None:
+    dates = [_normalize_market_date(value) for value in values if _normalize_market_date(value)]
+    if not dates:
+        return None
+    return max(dates, key=_market_date_sort_key)
+
+
+def _payload_report_date(payload: Any, default: Any = None) -> str | None:
+    if isinstance(payload, dict):
+        for key in ("date", "Date", "TradeDate", "ReportDate", "資料日期", "日期"):
+            normalized = _normalize_market_date(payload.get(key))
+            if normalized:
+                return normalized
+        for key in ("title", "Title", "subtitle", "Subtitle", "notes", "Notes"):
+            normalized = _normalize_market_date(payload.get(key))
+            if normalized:
+                return normalized
+    return _normalize_market_date(default)
+
+
+def _rows_from_fields_data(
+    fields: Any,
+    data: Any,
+    report_date: str | None = None,
+) -> list[dict[str, Any]]:
+    if not isinstance(fields, list) or not isinstance(data, list):
+        return []
+    clean_fields = [str(field).strip() for field in fields]
+    rows: list[dict[str, Any]] = []
+    for raw_row in data:
+        if not isinstance(raw_row, (list, tuple)):
+            continue
+        item = {
+            clean_fields[index]: raw_row[index]
+            for index in range(min(len(clean_fields), len(raw_row)))
+        }
+        if report_date:
+            item.setdefault("Date", report_date)
+            item.setdefault("資料日期", report_date)
+        rows.append(item)
+    return rows
+
+
+def _tabular_payload_rows(payload: Any, report_date: str | None = None) -> list[dict[str, Any]]:
+    """Extract rows from TWSE MI_INDEX table-style JSON payloads."""
+    if not isinstance(payload, dict):
+        return []
+
+    report_date = report_date or _payload_report_date(payload)
+    candidates: list[list[dict[str, Any]]] = []
+
+    # Newer TWSE rwd endpoint usually puts tables in payload["tables"].
+    tables = payload.get("tables")
+    if isinstance(tables, list):
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            fields = table.get("fields") or table.get("headers") or table.get("columns")
+            data = table.get("data") or table.get("rows")
+            rows = _rows_from_fields_data(fields, data, report_date=report_date)
+            if rows:
+                candidates.append(rows)
+
+    # Older exchangeReport endpoint often uses fields9/data9 style keys.
+    for key, fields in payload.items():
+        key_text = str(key)
+        match = re.fullmatch(r"fields(\d*)", key_text, re.IGNORECASE)
+        if not match:
+            continue
+        suffix = match.group(1)
+        data = payload.get(f"data{suffix}") or payload.get(f"Data{suffix}")
+        rows = _rows_from_fields_data(fields, data, report_date=report_date)
+        if rows:
+            candidates.append(rows)
+
+    # Fallback for a single table-like payload.
+    rows = _rows_from_fields_data(
+        payload.get("fields") or payload.get("headers"),
+        payload.get("data") or payload.get("rows"),
+        report_date=report_date,
+    )
+    if rows:
+        candidates.append(rows)
+
+    selected: list[dict[str, Any]] = []
+    for rows in candidates:
+        sample = rows[:5]
+        joined_keys = " ".join(" ".join(row.keys()) for row in sample)
+        if "證券代號" in joined_keys and ("收盤價" in joined_keys or "收盤" in joined_keys):
+            selected.extend(rows)
+
+    if selected:
+        return selected
+
+    flattened: list[dict[str, Any]] = []
+    for rows in candidates:
+        flattened.extend(rows)
+    return flattened
 
 
 def _normalize_official_row(
@@ -903,6 +1068,7 @@ async def _get_official_market_quotes(
     for row in rows:
         item = _normalize_official_row(row, market)
         if item is not None:
+            item["date"] = _normalize_market_date(item.get("date"))
             normalized.append(item)
 
     if not normalized:
@@ -912,11 +1078,14 @@ async def _get_official_market_quotes(
             f"可能是上游尚未更新或欄位改版；sampleKeys={sample_keys}"
         )
 
-    report_dates = sorted({
-        str(item.get("date"))
-        for item in normalized
-        if item.get("date")
-    })
+    report_dates = sorted(
+        {
+            date_text
+            for date_text in (_normalize_market_date(item.get("date")) for item in normalized)
+            if date_text
+        },
+        key=_market_date_sort_key,
+    )
     return {
         "market": market,
         "date": report_dates[-1] if report_dates else None,
@@ -927,6 +1096,184 @@ async def _get_official_market_quotes(
         "freshness": "官方端點最新公布的全市場日行情，不是盤中逐筆即時快照。",
     }
 
+
+async def _get_twse_mi_index_quotes(
+    target_date: str,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """Use TWSE MI_INDEX as date-specific TSE fallback."""
+    roc_date = _normalize_market_date(target_date)
+    gregorian_date = _roc_to_gregorian_yyyymmdd(roc_date)
+    if not roc_date or not gregorian_date:
+        raise ValueError(f"無法將 target_date 轉為 TWSE MI_INDEX 日期：{target_date}")
+
+    url = f"{TWSE_MI_INDEX_URL}?date={gregorian_date}&type=ALLBUT0999&response=json"
+    payload = await _official_http_json(
+        url,
+        cache_tag=f"TSE:MI_INDEX:{roc_date}",
+        force_refresh=force_refresh,
+    )
+
+    if isinstance(payload, dict):
+        stat = str(payload.get("stat", "") or "")
+        if stat and "OK" not in stat.upper():
+            raise RuntimeError(f"TWSE MI_INDEX 回傳非 OK 狀態：{stat}")
+
+    report_date = _payload_report_date(payload, default=roc_date) or roc_date
+    rows = _tabular_payload_rows(payload, report_date=report_date)
+    normalized = []
+    for row in rows:
+        item = _normalize_official_row(row, "TSE")
+        if item is not None:
+            item["date"] = _normalize_market_date(item.get("date")) or report_date
+            normalized.append(item)
+
+    if not normalized:
+        sample_keys = sorted(rows[0].keys())[:20] if rows else []
+        raise RuntimeError(
+            "TWSE MI_INDEX 備援資料目前沒有解析到普通股。"
+            f"可能是上游尚未更新或欄位改版；sampleKeys={sample_keys}"
+        )
+
+    report_dates = sorted(
+        {
+            date_text
+            for date_text in (_normalize_market_date(item.get("date")) for item in normalized)
+            if date_text
+        },
+        key=_market_date_sort_key,
+    )
+    final_date = report_dates[-1] if report_dates else report_date
+    return {
+        "market": "TSE",
+        "date": final_date,
+        "time": None,
+        "data": normalized,
+        "source": "TWSE MI_INDEX",
+        "fetchedAtTaipei": _taipei_now().isoformat(),
+        "freshness": "TWSE MI_INDEX 指定日期備援全市場日行情。",
+        "fallbackUsed": True,
+    }
+
+
+async def _resolve_official_market_payloads(
+    requested_markets: list[str],
+    force_refresh: bool = False,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Fetch official market data and apply date-stale fallback when possible.
+
+    Main rule: if a primary endpoint returns rows but its date is older than
+    the newest official market date from the requested markets, it is stale.
+    For TSE stale data, automatically use TWSE MI_INDEX date-specific fallback.
+    """
+    requested_markets = [market.upper().strip() for market in requested_markets]
+    primary_results = await asyncio.gather(
+        *[_get_official_market_quotes(market, force_refresh=force_refresh) for market in requested_markets],
+        return_exceptions=True,
+    )
+
+    primary_payloads: dict[str, dict[str, Any]] = {}
+    final_payloads: dict[str, dict[str, Any]] = {}
+    fetch_errors: list[dict[str, Any]] = []
+    for market, result in zip(requested_markets, primary_results):
+        if isinstance(result, Exception):
+            fetch_errors.append({
+                "market": market,
+                "error": str(result),
+                "stage": "primary",
+            })
+        else:
+            primary_payloads[market] = result
+            final_payloads[market] = result
+
+    primary_market_dates = {
+        market: _normalize_market_date(primary_payloads.get(market, {}).get("date"))
+        for market in requested_markets
+    }
+    target_date = _latest_market_date(list(primary_market_dates.values()))
+
+    fallback_attempts: list[dict[str, Any]] = []
+    if target_date:
+        for market in requested_markets:
+            primary_payload = primary_payloads.get(market)
+            primary_date = _normalize_market_date(primary_payload.get("date")) if primary_payload else None
+            if primary_date == target_date:
+                continue
+
+            attempt: dict[str, Any] = {
+                "market": market,
+                "primarySource": primary_payload.get("source") if primary_payload else None,
+                "primaryDate": primary_date,
+                "reason": "primary source stale" if primary_date else "primary source missing or empty",
+                "fallbackDate": None,
+                "success": False,
+            }
+
+            if market == "TSE":
+                try:
+                    fallback_payload = await _get_twse_mi_index_quotes(
+                        target_date,
+                        force_refresh=True if force_refresh else False,
+                    )
+                    fallback_date = _normalize_market_date(fallback_payload.get("date"))
+                    attempt.update({
+                        "fallbackSource": "TWSE MI_INDEX",
+                        "fallbackDate": fallback_date,
+                        "rowCount": len(fallback_payload.get("data", [])),
+                        "success": fallback_date == target_date and bool(fallback_payload.get("data")),
+                    })
+                    if attempt["success"]:
+                        final_payloads[market] = fallback_payload
+                except Exception as exc:
+                    attempt.update({
+                        "fallbackSource": "TWSE MI_INDEX",
+                        "error": str(exc),
+                    })
+            else:
+                attempt.update({
+                    "fallbackSource": None,
+                    "error": "目前尚未實作 TPEx 指定日期備援；若 OTC 日期落後，正式雷達會停用。",
+                })
+
+            fallback_attempts.append(attempt)
+
+    final_market_dates = {
+        market: _normalize_market_date(final_payloads.get(market, {}).get("date"))
+        for market in requested_markets
+    }
+    is_consistent = bool(target_date) and all(
+        final_market_dates.get(market) == target_date
+        for market in requested_markets
+    )
+    successful_fallback_markets = [
+        attempt["market"]
+        for attempt in fallback_attempts
+        if attempt.get("success")
+    ]
+
+    errors: list[dict[str, Any]] = list(fetch_errors)
+    if not is_consistent:
+        errors.append({
+            "error": "Official market dates inconsistent after fallback; formal radar disabled.",
+            "primaryMarketDates": primary_market_dates,
+            "finalMarketDates": final_market_dates,
+            "targetDate": target_date,
+        })
+
+    metadata = {
+        "primaryMarketDates": primary_market_dates,
+        "finalMarketDates": final_market_dates,
+        "fallbackUsed": bool(fallback_attempts),
+        "fallbackMarkets": successful_fallback_markets,
+        "fallbackAttempts": fallback_attempts,
+        "dataIntegrity": {
+            "targetDate": target_date,
+            "isConsistent": is_consistent,
+            "canGenerateOfficialRadar": is_consistent,
+        },
+        "officialMarketErrors": errors,
+    }
+    return final_payloads, metadata
 
 async def _get_historical_candles_raw(
     symbol: str,
@@ -1261,8 +1608,8 @@ def ping() -> dict:
     """檢查台股 MCP 伺服器是否正常運作。"""
     return {
         "ok": True,
-        "server": "Taiwan Stock MCP v8-free-score-tracker",
-        "version": "8.0.0-free",
+        "server": "Taiwan Stock MCP v8.1-free-official-fallback",
+        "version": "8.1.0-free-official-fallback",
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "tools": [
             "get_realtime_quote",
@@ -1617,25 +1964,62 @@ async def screen_market(
         raise ValueError("價格範圍設定不正確。")
 
     requested_markets = ["TSE", "OTC"] if markets == "BOTH" else [markets]
-    market_payloads = await asyncio.gather(
-        *[
-            _get_official_market_quotes(
-                market,
-                force_refresh=force_refresh,
-            )
-            for market in requested_markets
-        ]
+    market_payloads, market_metadata = await _resolve_official_market_payloads(
+        requested_markets,
+        force_refresh=force_refresh,
     )
 
-    universe: list[dict[str, Any]] = []
     as_of: list[dict[str, Any]] = []
-    for market, payload in zip(requested_markets, market_payloads):
+    for market in requested_markets:
+        payload = market_payloads.get(market, {})
         as_of.append({
             "market": market,
             "date": payload.get("date"),
             "source": payload.get("source"),
             "fetchedAtTaipei": payload.get("fetchedAtTaipei"),
         })
+
+    if not market_metadata.get("dataIntegrity", {}).get("canGenerateOfficialRadar"):
+        return {
+            "strategy": strategy,
+            "markets": requested_markets,
+            "asOf": as_of,
+            "marketDataMode": "official_latest_daily_market",
+            "marketDataFreshness": (
+                "全市場初篩依證交所／櫃買中心端點最新公布的日行情；"
+                "不是 Fugle 盤中 Snapshot。收盤後執行最完整。"
+            ),
+            "snapshotUniverseCount": 0,
+            "deepAnalyzedCount": 0,
+            "candidateLimit": candidate_limit,
+            "filters": {
+                "minTradeValue": min_trade_value,
+                "minPrice": min_price,
+                "maxPrice": max_price,
+            },
+            "includeChip": include_chip,
+            "forceRefresh": force_refresh,
+            "cacheNote": (
+                "官方市場行情、歷史 K 線與籌碼依 TTL 使用快取；"
+                "force_refresh=true 可略過快取。"
+            ),
+            "results": [],
+            "errors": market_metadata.get("officialMarketErrors", [])[:15],
+            "method": (
+                "證交所／櫃買中心最新公開日行情預篩，"
+                "再對候選股計算 180 日技術指標；不是報酬保證。"
+            ),
+            "source": (
+                "TWSE OpenAPI + TWSE MI_INDEX fallback + TPEx OpenAPI；候選股歷史 K 線使用 "
+                "Fugle MarketData API v1.0；include_chip 時另用 FinMind API v4"
+            ),
+            "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
+            **market_metadata,
+        }
+
+    universe: list[dict[str, Any]] = []
+    for market in requested_markets:
+        payload = market_payloads.get(market, {})
         for row in payload.get("data", []):
             close = _safe_float(row.get("closePrice"))
             trade_value = _safe_float(row.get("tradeValue"))
@@ -1750,6 +2134,7 @@ async def screen_market(
             "Fugle MarketData API v1.0；include_chip 時另用 FinMind API v4"
         ),
         "fetchedAtUtc": datetime.now(timezone.utc).isoformat(),
+        **market_metadata,
     }
 
 
@@ -2114,17 +2499,16 @@ def _same_theme_symbols(symbol: str, theme_map: dict[str, list[str]]) -> list[st
 async def _get_market_universe_for_theme(markets: str = "BOTH", force_refresh: bool = False) -> list[dict[str, Any]]:
     markets = markets.upper().strip()
     requested_markets = ["TSE", "OTC"] if markets == "BOTH" else [markets]
-    payloads = await asyncio.gather(
-        *[_get_official_market_quotes(market, force_refresh=force_refresh) for market in requested_markets],
-        return_exceptions=True,
+    payloads, _metadata = await _resolve_official_market_payloads(
+        requested_markets,
+        force_refresh=force_refresh,
     )
     rows: list[dict[str, Any]] = []
-    for payload in payloads:
-        if isinstance(payload, Exception):
-            continue
-        rows.extend(payload.get("data", []))
+    for market in requested_markets:
+        payload = payloads.get(market)
+        if isinstance(payload, dict):
+            rows.extend(payload.get("data", []))
     return rows
-
 
 async def _compute_theme_score(symbol: str, markets: str = "BOTH", force_refresh: bool = False) -> dict[str, Any]:
     symbol = _validate_symbol(symbol)
@@ -2260,13 +2644,25 @@ async def _compute_risk_flags(symbol: str, text: str = "") -> dict[str, Any]:
 
 
 def _date_key_from_screen_payload(payload: dict[str, Any]) -> str:
+    integrity = payload.get("dataIntegrity") or {}
+    target_date = integrity.get("targetDate") if isinstance(integrity, dict) else None
+    normalized_target = _normalize_market_date(target_date)
+    if normalized_target:
+        return re.sub(r"[^0-9]", "", normalized_target)[:8]
+
+    final_dates = payload.get("finalMarketDates") or {}
+    if isinstance(final_dates, dict):
+        latest_final = _latest_market_date(list(final_dates.values()))
+        if latest_final:
+            return re.sub(r"[^0-9]", "", latest_final)[:8]
+
     as_of = payload.get("asOf") or []
     if isinstance(as_of, list) and as_of:
         first_date = as_of[0].get("date") if isinstance(as_of[0], dict) else None
-        if first_date:
-            return re.sub(r"[^0-9]", "", str(first_date))[:8]
+        normalized_first = _normalize_market_date(first_date)
+        if normalized_first:
+            return re.sub(r"[^0-9]", "", normalized_first)[:8]
     return _taipei_now().strftime("%Y%m%d")
-
 
 async def _load_screen_records() -> list[dict[str, Any]]:
     remote = await _v8_redis_get_json("screenRecords")
@@ -2463,6 +2859,21 @@ async def screen_market_v2(
         include_chip=include_chip,
         force_refresh=force_refresh,
     )
+    if not base.get("dataIntegrity", {}).get("canGenerateOfficialRadar", True):
+        base["v8"] = {
+            "version": "8.1.0-free-official-fallback",
+            "includeTheme": include_theme,
+            "includeRisk": include_risk,
+            "recordResult": False,
+            "note": "官方市場日期不一致或備援未成功，本次不產生正式 V8 雷達，也不記錄回測訊號。",
+        }
+        if record_result:
+            base["record"] = {
+                "ok": False,
+                "reason": "official market dates inconsistent; record skipped",
+            }
+        return base
+
     enhanced = []
     for item in base.get("results", []):
         item = dict(item)
@@ -2493,7 +2904,7 @@ async def screen_market_v2(
         item["rank"] = rank
     base["results"] = enhanced[:top_n]
     base["v8"] = {
-        "version": "8.0.0-free",
+        "version": "8.1.0-free-official-fallback",
         "includeTheme": include_theme,
         "includeRisk": include_risk,
         "recordResult": record_result,
@@ -2596,65 +3007,6 @@ async def get_signal_performance(signal_id: str) -> dict:
 # === V9 Dynamic Monitor Config Tools ===
 # 這段工具讓 ChatGPT 可以直接更新 Background Worker 的動態監控設定。
 # 需搭配 monitor_config_store.py，並且 Web Service / Background Worker 都設定同一組 REDIS_URL。
-# 更新成功後會同步嘗試發送 Telegram 確認通知。
-# 2026-06-22：新增 entry 模式、漲停重複通知抑制、預估停利/停損參數。
-
-async def _notify_monitor_config_changed(config: dict[str, Any], action: str = "監控設定已更新") -> dict:
-    """設定更新後，送一則 Telegram 確認通知。失敗不影響設定本身。"""
-    try:
-        from notifications import send_telegram_message
-
-        watchlist = config.get("watchlist") or []
-        rules = config.get("rules") or {}
-
-        lines = []
-        for item in watchlist:
-            symbol = str(item.get("symbol", "")).strip()
-            name = str(item.get("name") or symbol).strip()
-            if symbol:
-                lines.append(f"• {symbol} {name}")
-
-        market_only = rules.get("market_only")
-        market_only_text = "是" if market_only else "否"
-
-        message = (
-            "【台股監控設定已更新】\n"
-            f"{action}\n\n"
-            f"監控檔數：{len(watchlist)}\n"
-            "監控清單：\n"
-            f"{chr(10).join(lines) if lines else '無'}\n\n"
-            f"輪詢秒數：{rules.get('poll_seconds', '未設定')} 秒\n"
-            f"冷卻秒數：{rules.get('cooldown_seconds', '未設定')} 秒\n"
-            f"訊號模式：{rules.get('signal_mode', '未設定')}\n"
-            f"二次確認秒數：{rules.get('confirm_seconds', '未設定')} 秒\n"
-            f"進場區間：{rules.get('entry_min_from_open_percent', '未設定')}%～{rules.get('entry_max_from_open_percent', '未設定')}%\n"
-            f"開低走高模式：{rules.get('gap_recovery_enabled', '未設定')}\n"
-            f"開低後拉升門檻：{rules.get('gap_recovery_min_from_open_percent', '未設定')}%\n"
-            f"缺口收復門檻：{rules.get('gap_recovery_min_recovered_percent', '未設定')}%\n"
-            f"接近參考價門檻：{rules.get('gap_recovery_near_reference_percent', '未設定')}%\n"
-            f"漲停抑制：{rules.get('suppress_limit_up_repeats', '未設定')}\n"
-            f"漲停判斷門檻：{rules.get('limit_up_near_percent', '未設定')}%\n"
-            f"預估停損：{rules.get('entry_stop_loss_percent', '未設定')}%\n"
-            f"預估停利：{rules.get('take_profit_r_multiple', '未設定')}R\n"
-            f"開盤漲幅提醒：{rules.get('breakout_from_open_percent', '未設定')}%\n"
-            f"開盤跌幅提醒：{rules.get('drop_from_open_percent', '未設定')}%\n"
-            f"創高延伸提醒：{rules.get('new_high_extension_percent', '未設定')}%\n"
-            f"僅盤中監控：{market_only_text}"
-        )
-
-        data = await send_telegram_message(message)
-        return {
-            "ok": True,
-            "telegramOk": bool(data.get("ok")),
-            "message": "Telegram 確認通知已送出。",
-        }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "telegramOk": False,
-            "message": f"Telegram 確認通知發送失敗：{exc}",
-        }
-
 
 @mcp.tool()
 async def get_dynamic_monitor_config() -> dict:
@@ -2681,28 +3033,8 @@ async def update_monitor_config(
     breakout_from_open_percent: float | None = None,
     drop_from_open_percent: float | None = None,
     new_high_extension_percent: float | None = None,
-    signal_mode: str | None = None,
-    confirm_seconds: int | None = None,
-    entry_filter_enabled: bool | None = None,
-    entry_signal_only: bool | None = None,
-    entry_min_from_open_percent: float | None = None,
-    entry_max_from_open_percent: float | None = None,
-    gap_recovery_enabled: bool | None = None,
-    gap_recovery_min_from_open_percent: float | None = None,
-    gap_recovery_min_recovered_percent: float | None = None,
-    gap_recovery_near_reference_percent: float | None = None,
-    gap_recovery_max_above_reference_percent: float | None = None,
-    suppress_limit_up_repeats: bool | None = None,
-    send_limit_up_notice_once: bool | None = None,
-    limit_up_near_percent: float | None = None,
-    entry_stop_loss_percent: float | None = None,
-    take_profit_r_multiple: float | None = None,
 ) -> dict:
-    """
-    V9：更新盤中監控設定。
-    watchlist 格式例：2408:南亞科,6213:聯茂
-    signal_mode 支援 alert、confirmed、both、entry。
-    """
+    """V9：更新盤中監控設定。watchlist 格式例：2313:華通,4977:眾達-KY"""
     from monitor_config_store import update_dynamic_config, redis_configured, REDIS_KEY
 
     if not redis_configured():
@@ -2721,22 +3053,6 @@ async def update_monitor_config(
             breakout_from_open_percent=breakout_from_open_percent,
             drop_from_open_percent=drop_from_open_percent,
             new_high_extension_percent=new_high_extension_percent,
-            signal_mode=signal_mode,
-            confirm_seconds=confirm_seconds,
-            entry_filter_enabled=entry_filter_enabled,
-            entry_signal_only=entry_signal_only,
-            entry_min_from_open_percent=entry_min_from_open_percent,
-            entry_max_from_open_percent=entry_max_from_open_percent,
-            gap_recovery_enabled=gap_recovery_enabled,
-            gap_recovery_min_from_open_percent=gap_recovery_min_from_open_percent,
-            gap_recovery_min_recovered_percent=gap_recovery_min_recovered_percent,
-            gap_recovery_near_reference_percent=gap_recovery_near_reference_percent,
-            gap_recovery_max_above_reference_percent=gap_recovery_max_above_reference_percent,
-            suppress_limit_up_repeats=suppress_limit_up_repeats,
-            send_limit_up_notice_once=send_limit_up_notice_once,
-            limit_up_near_percent=limit_up_near_percent,
-            entry_stop_loss_percent=entry_stop_loss_percent,
-            take_profit_r_multiple=take_profit_r_multiple,
         )
     except Exception as exc:
         return {
@@ -2744,23 +3060,17 @@ async def update_monitor_config(
             "message": f"更新監控設定失敗：{exc}",
         }
 
-    telegram_result = await _notify_monitor_config_changed(
-        config,
-        action="ChatGPT 已更新監控設定。",
-    )
-
     return {
         "ok": True,
         "redisKey": REDIS_KEY,
         "config": config,
-        "telegram": telegram_result,
-        "message": "監控設定已更新。Background Worker 會在下一輪輪詢讀到新設定，並已嘗試發送 Telegram 確認通知。",
+        "message": "監控設定已更新。Background Worker 會在下一輪輪詢讀到新設定。",
     }
 
 
 @mcp.tool()
 async def set_monitor_watchlist(watchlist: str, poll_seconds: int | None = None) -> dict:
-    """V9：快速設定監控清單，可選擇一起改秒數。例：2408:南亞科,6213:聯茂"""
+    """V9：快速設定監控清單，可選擇一起改秒數。例：2313:華通,4977:眾達-KY"""
     from monitor_config_store import update_dynamic_config, redis_configured, REDIS_KEY
 
     if not redis_configured():
@@ -2780,19 +3090,15 @@ async def set_monitor_watchlist(watchlist: str, poll_seconds: int | None = None)
             "message": f"設定監控清單失敗：{exc}",
         }
 
-    telegram_result = await _notify_monitor_config_changed(
-        config,
-        action="ChatGPT 已更新監控清單。",
-    )
-
     return {
         "ok": True,
         "redisKey": REDIS_KEY,
         "config": config,
-        "telegram": telegram_result,
-        "message": "監控清單已更新。Background Worker 會在下一輪輪詢讀到新設定，並已嘗試發送 Telegram 確認通知。",
+        "message": "監控清單已更新。Background Worker 會在下一輪輪詢讀到新設定。",
     }
+
 
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
+
