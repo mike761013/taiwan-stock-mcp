@@ -56,6 +56,24 @@ class StockDatabaseService:
         count = await self.repository.bulk_upsert_indicators(rows)
         return {"ok": True, "symbol": symbol, "processed": count}
 
+    async def cleanup(
+        self,
+        retention_years: int = 3,
+        radar_retention_days: int = 180,
+        job_retention_days: int = 90,
+        vacuum: bool = True,
+    ) -> dict[str, Any]:
+        health = await self.database.health()
+        if health.get("status") != "healthy":
+            return {"ok": False, "health": health}
+        result = await self.repository.cleanup_old_data(
+            retention_years=retention_years,
+            radar_retention_days=radar_retention_days,
+            job_retention_days=job_retention_days,
+            vacuum=vacuum,
+        )
+        return {"health": health, **result}
+
     async def save_radar_result(
         self, strategy: str, candidates: Sequence[dict[str, Any]],
         run_date: date | None = None,

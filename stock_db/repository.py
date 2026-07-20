@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import date
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -171,6 +172,18 @@ class StockRepository:
             rows = await connection.fetch(query, *args)
         return [dict(row) for row in rows]
 
+    async def get_symbols_with_daily_bars(self) -> list[str]:
+        """Return active symbols that currently have at least one daily bar."""
+        async with self.database.acquire() as connection:
+            rows = await connection.fetch("""
+                SELECT DISTINCT s.symbol
+                FROM securities s
+                JOIN daily_bars b ON b.symbol=s.symbol
+                WHERE s.is_active=TRUE
+                ORDER BY s.symbol
+            """)
+        return [str(row["symbol"]) for row in rows]
+
     async def get_latest_trade_date(self, symbol: str | None = None) -> date | None:
         async with self.database.acquire() as connection:
             if symbol:
@@ -191,12 +204,112 @@ class StockRepository:
                     (SELECT MIN(trade_date) FROM daily_bars) AS first_date,
                     (SELECT MAX(trade_date) FROM daily_bars) AS latest_date
             """)
+            size_bytes = int(await connection.fetchval(
+                "SELECT pg_database_size(current_database())"
+            ) or 0)
             size = await connection.fetchval(
                 "SELECT pg_size_pretty(pg_database_size(current_database()))"
             )
+
+        try:
+            limit_bytes = max(1, int(os.getenv(
+                "STOCK_DB_MAX_BYTES", str(1024 * 1024 * 1024)
+            )))
+        except (TypeError, ValueError):
+            limit_bytes = 1024 * 1024 * 1024
+
         result = dict(row)
-        result["databaseSize"] = size
+        result.update({
+            "databaseSize": size,
+            "databaseSizeBytes": size_bytes,
+            "databaseLimitBytes": limit_bytes,
+            "databaseUsagePercent": round(size_bytes / limit_bytes * 100, 2),
+            "remainingMB": round(max(limit_bytes - size_bytes, 0) / 1024 / 1024, 2),
+        })
         return result
+
+    async def cleanup_old_data(
+        self,
+        retention_years: int = 3,
+        radar_retention_days: int = 180,
+        job_retention_days: int = 90,
+        vacuum: bool = True,
+    ) -> dict[str, Any]:
+        """Delete expired rows and optionally run VACUUM ANALYZE."""
+        retention_years = max(1, min(retention_years, 10))
+        radar_retention_days = max(1, radar_retention_days)
+        job_retention_days = max(1, job_retention_days)
+
+        def affected(command_tag: str) -> int:
+            try:
+                return int(command_tag.rsplit(" ", 1)[-1])
+            except (TypeError, ValueError):
+                return 0
+
+        async with self.database.acquire() as connection:
+            async with connection.transaction():
+                deleted_radar_candidates = affected(await connection.execute("""
+                    DELETE FROM radar_candidates c
+                    USING radar_runs r
+                    WHERE c.radar_run_id=r.id
+                      AND r.run_date < CURRENT_DATE
+                          - ($1::int * INTERVAL '1 day')
+                """, radar_retention_days))
+                deleted_radar_runs = affected(await connection.execute("""
+                    DELETE FROM radar_runs
+                    WHERE run_date < CURRENT_DATE
+                        - ($1::int * INTERVAL '1 day')
+                """, radar_retention_days))
+                deleted_indicators = affected(await connection.execute("""
+                    DELETE FROM daily_indicators
+                    WHERE trade_date < CURRENT_DATE
+                        - ($1::int * INTERVAL '1 year')
+                """, retention_years))
+                deleted_bars = affected(await connection.execute("""
+                    DELETE FROM daily_bars
+                    WHERE trade_date < CURRENT_DATE
+                        - ($1::int * INTERVAL '1 year')
+                """, retention_years))
+                deleted_jobs = affected(await connection.execute("""
+                    DELETE FROM database_jobs
+                    WHERE started_at < NOW()
+                        - ($1::int * INTERVAL '1 day')
+                """, job_retention_days))
+
+            vacuum_errors: list[dict[str, str]] = []
+            if vacuum:
+                for table in (
+                    "daily_bars",
+                    "daily_indicators",
+                    "radar_runs",
+                    "radar_candidates",
+                    "database_jobs",
+                ):
+                    try:
+                        await connection.execute(f"VACUUM (ANALYZE) {table}")
+                    except Exception as exc:
+                        vacuum_errors.append({
+                            "table": table,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        })
+
+        return {
+            "ok": True,
+            "retentionYears": retention_years,
+            "radarRetentionDays": radar_retention_days,
+            "jobRetentionDays": job_retention_days,
+            "deleted": {
+                "dailyBars": deleted_bars,
+                "dailyIndicators": deleted_indicators,
+                "radarRuns": deleted_radar_runs,
+                "radarCandidates": deleted_radar_candidates,
+                "databaseJobs": deleted_jobs,
+            },
+            "vacuumRequested": vacuum,
+            "vacuumOk": not vacuum_errors,
+            "vacuumErrors": vacuum_errors,
+            "statistics": await self.statistics(),
+        }
 
     async def start_job(
         self, job_type: str, trade_date: date | None = None,
@@ -252,10 +365,12 @@ class StockRepository:
                             rank=EXCLUDED.rank, total_score=EXCLUDED.total_score,
                             snapshot=EXCLUDED.snapshot
                     """, run_id, symbol, rank,
-                        item.get("totalScore") or item.get("score"),
-                        item.get("technicalScore"), item.get("chipScore"),
-                        item.get("themeScore"), item.get("fundamentalScore"),
-                        item.get("riskScore"),
+                        item.get("total_score") or item.get("totalScore") or item.get("score"),
+                        item.get("technical_score") or item.get("technicalScore"),
+                        item.get("chip_score") or item.get("chipScore"),
+                        item.get("theme_score") or item.get("themeScore"),
+                        item.get("fundamental_score") or item.get("fundamentalScore"),
+                        item.get("risk_score") or item.get("riskScore"),
                         json.dumps(item.get("reasons") or [], ensure_ascii=False),
                         json.dumps(item, ensure_ascii=False, default=str))
         return run_id
