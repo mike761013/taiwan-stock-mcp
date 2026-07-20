@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import hashlib
 import json
 import math
@@ -2688,6 +2688,16 @@ async def set_monitor_watchlist(watchlist: str, poll_seconds: int | None = None)
 
 
 
+
+# === V10 PostgreSQL Tool Registration ===
+try:
+    from server_v10_tools import register_v10_tools
+    register_v10_tools(mcp)
+except Exception as exc:
+    # PostgreSQL is optional and must never prevent the existing MCP from starting.
+    print(f"V10 PostgreSQL tools were not registered: {type(exc).__name__}: {exc}")
+
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
+
 

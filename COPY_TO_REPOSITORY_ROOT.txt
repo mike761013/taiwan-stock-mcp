@@ -1,0 +1,15 @@
+把本資料夾內所有內容複製到：
+文件\GitHub\taiwan-stock-mcp
+
+然後雙擊：
+install_v10.bat
+
+此版本使用 Windows 內建 PowerShell，不需要先安裝 Python。
+
+安裝器會：
+- 清除上次網頁上傳時攤平的 V10 草稿檔案
+- 備份 server.py 與 requirements.txt
+- 加入 asyncpg
+- 註冊 V10 MCP 工具
+
+不要把 DATABASE_URL 寫進任何檔案或上傳 GitHub。
