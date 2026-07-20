@@ -1,0 +1,9 @@
+你已經做過 Foundation Commit，無須撤銷。
+
+1. 把本套件所有內容覆蓋到 Documents\GitHub\taiwan-stock-mcp
+2. 雙擊 install_v10_5.bat
+3. GitHub Desktop Summary：
+   Complete V10.5 database radar and automation
+4. Commit
+5. Push origin
+6. 不要 Merge main，先在 Render 用此分支測試。

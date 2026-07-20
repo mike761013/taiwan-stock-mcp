@@ -1,0 +1,7 @@
+﻿.v10_backup/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.v10.example
+

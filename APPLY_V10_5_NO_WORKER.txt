@@ -1,0 +1,19 @@
+你沒有使用 Render Background Worker，請使用此版本。
+
+1. 把本套件所有內容覆蓋到：
+   C:\Users\Mike\Documents\GitHub\taiwan-stock-mcp
+
+2. 雙擊：
+   install_v10_5_no_worker.bat
+
+3. 此安裝器不會修改 monitor_worker.py。
+
+4. GitHub Desktop Commit：
+   Complete V10.5 without Background Worker
+
+5. Push origin，但先不要 Merge main。
+
+每日維護方式：
+- 在 ChatGPT 呼叫 MCP 工具 run_v10_daily_maintenance
+- 或在 Render Shell 執行 python scripts/daily_maintenance.py
+- 日後若需要全自動，再建立 Render Cron Job。
