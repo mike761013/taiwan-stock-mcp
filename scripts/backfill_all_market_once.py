@@ -1,8 +1,4 @@
-"""One-click full-market stock-history backfill for GitHub Actions.
-
-This script runs outside the MCP HTTP request, so Render's gateway timeout
-does not interrupt the work. It writes a checkpoint after every batch.
-"""
+"""Rate-limited, resumable full-market backfill for GitHub Actions."""
 
 from __future__ import annotations
 
@@ -32,18 +28,21 @@ def _write_json(path: Path, payload: dict[str, Any] | list[Any]) -> None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--years", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=20)
-    parser.add_argument("--concurrency", type=int, default=6)
+    parser.add_argument("--request-delay", type=float, default=6.5)
     parser.add_argument("--start-after", type=str, default="")
     parser.add_argument("--max-symbols", type=int, default=0)
     return parser.parse_args()
 
 
+def _is_forbidden(error: str) -> bool:
+    value = error.lower()
+    return "403" in value or "forbidden" in value or "ip banned" in value
+
+
 async def main() -> int:
     args = _parse_args()
     years = max(1, min(args.years, 10))
-    batch_size = max(1, min(args.batch_size, 100))
-    concurrency = max(1, min(args.concurrency, 6))
+    request_delay = max(6.2, min(args.request_delay, 60.0))
     start_after = args.start_after.strip()
     max_symbols = max(0, args.max_symbols)
 
@@ -53,125 +52,98 @@ async def main() -> int:
         return 1
 
     master = await fetch_security_master()
-    all_symbols = [str(row["symbol"]).strip() for row in master if row.get("symbol")]
+    symbols = [str(row["symbol"]).strip() for row in master if row.get("symbol")]
 
-    start_after_found = not start_after
     if start_after:
-        if start_after in all_symbols:
-            all_symbols = all_symbols[all_symbols.index(start_after) + 1 :]
-            start_after_found = True
-        else:
-            print(
-                f"WARNING: start_after={start_after!r} 不在股票清單內，"
-                "將從第一檔開始。",
-                flush=True,
-            )
+        if start_after not in symbols:
+            print(f"ERROR: start_after={start_after!r} 不在股票清單內。", flush=True)
+            return 1
+        symbols = symbols[symbols.index(start_after) + 1 :]
 
     if max_symbols > 0:
-        all_symbols = all_symbols[:max_symbols]
+        symbols = symbols[:max_symbols]
 
-    total_symbols = len(all_symbols)
-    total_processed = 0
-    total_failed = 0
-    total_bars = 0
+    total = len(symbols)
+    processed = failed = bars_written = 0
     failures: list[dict[str, Any]] = []
-    last_symbol: str | None = start_after or None
+    last_successful = start_after or None
 
-    print(
-        json.dumps(
-            {
-                "event": "backfill_started",
-                "years": years,
-                "batchSize": batch_size,
-                "concurrency": concurrency,
-                "startAfter": start_after or None,
-                "startAfterFound": start_after_found,
-                "symbolCount": total_symbols,
-            },
-            ensure_ascii=False,
-        ),
-        flush=True,
-    )
+    print(json.dumps({
+        "event": "backfill_started",
+        "years": years,
+        "requestDelaySeconds": request_delay,
+        "startAfter": start_after or None,
+        "symbolCount": total,
+    }, ensure_ascii=False), flush=True)
 
-    for offset in range(0, total_symbols, batch_size):
-        batch = all_symbols[offset : offset + batch_size]
-        result = await backfill_symbols(
-            batch,
-            years=years,
-            concurrency=concurrency,
-        )
+    for index, symbol in enumerate(symbols):
+        result = await backfill_symbols([symbol], years=years, concurrency=1)
+        symbol_failures = result.get("failures") or []
 
-        total_processed += int(result.get("processedSymbols", 0))
-        total_failed += int(result.get("failedSymbols", 0))
-        total_bars += int(result.get("barsWritten", 0))
-        failures.extend(result.get("failures") or [])
-        last_symbol = batch[-1] if batch else last_symbol
+        if int(result.get("processedSymbols", 0)) > 0:
+            processed += 1
+            bars_written += int(result.get("barsWritten", 0))
+            last_successful = symbol
+        else:
+            failed += 1
+            failures.extend(symbol_failures)
+            error_text = " | ".join(str(x.get("error") or "") for x in symbol_failures)
+            if _is_forbidden(error_text):
+                remaining = total - index
+                checkpoint = {
+                    "updatedAt": datetime.now(timezone.utc).isoformat(),
+                    "status": "paused_finmind_403",
+                    "blockedAtSymbol": symbol,
+                    "lastSuccessfulSymbol": last_successful,
+                    "nextStartAfter": last_successful,
+                    "hasMore": True,
+                    "remainingSymbols": remaining,
+                    "processedSymbols": processed,
+                    "failedSymbols": failed,
+                    "barsWritten": bars_written,
+                    "requestDelaySeconds": request_delay,
+                }
+                _write_json(CHECKPOINT_PATH, checkpoint)
+                _write_json(FAILURES_PATH, failures)
+                print(json.dumps(checkpoint, ensure_ascii=False, indent=2), flush=True)
+                return 75
 
-        remaining = max(total_symbols - (offset + len(batch)), 0)
+        remaining = total - index - 1
         checkpoint = {
             "updatedAt": datetime.now(timezone.utc).isoformat(),
-            "years": years,
-            "batchSize": batch_size,
-            "concurrency": concurrency,
-            "startAfter": start_after or None,
-            "lastSymbol": last_symbol,
-            "nextStartAfter": last_symbol if remaining > 0 else None,
+            "status": "running" if remaining else "completed",
+            "lastSuccessfulSymbol": last_successful,
+            "nextStartAfter": last_successful if remaining else None,
             "hasMore": remaining > 0,
             "remainingSymbols": remaining,
-            "totalSymbolsThisRun": total_symbols,
-            "processedSymbols": total_processed,
-            "failedSymbols": total_failed,
-            "barsWritten": total_bars,
+            "processedSymbols": processed,
+            "failedSymbols": failed,
+            "barsWritten": bars_written,
+            "requestDelaySeconds": request_delay,
         }
         _write_json(CHECKPOINT_PATH, checkpoint)
         _write_json(FAILURES_PATH, failures)
 
-        print(
-            json.dumps(
-                {
-                    "event": "batch_completed",
-                    "batchStart": batch[0] if batch else None,
-                    "batchEnd": last_symbol,
-                    "batchSymbolCount": len(batch),
-                    "processedSymbols": total_processed,
-                    "failedSymbols": total_failed,
-                    "barsWritten": total_bars,
-                    "remainingSymbols": remaining,
-                    "nextStartAfter": checkpoint["nextStartAfter"],
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
+        if processed % 20 == 0 or remaining == 0:
+            print(json.dumps({
+                "event": "progress",
+                "processedSymbols": processed,
+                "failedSymbols": failed,
+                "barsWritten": bars_written,
+                "remainingSymbols": remaining,
+                "nextStartAfter": checkpoint["nextStartAfter"],
+            }, ensure_ascii=False), flush=True)
 
-    # Retry failed symbols once, using low concurrency to reduce API pressure.
-    retry_symbols = sorted(
-        {
-            str(item.get("symbol") or "").strip()
-            for item in failures
-            if str(item.get("symbol") or "").strip()
-        }
-    )
-    retry_result: dict[str, Any] | None = None
-    if retry_symbols:
-        print(
-            f"Retrying {len(retry_symbols)} failed symbols with concurrency=1",
-            flush=True,
-        )
-        retry_result = await backfill_symbols(
-            retry_symbols,
-            years=years,
-            concurrency=1,
-        )
+        if remaining:
+            await asyncio.sleep(request_delay)
 
     statistics = await stock_database_service.statistics()
     final = {
-        "ok": total_failed == 0 or bool(retry_result and retry_result.get("ok")),
-        "processedSymbols": total_processed,
-        "failedSymbolsBeforeRetry": total_failed,
-        "barsWritten": total_bars,
-        "lastSymbol": last_symbol,
-        "retry": retry_result,
+        "ok": failed == 0,
+        "processedSymbols": processed,
+        "failedSymbols": failed,
+        "barsWritten": bars_written,
+        "lastSuccessfulSymbol": last_successful,
         "statistics": statistics,
     }
     print(json.dumps(final, ensure_ascii=False, indent=2, default=str), flush=True)
@@ -182,5 +154,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(asyncio.run(main()))
     except KeyboardInterrupt:
-        print("Interrupted. Use backfill_checkpoint.json to resume.", file=sys.stderr)
+        print("Interrupted. Resume with nextStartAfter in checkpoint.", file=sys.stderr)
         raise SystemExit(130)
