@@ -1,4 +1,4 @@
-"""Database-first V10.5 market radar."""
+"""Database-first V11 market radar."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ async def screen_database_market(
     if strategy not in _STRATEGIES:
         raise ValueError(f"strategy must be one of {sorted(_STRATEGIES)}")
     limit = max(1, min(limit, 200))
+    minimum_score = max(0.0, min(float(minimum_score), 100.0))
 
     strategy_filter = {
         "early_stage": """
@@ -72,24 +73,41 @@ async def screen_database_market(
         universe_count = int(await connection.fetchval(
             "SELECT COUNT(*) FROM securities WHERE is_active=TRUE"
         ) or 0)
-    candidates = []
+        latest_trade_date = await connection.fetchval(
+            "SELECT MAX(trade_date) FROM daily_indicators"
+        )
+
+    candidates: list[dict[str, Any]] = []
     for rank, row in enumerate(rows, 1):
         item = dict(row)
         item["rank"] = rank
         item["reasons"] = [
             reason for condition, reason in (
-                (item.get("ma5") and item.get("ma20") and item["ma5"] > item["ma20"],
-                 "MA5高於MA20"),
-                (item.get("volume_ratio") and item["volume_ratio"] >= 1.2,
-                 "量比放大"),
-                (item.get("large_volume_low") and item.get("close")
-                 and item["close"] >= item["large_volume_low"], "守住大量低點"),
+                (
+                    item.get("ma5") is not None
+                    and item.get("ma20") is not None
+                    and item["ma5"] > item["ma20"],
+                    "MA5高於MA20",
+                ),
+                (
+                    item.get("volume_ratio") is not None
+                    and item["volume_ratio"] >= 1.2,
+                    "量比放大",
+                ),
+                (
+                    item.get("large_volume_low") is not None
+                    and item.get("close") is not None
+                    and item["close"] >= item["large_volume_low"],
+                    "守住大量低點",
+                ),
             ) if condition
         ]
         candidates.append(item)
 
     saved = None
-    if save_result and candidates:
+    # Save every requested run, including zero-candidate runs, so database history
+    # accurately records that the strategy executed successfully.
+    if save_result:
         saved = await stock_database_service.save_radar_result(
             strategy=strategy,
             candidates=candidates,
@@ -98,25 +116,39 @@ async def screen_database_market(
             configuration={
                 "minimumScore": minimum_score,
                 "limit": limit,
-                "engine": "postgres-v10.5",
+                "engine": "postgres-v11",
+                "latestTradeDate": str(latest_trade_date) if latest_trade_date else None,
             },
         )
+
     return {
         "ok": True,
         "strategy": strategy,
         "candidateCount": len(candidates),
         "universeCount": universe_count,
+        "latestTradeDate": latest_trade_date,
         "results": candidates,
         "record": saved,
-        "source": "PostgreSQL V10.5",
+        "source": "PostgreSQL V11",
     }
 
 
-async def run_full_bullish_radar(limit_each: int = 20) -> dict[str, Any]:
-    grouped = {}
+async def run_full_bullish_radar(
+    limit_each: int = 20,
+    minimum_score: float = 45,
+    save_result: bool = True,
+) -> dict[str, Any]:
+    limit_each = max(1, min(limit_each, 200))
+    grouped: dict[str, dict[str, Any]] = {}
     merged: dict[str, dict[str, Any]] = {}
+
     for strategy in ("early_stage", "breakout", "pullback"):
-        result = await screen_database_market(strategy, limit_each, save_result=True)
+        result = await screen_database_market(
+            strategy=strategy,
+            limit=limit_each,
+            minimum_score=minimum_score,
+            save_result=save_result,
+        )
         grouped[strategy] = result
         for item in result["results"]:
             symbol = item["symbol"]
@@ -127,22 +159,26 @@ async def run_full_bullish_radar(limit_each: int = 20) -> dict[str, Any]:
                 merged[symbol] = {**item, "strategies": [strategy]}
             elif strategy not in existing["strategies"]:
                 existing["strategies"].append(strategy)
+
     ranked = sorted(
         merged.values(),
-        key=lambda x: (
-            len(x.get("strategies", [])),
-            float(x.get("total_score") or 0),
-            float(x.get("volume_ratio") or 0),
+        key=lambda item: (
+            len(item.get("strategies", [])),
+            float(item.get("total_score") or 0),
+            float(item.get("volume_ratio") or 0),
         ),
         reverse=True,
     )
     for index, item in enumerate(ranked, 1):
         item["combinedRank"] = index
+
     return {
         "ok": True,
+        "candidateCount": len(ranked),
+        "minimumScore": minimum_score,
         "top10": ranked[:10],
         "top5": ranked[:5],
         "watchlistCandidates": ranked[:3],
         "byStrategy": grouped,
-        "source": "PostgreSQL V10.5",
+        "source": "PostgreSQL V11",
     }

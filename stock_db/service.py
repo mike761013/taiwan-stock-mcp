@@ -41,9 +41,15 @@ class StockDatabaseService:
         return {"ok": True, "health": health,
                 "statistics": await self.repository.statistics()}
 
-    async def calculate_symbol_indicators(self, symbol: str) -> dict[str, Any]:
+    async def calculate_symbol_indicators(
+        self,
+        symbol: str,
+        latest_only: bool = False,
+    ) -> dict[str, Any]:
         bars = await self.repository.get_daily_bars(symbol, limit=5000)
         calculated = calculate_indicators(bars)
+        if latest_only and calculated:
+            calculated = calculated[-1:]
         rows = [
             DailyIndicator(
                 symbol=item["symbol"],
@@ -54,7 +60,12 @@ class StockDatabaseService:
             for item in calculated
         ]
         count = await self.repository.bulk_upsert_indicators(rows)
-        return {"ok": True, "symbol": symbol, "processed": count}
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "processed": count,
+            "latestOnly": latest_only,
+        }
 
     async def cleanup(
         self,

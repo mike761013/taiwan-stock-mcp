@@ -241,35 +241,80 @@ async def calculate_all_indicators(
     }
 
 
-async def update_official_daily() -> dict[str, Any]:
+async def update_official_daily(
+    batch_size: int = 50,
+    start_after: str | None = None,
+    concurrency: int = 6,
+) -> dict[str, Any]:
+    """Update official daily bars and calculate one resumable indicator batch.
+
+    Official bars are bulk-upserted on every call and are idempotent. Indicator
+    calculation only writes the newest row for each symbol, keeping each HTTP
+    request short enough for a free Render Web Service.
+    """
     init = await stock_database_service.initialize()
     if not init.get("ok"):
         return init
+
     rows = await fetch_official_daily_snapshot()
     securities = [
-        Security(symbol=r["symbol"], name=r["name"], market=r["market"])
-        for r in rows
+        Security(symbol=row["symbol"], name=row["name"], market=row["market"])
+        for row in rows
     ]
     await stock_repository.upsert_securities(securities)
+
     bars = [
         row_to_daily_bar(row, row["source"])
         for row in rows
         if row.get("close") is not None
     ]
     written = await stock_repository.bulk_upsert_daily_bars(bars)
-    symbols = sorted({bar.symbol for bar in bars})
-    indicator_failures = []
-    for symbol in symbols:
-        try:
-            await stock_database_service.calculate_symbol_indicators(symbol)
-        except Exception as exc:
-            indicator_failures.append(
-                {"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"}
-            )
+    all_symbols = sorted({bar.symbol for bar in bars})
+    remaining, marker_found = _resume_slice(all_symbols, start_after)
+    batch_size = max(1, min(batch_size, 100))
+    target_symbols = remaining[:batch_size]
+
+    semaphore = asyncio.Semaphore(max(1, min(concurrency, 8)))
+    processed = failed = indicator_rows_written = 0
+    indicator_failures: list[dict[str, str]] = []
+
+    async def one(symbol: str) -> None:
+        nonlocal processed, failed, indicator_rows_written
+        async with semaphore:
+            try:
+                result = await stock_database_service.calculate_symbol_indicators(
+                    symbol,
+                    latest_only=True,
+                )
+                indicator_rows_written += int(result.get("processed", 0))
+                processed += 1
+            except Exception as exc:
+                failed += 1
+                indicator_failures.append({
+                    "symbol": symbol,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+
+    await asyncio.gather(*(one(symbol) for symbol in target_symbols))
+
+    remaining_after = max(0, len(remaining) - len(target_symbols))
+    has_more = remaining_after > 0
+    last_symbol = target_symbols[-1] if target_symbols else start_after
     return {
-        "ok": True,
+        "ok": failed == 0,
         "rowsFetched": len(rows),
         "barsWritten": written,
-        "indicatorSymbols": len(symbols) - len(indicator_failures),
+        "universeCount": len(all_symbols),
+        "batchSize": batch_size,
+        "batchSymbolCount": len(target_symbols),
+        "batchSymbols": target_symbols,
+        "indicatorSymbols": processed,
+        "failedSymbols": failed,
+        "indicatorRowsWritten": indicator_rows_written,
         "indicatorFailures": indicator_failures[:50],
+        "lastSymbol": last_symbol,
+        "hasMore": has_more,
+        "nextStartAfter": last_symbol if has_more else None,
+        "remainingSymbols": remaining_after,
+        "startAfterFound": marker_found,
     }

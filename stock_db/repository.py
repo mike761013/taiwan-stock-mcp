@@ -14,6 +14,15 @@ from .models import DailyBar, DailyIndicator, Security
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 
+def _pick(mapping: dict[str, Any], *keys: str) -> Any:
+    """Return the first non-None value, preserving valid zero scores."""
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None:
+            return value
+    return None
+
+
 class StockRepository:
     def __init__(self, database: StockDatabase | None = None) -> None:
         self.database = database or stock_database
@@ -365,12 +374,12 @@ class StockRepository:
                             rank=EXCLUDED.rank, total_score=EXCLUDED.total_score,
                             snapshot=EXCLUDED.snapshot
                     """, run_id, symbol, rank,
-                        item.get("total_score") or item.get("totalScore") or item.get("score"),
-                        item.get("technical_score") or item.get("technicalScore"),
-                        item.get("chip_score") or item.get("chipScore"),
-                        item.get("theme_score") or item.get("themeScore"),
-                        item.get("fundamental_score") or item.get("fundamentalScore"),
-                        item.get("risk_score") or item.get("riskScore"),
+                        _pick(item, "total_score", "totalScore", "score"),
+                        _pick(item, "technical_score", "technicalScore"),
+                        _pick(item, "chip_score", "chipScore"),
+                        _pick(item, "theme_score", "themeScore"),
+                        _pick(item, "fundamental_score", "fundamentalScore"),
+                        _pick(item, "risk_score", "riskScore"),
                         json.dumps(item.get("reasons") or [], ensure_ascii=False),
                         json.dumps(item, ensure_ascii=False, default=str))
         return run_id
