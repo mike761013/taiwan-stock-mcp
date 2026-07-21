@@ -34,6 +34,7 @@ jobs:
       STOCK_DB_ENABLED: "true"
       FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
       PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
       - name: Checkout repository
