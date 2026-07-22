@@ -17,6 +17,22 @@ from typing import Any, Mapping, Sequence
 V12_STRATEGIES = ("early_stage", "breakout", "pullback", "reversal_reclaim")
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "v12_config.json"
 
+V12_STATUS_LABELS = {
+    "BUY_ZONE": "買進區",
+    "BUY_ON_BREAKOUT": "突破時買進",
+    "EARLY_ENTRY": "早期進場",
+    "EARLY_ENTRY_SMALL_POSITION": "早期進場（小部位）",
+    "PRICE_CONFIRMATION_REQUIRED": "等待價格確認",
+    "SMALL_POSITION_OR_SKIP": "小部位或略過",
+    "WAIT_PULLBACK": "等待拉回",
+    "DO_NOT_CHASE": "不追價",
+}
+
+
+def v12_status_label(status_code: str) -> str:
+    """Return a Chinese display label while keeping a stable machine code."""
+    return V12_STATUS_LABELS.get(status_code, status_code)
+
 
 @dataclass(frozen=True)
 class V12Config:
@@ -440,7 +456,8 @@ def build_trading_plan(
         initial_position = 30
 
     return {
-        "status": status,
+        "status": v12_status_label(status),
+        "statusCode": status,
         "signalDate": str(row.get("trade_date") or ""),
         "signalPrice": round_tw_price(close),
         "idealEntryLow": round_tw_price(entry_low),
@@ -452,7 +469,7 @@ def build_trading_plan(
         "atr14": round_tw_price(atr14),
         "initialPositionPercent": initial_position,
         "maximumRiskPercent": round(risk_pct, 2),
-        "softBreakAction": f"減碼{int(config.soft_break_reduce_ratio * 100)}%，進入SHAKEOUT_WATCH",
+        "softBreakAction": f"減碼{int(config.soft_break_reduce_ratio * 100)}%，進入洗盤觀察",
         "hardStopAction": "收盤確認跌破後退出剩餘部位",
         "reclaimAction": "快速收復固定防守與前一日黑K中值時分批買回",
     }
@@ -477,11 +494,14 @@ def build_v12_candidate(
     plan = build_trading_plan(row, strategy, config)
 
     # A heavily penalised setup is observable but should not be presented as a buy.
-    action = plan["status"]
+    action_code = str(plan["statusCode"])
     if adjustment <= -25:
-        action = "DO_NOT_CHASE"
-    elif adjustment <= -10 and action not in {"SMALL_POSITION_OR_SKIP", "EARLY_ENTRY_SMALL_POSITION"}:
-        action = "WAIT_PULLBACK"
+        action_code = "DO_NOT_CHASE"
+    elif adjustment <= -10 and action_code not in {
+        "SMALL_POSITION_OR_SKIP",
+        "EARLY_ENTRY_SMALL_POSITION",
+    }:
+        action_code = "WAIT_PULLBACK"
 
     item = dict(row)
     # The database column historically stores the official daily price change
@@ -499,7 +519,8 @@ def build_v12_candidate(
             "trading_adjustment": round(adjustment, 2),
             "total_score": round(final_score, 2),
             "finalScore": round(final_score, 2),
-            "action": action,
+            "action": v12_status_label(action_code),
+            "actionCode": action_code,
             "reasons": reasons,
             "warnings": pattern_warnings + trading_warnings,
             "liquidity": liquidity,
@@ -561,7 +582,7 @@ def validate_v12_candidates(
         maximum_buy = _number(plan, "maximumBuyPrice")
         no_chase = _number(plan, "noChasePrice")
         signal_price = _number(plan, "signalPrice")
-        status = str(plan.get("status") or "")
+        status = str(plan.get("statusCode") or plan.get("status") or "")
 
         if not (entry_low <= entry_high <= maximum_buy <= no_chase):
             issues.append(
