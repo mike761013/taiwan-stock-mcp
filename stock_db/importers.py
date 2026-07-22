@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -12,10 +13,27 @@ from .models import DailyBar, Security
 
 
 def parse_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
     if isinstance(value, date):
         return value
-    text = str(value).strip().replace("/", "-")
-    return datetime.fromisoformat(text[:10]).date()
+
+    text = str(value).strip()
+    if not text:
+        raise ValueError("Missing date")
+
+    # TPEx may return Republic of China calendar dates such as ``1150721``
+    # or ``115/07/21``.  Convert those to Gregorian dates before falling back
+    # to the ISO parser used by TWSE and FinMind.
+    digits = re.sub(r"\D", "", text)
+    if len(digits) == 7:
+        roc_year = int(digits[:3])
+        return date(roc_year + 1911, int(digits[3:5]), int(digits[5:7]))
+    if len(digits) == 8 and text[:4].isdigit():
+        return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+
+    normalized = text.replace("/", "-")
+    return datetime.fromisoformat(normalized[:10]).date()
 
 
 def _number(value: Any) -> float | None:
