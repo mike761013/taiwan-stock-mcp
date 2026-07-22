@@ -13,7 +13,13 @@ from stock_db.pipeline import (
     sync_security_master,
     update_official_daily,
 )
-from stock_db.radar import run_full_bullish_radar, screen_database_market
+from stock_db.radar import (
+    run_full_bullish_radar,
+    run_full_bullish_radar_v12 as run_full_bullish_radar_v12_core,
+    screen_database_market,
+    screen_database_market_v12,
+)
+from stock_db.v12 import V12_STRATEGIES, load_v12_config
 from stock_db.service import stock_database_service
 
 
@@ -164,6 +170,45 @@ def register_v10_tools(mcp: Any) -> None:
         )
 
     @mcp.tool()
+    async def screen_market_v12(
+        strategy: str = "reversal_reclaim",
+        limit: int = 30,
+        minimum_score: float = 45,
+        save_result: bool = True,
+    ) -> dict:
+        """V12全市場雷達：V7流動性、V11三策略、反轉收復與ATR交易計畫。"""
+        return await screen_database_market_v12(
+            strategy=strategy,
+            limit=limit,
+            minimum_score=minimum_score,
+            save_result=save_result,
+        )
+
+    @mcp.tool()
+    async def run_full_bullish_radar_v12(
+        limit_each: int = 20,
+        minimum_score: float = 45,
+        save_result: bool = True,
+    ) -> dict:
+        """執行V12四種看漲策略，輸出買進區、最高買價、ATR防守與不追價訊號。"""
+        return await run_full_bullish_radar_v12_core(
+            limit_each=limit_each,
+            minimum_score=minimum_score,
+            save_result=save_result,
+        )
+
+    @mcp.tool()
+    async def get_v12_radar_config() -> dict:
+        """查看目前V12流動性、反轉收復、ATR與過熱扣分設定。"""
+        config = load_v12_config()
+        return {
+            "ok": True,
+            "version": "V12",
+            "strategies": list(V12_STRATEGIES),
+            "config": config.public_dict(),
+        }
+
+    @mcp.tool()
     async def run_full_bullish_radar_v10(
         limit_each: int = 20,
         minimum_score: float = 45,
@@ -248,6 +293,58 @@ def register_v10_tools(mcp: Any) -> None:
     ) -> dict:
         """查詢雷達策略績效摘要。"""
         return await performance_summary(strategy)
+
+    @mcp.tool()
+    async def validate_v12_release(
+        limit_each: int = 5,
+        minimum_score: float = 0,
+    ) -> dict:
+        """驗證資料庫、V12四策略、合併雷達及寫入功能。"""
+        health = await stock_database_service.health()
+        before = await stock_database_service.statistics()
+        strategies: dict[str, dict] = {}
+        for strategy in V12_STRATEGIES:
+            strategies[strategy] = await screen_database_market_v12(
+                strategy=strategy,
+                limit=limit_each,
+                minimum_score=minimum_score,
+                save_result=True,
+            )
+        full = await run_full_bullish_radar_v12_core(
+            limit_each=limit_each,
+            minimum_score=minimum_score,
+            save_result=True,
+        )
+        after = await stock_database_service.statistics()
+        before_stats = before.get("statistics", {})
+        after_stats = after.get("statistics", {})
+        total_candidates = sum(
+            int(result.get("candidateCount", 0))
+            for result in strategies.values()
+        )
+        checks = {
+            "databaseHealthy": health.get("status") == "healthy",
+            "allStrategiesOk": all(result.get("ok") for result in strategies.values()),
+            "fullRadarOk": bool(full.get("ok")),
+            "radarRunsWritten": int(after_stats.get("radar_runs", 0))
+                > int(before_stats.get("radar_runs", 0)),
+            "radarCandidatesWritten": (
+                total_candidates == 0
+                or int(after_stats.get("radar_candidates", 0))
+                    > int(before_stats.get("radar_candidates", 0))
+            ),
+        }
+        return {
+            "ok": all(checks.values()),
+            "releaseReady": all(checks.values()),
+            "version": "V12",
+            "checks": checks,
+            "candidateCount": total_candidates,
+            "strategies": strategies,
+            "fullRadar": full,
+            "statisticsBefore": before_stats,
+            "statisticsAfter": after_stats,
+        }
 
     @mcp.tool()
     async def validate_v11_release(

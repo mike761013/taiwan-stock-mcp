@@ -1,0 +1,17 @@
+V12 PATCH CONTENTS
+==================
+
+Files at archive root:
+- server_v10_tools.py
+- v12_config.json
+- README_V12_INSTALL.txt
+- CONTENTS.txt
+
+Folders:
+- stock_db/v12.py
+- stock_db/radar.py
+- tests/test_v12_radar.py
+
+Installation:
+Copy all files and folders from this archive into the root of your existing
+taiwan-stock-mcp project and choose Replace when Windows asks.
