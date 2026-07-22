@@ -406,19 +406,29 @@ def build_trading_plan(
         entry_low = max(signal_defense, reference - atr14 * 0.20)
         entry_high = min(close, reference + atr14 * 0.20) if close >= reference else close
 
+    # A high signal-day low can put the two calculated entry bounds in reverse
+    # order. Normalise them before deriving every downstream price so that the
+    # public plan always satisfies low <= high <= maximum buy <= no chase.
+    entry_low, entry_high = sorted((entry_low, entry_high))
     maximum_buy = entry_high + atr14 * config.max_buy_atr_multiple
     no_chase = entry_high + atr14 * config.no_chase_atr_multiple
     risk_pct = (entry_high - hard_stop) / entry_high * 100 if entry_high > 0 else 0.0
 
-    if risk_pct > config.max_entry_to_hard_stop_risk_pct:
+    # Price tradability takes precedence over strategy/risk labels. Previously
+    # pullback candidates could be reported as BUY_ZONE even when the signal
+    # price was already above maximumBuyPrice.
+    if close >= no_chase:
+        status = "DO_NOT_CHASE"
+        initial_position = 0
+    elif close > maximum_buy:
+        status = "WAIT_PULLBACK"
+        initial_position = 0
+    elif risk_pct > config.max_entry_to_hard_stop_risk_pct:
         status = "EARLY_ENTRY_SMALL_POSITION" if strategy == "reversal_reclaim" else "SMALL_POSITION_OR_SKIP"
         initial_position = 30
     elif strategy == "reversal_reclaim":
         status = "EARLY_ENTRY"
         initial_position = 40
-    elif close > no_chase:
-        status = "DO_NOT_CHASE"
-        initial_position = 0
     elif strategy == "breakout":
         status = "BUY_ON_BREAKOUT"
         initial_position = 40
@@ -474,8 +484,15 @@ def build_v12_candidate(
         action = "WAIT_PULLBACK"
 
     item = dict(row)
+    # The database column historically stores the official daily price change
+    # amount even though it is named change_percent. Keep that value under an
+    # accurate compatibility field and expose a real percentage in V12.
+    change_amount = item.get("change_percent")
+    daily_change_percent = round(_daily_change_pct(row), 4)
     item.update(
         {
+            "change_amount": change_amount,
+            "change_percent": daily_change_percent,
             "strategy": strategy,
             "strategies": [strategy],
             "raw_score": round(raw_score, 2),
@@ -492,12 +509,106 @@ def build_v12_candidate(
             "hard_stop_price": plan["hardStopPrice"],
             # This remains rolling for reference only, never for retroactive stop changes.
             "rolling_massive_volume_low": _number(row, "large_volume_low") or None,
-            "dailyChangePercent": round(_daily_change_pct(row), 2),
+            "dailyChangePercent": round(daily_change_percent, 2),
             "closePosition": round(_close_position(row), 4),
             "upperShadowPercent": round(_upper_shadow_pct(row), 2),
         }
     )
     return item
+
+
+def validate_v12_candidates(
+    candidates: Sequence[Mapping[str, Any]], context: str = "results"
+) -> list[dict[str, Any]]:
+    """Return semantic output problems that functional release checks can miss."""
+    issues: list[dict[str, Any]] = []
+    tradable_statuses = {
+        "BUY_ZONE",
+        "BUY_ON_BREAKOUT",
+        "EARLY_ENTRY",
+        "EARLY_ENTRY_SMALL_POSITION",
+        "PRICE_CONFIRMATION_REQUIRED",
+        "SMALL_POSITION_OR_SKIP",
+    }
+
+    for index, candidate in enumerate(candidates):
+        symbol = str(candidate.get("symbol") or "UNKNOWN")
+        path = f"{context}[{index}]"
+        plan = candidate.get("tradingPlan")
+        if not isinstance(plan, Mapping):
+            issues.append({"code": "MISSING_TRADING_PLAN", "symbol": symbol, "path": path})
+            continue
+
+        close = _number(candidate, "close")
+        previous_close = _number(candidate, "prev_close")
+        actual_change_percent = _number(candidate, "change_percent")
+        expected_change_percent = (
+            (close / previous_close - 1) * 100 if previous_close > 0 else 0.0
+        )
+        if previous_close > 0 and abs(actual_change_percent - expected_change_percent) > 0.02:
+            issues.append(
+                {
+                    "code": "CHANGE_PERCENT_MISMATCH",
+                    "symbol": symbol,
+                    "path": path,
+                    "expected": round(expected_change_percent, 4),
+                    "actual": round(actual_change_percent, 4),
+                }
+            )
+
+        entry_low = _number(plan, "idealEntryLow")
+        entry_high = _number(plan, "idealEntryHigh")
+        maximum_buy = _number(plan, "maximumBuyPrice")
+        no_chase = _number(plan, "noChasePrice")
+        signal_price = _number(plan, "signalPrice")
+        status = str(plan.get("status") or "")
+
+        if not (entry_low <= entry_high <= maximum_buy <= no_chase):
+            issues.append(
+                {
+                    "code": "INVALID_PRICE_BAND_ORDER",
+                    "symbol": symbol,
+                    "path": path,
+                    "idealEntryLow": entry_low,
+                    "idealEntryHigh": entry_high,
+                    "maximumBuyPrice": maximum_buy,
+                    "noChasePrice": no_chase,
+                }
+            )
+
+        if status == "BUY_ZONE" and not (entry_low <= signal_price <= entry_high):
+            issues.append(
+                {
+                    "code": "BUY_ZONE_OUTSIDE_ENTRY_RANGE",
+                    "symbol": symbol,
+                    "path": path,
+                    "signalPrice": signal_price,
+                }
+            )
+        if status in tradable_statuses and signal_price > maximum_buy:
+            issues.append(
+                {
+                    "code": "TRADABLE_STATUS_ABOVE_MAXIMUM_BUY",
+                    "symbol": symbol,
+                    "path": path,
+                    "status": status,
+                    "signalPrice": signal_price,
+                    "maximumBuyPrice": maximum_buy,
+                }
+            )
+        if signal_price >= no_chase and status != "DO_NOT_CHASE":
+            issues.append(
+                {
+                    "code": "NO_CHASE_STATUS_MISSING",
+                    "symbol": symbol,
+                    "path": path,
+                    "status": status,
+                    "signalPrice": signal_price,
+                    "noChasePrice": no_chase,
+                }
+            )
+
+    return issues
 
 
 def screen_v12_rows(
