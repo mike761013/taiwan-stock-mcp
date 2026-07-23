@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import date, timedelta
 from typing import Any, Sequence
 
+from .connection import stock_database
 from .data_sources import (
     fetch_finmind_history,
     fetch_official_daily_snapshot,
@@ -15,6 +17,53 @@ from .importers import row_to_daily_bar
 from .models import Security
 from .repository import stock_repository
 from .service import stock_database_service
+
+
+_COMMON_STOCK_SYMBOL_RE = re.compile(r"^[1-9][0-9]{3}$")
+_COMMON_STOCK_MARKETS = {"TWSE", "TPEX", "OTC"}
+
+
+def is_listed_otc_common_stock(symbol: Any, market: Any) -> bool:
+    """Return whether a security belongs to the V12 common-stock universe."""
+    normalized_symbol = str(symbol or "").strip()
+    normalized_market = str(market or "").strip().upper()
+    return (
+        normalized_market in _COMMON_STOCK_MARKETS
+        and _COMMON_STOCK_SYMBOL_RE.fullmatch(normalized_symbol) is not None
+    )
+
+
+async def _latest_common_stock_symbols() -> list[str]:
+    """Read the latest TWSE/TPEx common-stock universe from PostgreSQL.
+
+    Each market uses its own newest trade date so a temporarily delayed TPEx
+    feed does not remove all OTC symbols from a resumable maintenance run.
+    """
+    query = """
+        WITH market_latest AS (
+            SELECT UPPER(s.market) AS market_key,
+                   MAX(b.trade_date) AS trade_date
+            FROM daily_bars b
+            JOIN securities s ON s.symbol = b.symbol
+            WHERE s.is_active = TRUE
+              AND UPPER(s.market) = ANY($1::varchar[])
+              AND b.symbol ~ '^[1-9][0-9]{3}$'
+            GROUP BY UPPER(s.market)
+        )
+        SELECT DISTINCT b.symbol
+        FROM daily_bars b
+        JOIN securities s ON s.symbol = b.symbol
+        JOIN market_latest d
+          ON d.market_key = UPPER(s.market)
+         AND d.trade_date = b.trade_date
+        WHERE s.is_active = TRUE
+          AND UPPER(s.market) = ANY($1::varchar[])
+          AND b.symbol ~ '^[1-9][0-9]{3}$'
+        ORDER BY b.symbol
+    """
+    async with stock_database.acquire() as connection:
+        rows = await connection.fetch(query, sorted(_COMMON_STOCK_MARKETS))
+    return [str(row["symbol"]) for row in rows]
 
 
 def _normalise_symbols(symbols: str | Sequence[str] | None) -> list[str]:
@@ -248,28 +297,46 @@ async def update_official_daily(
 ) -> dict[str, Any]:
     """Update official daily bars and calculate one resumable indicator batch.
 
-    Official bars are bulk-upserted on every call and are idempotent. Indicator
-    calculation only writes the newest row for each symbol, keeping each HTTP
-    request short enough for a free Render Web Service.
+    The official endpoints return mixed security types. Only TWSE/TPEx
+    four-digit common stocks are persisted and used for indicator calculation.
+    Continuation calls reuse the first call's committed snapshot, keeping each
+    HTTP request short enough for a free Render Web Service.
     """
     init = await stock_database_service.initialize()
     if not init.get("ok"):
         return init
 
-    rows = await fetch_official_daily_snapshot()
-    securities = [
-        Security(symbol=row["symbol"], name=row["name"], market=row["market"])
-        for row in rows
-    ]
-    await stock_repository.upsert_securities(securities)
+    # The first request refreshes the official snapshot. Continuation requests
+    # reuse the committed snapshot so every 100-symbol batch does not download
+    # the same 11k-row payload again.
+    refresh_snapshot = not start_after
+    raw_rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+    written = 0
+    if refresh_snapshot:
+        raw_rows = await fetch_official_daily_snapshot()
+        rows = [
+            row
+            for row in raw_rows
+            if is_listed_otc_common_stock(
+                row.get("symbol"),
+                row.get("market"),
+            )
+        ]
+        securities = [
+            Security(symbol=row["symbol"], name=row["name"], market=row["market"])
+            for row in rows
+        ]
+        await stock_repository.upsert_securities(securities)
 
-    bars = [
-        row_to_daily_bar(row, row["source"])
-        for row in rows
-        if row.get("close") is not None
-    ]
-    written = await stock_repository.bulk_upsert_daily_bars(bars)
-    all_symbols = sorted({bar.symbol for bar in bars})
+        bars = [
+            row_to_daily_bar(row, row["source"])
+            for row in rows
+            if row.get("close") is not None
+        ]
+        written = await stock_repository.bulk_upsert_daily_bars(bars)
+
+    all_symbols = await _latest_common_stock_symbols()
     remaining, marker_found = _resume_slice(all_symbols, start_after)
     batch_size = max(1, min(batch_size, 100))
     target_symbols = remaining[:batch_size]
@@ -302,6 +369,9 @@ async def update_official_daily(
     last_symbol = target_symbols[-1] if target_symbols else start_after
     return {
         "ok": failed == 0,
+        "scope": "TWSE_TPEX_COMMON_STOCKS",
+        "snapshotRefreshed": refresh_snapshot,
+        "rawRowsFetched": len(raw_rows),
         "rowsFetched": len(rows),
         "barsWritten": written,
         "universeCount": len(all_symbols),

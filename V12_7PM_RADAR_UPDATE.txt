@@ -1,0 +1,58 @@
+V12 七點雷達更新包
+====================
+
+請把下列 4 個檔案放到 GitHub 對應位置並覆蓋原檔：
+
+1. stock_db/v12.py
+2. stock_db/radar.py
+3. stock_db/pipeline.py
+4. v12_config.json
+
+本次規則：
+
+- 僅篩選上市、上櫃四位數普通股。
+- 排除 ETF、ETN、債券、權證、特別股及其他非普通股。
+- 收盤作業抓回官方整批資料後，只會寫入上市、上櫃普通股的
+  證券資料與日 K，並只替這些普通股計算指標。
+- 資料庫內既有的 ETF 歷史資料不會刪除，但收盤作業不再更新。
+- 單日成交量至少 2,000 張。
+- 20 日平均成交量至少 1,000 張。
+- 單日成交金額至少新台幣 1 億元。
+- 收盤價 200 元以下列入正式主榜。
+- 收盤價超過 200 元不占用主榜名額，只在下列條件全部成立時另列：
+  - V12 最終分數至少 85 分。
+  - 最大風險不超過 6%。
+  - 操作狀態可執行。
+  - 通過全部流動性門檻。
+  - 沒有過熱、乖離或走弱警示。
+
+部署完成後依序測試：
+
+get_v12_radar_config
+
+確認回傳：
+
+- min_daily_volume_lots = 2000
+- min_average_volume20_lots = 1000
+- min_trade_value = 100000000
+- primary_max_price = 200
+- high_price_min_score = 85
+- high_price_max_risk_pct = 6
+
+接著執行：
+
+validate_v12_release
+limit_each=5
+minimum_score=0
+
+最後正式執行：
+
+run_full_bullish_radar_v12
+limit_each=10
+minimum_score=45
+save_result=true
+
+正式結果中：
+
+- top5、top10、watchlistCandidates 都只會使用 200 元以下主榜。
+- 200 元以上但條件特別好的股票會出現在 highPriceStrongCandidates。

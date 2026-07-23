@@ -1,4 +1,11 @@
-from stock_db.v12 import V12Config, build_v12_candidate, liquidity_result
+from stock_db.v12 import (
+    V12Config,
+    build_trading_plan,
+    build_v12_candidate,
+    liquidity_result,
+    split_v12_price_tiers,
+    validate_v12_candidates,
+)
 
 
 def asia_electronic_2026_07_15():
@@ -31,20 +38,27 @@ def asia_electronic_2026_07_15():
 
 
 def test_reversal_reclaim_finds_asia_electronic_one_day_earlier():
+    row = asia_electronic_2026_07_15()
+    row["change_percent"] = 5.5  # Official feeds store the price change amount.
     candidate = build_v12_candidate(
-        asia_electronic_2026_07_15(),
+        row,
         "reversal_reclaim",
         V12Config(),
     )
     assert candidate is not None
     assert candidate["strategy"] == "reversal_reclaim"
     assert candidate["total_score"] >= 80
-    assert candidate["action"] == "EARLY_ENTRY_SMALL_POSITION"
+    assert candidate["action"] == "早期進場（小部位）"
+    assert candidate["actionCode"] == "EARLY_ENTRY_SMALL_POSITION"
     assert candidate["tradingPlan"]["signalPrice"] == 60.8
     assert candidate["tradingPlan"]["signalDefensePrice"] == 56.2
     assert candidate["tradingPlan"]["hardStopPrice"] < 56.2
     assert candidate["tradingPlan"]["maximumBuyPrice"] < 63.0
     assert candidate["tradingPlan"]["noChasePrice"] < 65.0
+    assert candidate["change_amount"] == 5.5
+    assert candidate["change_percent"] == 9.9458
+    assert candidate["dailyChangePercent"] == 9.95
+    assert validate_v12_candidates([candidate]) == []
 
 
 def test_v7_liquidity_gate_rejects_thin_stock():
@@ -53,3 +67,140 @@ def test_v7_liquidity_gate_rejects_thin_stock():
     result = liquidity_result(row, V12Config())
     assert result["eligible"] is False
     assert len(result["failedRules"]) == 3
+
+
+def test_ta_chia_2026_07_22_is_rejected_by_tighter_liquidity_rules():
+    row = asia_electronic_2026_07_15()
+    row.update(
+        {
+            "symbol": "2221",
+            "name": "大甲",
+            "close": 51.6,
+            "volume": 1_627_943,
+            "volume_ma20": 770_000,
+            "turnover": 84_113_214,
+        }
+    )
+    result = liquidity_result(row, V12Config())
+    assert result["eligible"] is False
+    assert result["dailyVolumeLots"] == 1627.94
+    assert result["averageVolume20Lots"] == 770.0
+    assert len(result["failedRules"]) == 3
+
+
+def test_price_tiers_keep_under_200_main_and_require_strict_high_price_quality():
+    candidates = [
+        {
+            "symbol": "1001",
+            "close": 200,
+            "total_score": 70,
+            "actionCode": "WAIT_PULLBACK",
+            "warnings": ["等待拉回"],
+            "liquidity": {"eligible": True},
+            "tradingPlan": {
+                "statusCode": "WAIT_PULLBACK",
+                "maximumRiskPercent": 8,
+            },
+        },
+        {
+            "symbol": "2001",
+            "close": 250,
+            "total_score": 90,
+            "actionCode": "BUY_ZONE",
+            "warnings": [],
+            "liquidity": {"eligible": True},
+            "tradingPlan": {
+                "statusCode": "BUY_ZONE",
+                "maximumRiskPercent": 5,
+            },
+        },
+        {
+            "symbol": "2002",
+            "close": 300,
+            "total_score": 84,
+            "actionCode": "BUY_ZONE",
+            "warnings": [],
+            "liquidity": {"eligible": True},
+            "tradingPlan": {
+                "statusCode": "BUY_ZONE",
+                "maximumRiskPercent": 5,
+            },
+        },
+        {
+            "symbol": "2003",
+            "close": 400,
+            "total_score": 95,
+            "actionCode": "WAIT_PULLBACK",
+            "warnings": [],
+            "liquidity": {"eligible": True},
+            "tradingPlan": {
+                "statusCode": "WAIT_PULLBACK",
+                "maximumRiskPercent": 4,
+            },
+        },
+    ]
+    tiers = split_v12_price_tiers(candidates, V12Config())
+    assert [item["symbol"] for item in tiers["main"]] == ["1001"]
+    assert [item["symbol"] for item in tiers["highPrice"]] == ["2001"]
+    assert [item["symbol"] for item in tiers["rejectedHighPrice"]] == [
+        "2002",
+        "2003",
+    ]
+    assert tiers["highPrice"][0]["priceTierLabel"] == "200元以上強勢例外"
+
+
+def test_pullback_plan_normalises_reversed_entry_bounds_and_waits_above_maximum():
+    row = {
+        "trade_date": "2026-07-22",
+        "low": 41.55,
+        "close": 41.9,
+        "ma20": 41.25,
+        "atr14": 1.1428571428571429,
+    }
+    plan = build_trading_plan(row, "pullback", V12Config())
+    assert plan["idealEntryLow"] <= plan["idealEntryHigh"]
+    assert plan["idealEntryHigh"] <= plan["maximumBuyPrice"]
+    assert plan["maximumBuyPrice"] <= plan["noChasePrice"]
+    assert plan["signalPrice"] > plan["maximumBuyPrice"]
+    assert plan["status"] == "等待拉回"
+    assert plan["statusCode"] == "WAIT_PULLBACK"
+    assert plan["initialPositionPercent"] == 0
+
+
+def test_pullback_plan_keeps_buy_zone_when_signal_is_inside_normalised_range():
+    row = {
+        "trade_date": "2026-07-22",
+        "low": 104.0,
+        "close": 104.0,
+        "ma20": 101.745,
+        "atr14": 3.3142857142857143,
+    }
+    plan = build_trading_plan(row, "pullback", V12Config())
+    assert plan["idealEntryLow"] == 102.5
+    assert plan["idealEntryHigh"] == 104.0
+    assert plan["maximumBuyPrice"] == 104.5
+    assert plan["status"] == "買進區"
+    assert plan["statusCode"] == "BUY_ZONE"
+
+
+def test_semantic_validator_rejects_invalid_v12_output():
+    bad_candidate = {
+        "symbol": "5515",
+        "close": 41.9,
+        "prev_close": 44.25,
+        "change_percent": -2.35,
+        "tradingPlan": {
+            "status": "BUY_ZONE",
+            "signalPrice": 41.9,
+            "idealEntryLow": 41.55,
+            "idealEntryHigh": 41.5,
+            "maximumBuyPrice": 41.7,
+            "noChasePrice": 42.15,
+        },
+    }
+    codes = {
+        issue["code"] for issue in validate_v12_candidates([bad_candidate])
+    }
+    assert "CHANGE_PERCENT_MISMATCH" in codes
+    assert "INVALID_PRICE_BAND_ORDER" in codes
+    assert "TRADABLE_STATUS_ABOVE_MAXIMUM_BUY" in codes

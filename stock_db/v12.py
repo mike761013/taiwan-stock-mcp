@@ -28,6 +28,16 @@ V12_STATUS_LABELS = {
     "DO_NOT_CHASE": "不追價",
 }
 
+V12_HIGH_PRICE_ELIGIBLE_STATUS_CODES = frozenset(
+    {
+        "BUY_ZONE",
+        "BUY_ON_BREAKOUT",
+        "EARLY_ENTRY",
+        "EARLY_ENTRY_SMALL_POSITION",
+        "PRICE_CONFIRMATION_REQUIRED",
+    }
+)
+
 
 def v12_status_label(status_code: str) -> str:
     """Return a Chinese display label while keeping a stable machine code."""
@@ -37,11 +47,17 @@ def v12_status_label(status_code: str) -> str:
 @dataclass(frozen=True)
 class V12Config:
     # V7 liquidity gates. Volumes are expressed in Taiwan lots (1 lot=1,000 shares).
-    min_daily_volume_lots: float = 1000.0
-    min_average_volume20_lots: float = 500.0
-    min_trade_value: float = 50_000_000.0
-    strict_min_trade_value: float = 100_000_000.0
+    min_daily_volume_lots: float = 2000.0
+    min_average_volume20_lots: float = 1000.0
+    min_trade_value: float = 100_000_000.0
+    strict_min_trade_value: float = 200_000_000.0
     strict_liquidity: bool = False
+
+    # Price-tier display rules. The main radar is affordable-stock first.
+    primary_max_price: float = 200.0
+    high_price_min_score: float = 85.0
+    high_price_max_risk_pct: float = 6.0
+    high_price_limit: int = 5
 
     # Early reversal/reclaim pattern.
     reversal_min_change_pct: float = 5.0
@@ -536,6 +552,99 @@ def build_v12_candidate(
         }
     )
     return item
+
+
+def split_v12_price_tiers(
+    candidates: Sequence[Mapping[str, Any]],
+    config: V12Config,
+) -> dict[str, list[dict[str, Any]]]:
+    """Split radar output into the <=NT$200 main board and strict exceptions."""
+    main: list[dict[str, Any]] = []
+    high_price: list[dict[str, Any]] = []
+    rejected_high_price: list[dict[str, Any]] = []
+
+    for candidate in candidates:
+        item = dict(candidate)
+        close = _number(item, "close")
+        if close <= config.primary_max_price:
+            item.update(
+                {
+                    "priceTier": "MAIN_UNDER_200",
+                    "priceTierLabel": f"{config.primary_max_price:.0f}元以下主榜",
+                    "priceRuleFailures": [],
+                }
+            )
+            main.append(item)
+            continue
+
+        score = _number(item, "total_score")
+        plan = item.get("tradingPlan")
+        plan = plan if isinstance(plan, Mapping) else {}
+        action_code = str(
+            item.get("actionCode")
+            or plan.get("statusCode")
+            or ""
+        )
+        maximum_risk = _number(plan, "maximumRiskPercent", 999.0)
+        warnings = [str(value) for value in item.get("warnings") or [] if value]
+        liquidity = item.get("liquidity")
+        liquidity_eligible = (
+            isinstance(liquidity, Mapping)
+            and bool(liquidity.get("eligible"))
+        )
+        failures: list[str] = []
+
+        if score < config.high_price_min_score:
+            failures.append(
+                f"總分{score:.1f}低於高價股門檻{config.high_price_min_score:.0f}"
+            )
+        if action_code not in V12_HIGH_PRICE_ELIGIBLE_STATUS_CODES:
+            failures.append("目前操作狀態不適合列入高價強勢股")
+        if maximum_risk > config.high_price_max_risk_pct:
+            failures.append(
+                f"最大風險{maximum_risk:.1f}%高於"
+                f"{config.high_price_max_risk_pct:.1f}%"
+            )
+        if warnings:
+            failures.append("仍有過熱、乖離或走弱警示")
+        if not liquidity_eligible:
+            failures.append("未通過流動性硬門檻")
+
+        if failures:
+            item.update(
+                {
+                    "priceTier": "HIGH_PRICE_REJECTED",
+                    "priceTierLabel": (
+                        f"{config.primary_max_price:.0f}元以上未達例外標準"
+                    ),
+                    "priceRuleFailures": failures,
+                }
+            )
+            rejected_high_price.append(item)
+            continue
+
+        item.update(
+            {
+                "priceTier": "HIGH_PRICE_EXCEPTION",
+                "priceTierLabel": (
+                    f"{config.primary_max_price:.0f}元以上強勢例外"
+                ),
+                "priceRuleFailures": [],
+                "highPriceQualification": [
+                    f"總分{score:.1f}",
+                    "操作狀態可執行",
+                    f"最大風險{maximum_risk:.1f}%",
+                    "無過熱、乖離或走弱警示",
+                ],
+            }
+        )
+        high_price.append(item)
+
+    return {
+        "main": main,
+        "highPrice": high_price,
+        "rejectedHighPrice": rejected_high_price,
+    }
 
 
 def validate_v12_candidates(

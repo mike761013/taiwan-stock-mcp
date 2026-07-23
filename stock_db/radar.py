@@ -11,10 +11,21 @@ from .v12 import (
     V12_STRATEGIES,
     load_v12_config,
     screen_v12_rows,
+    split_v12_price_tiers,
 )
 
 
 _STRATEGIES = {"early_stage", "breakout", "pullback"}
+_COMMON_STOCK_FILTER = """
+          UPPER(s.market) IN ('TWSE', 'TPEX', 'OTC')
+          AND s.symbol ~ '^[1-9][0-9]{3}$'
+"""
+_COMMON_STOCK_UNIVERSE_COUNT_QUERY = f"""
+    SELECT COUNT(*)
+    FROM securities s
+    WHERE s.is_active = TRUE
+      AND {_COMMON_STOCK_FILTER}
+"""
 
 
 async def screen_database_market(
@@ -68,6 +79,7 @@ async def screen_database_market(
         JOIN daily_bars b ON b.symbol=i.symbol AND b.trade_date=i.trade_date
         JOIN securities s ON s.symbol=b.symbol
         WHERE s.is_active=TRUE
+          AND {_COMMON_STOCK_FILTER}
           AND COALESCE(i.technical_score,0) >= $1
           {strategy_filter}
         ORDER BY total_score DESC, i.volume_ratio DESC NULLS LAST
@@ -76,7 +88,7 @@ async def screen_database_market(
     async with stock_database.acquire() as connection:
         rows = await connection.fetch(query, minimum_score, limit)
         universe_count = int(await connection.fetchval(
-            "SELECT COUNT(*) FROM securities WHERE is_active=TRUE"
+            _COMMON_STOCK_UNIVERSE_COUNT_QUERY
         ) or 0)
         latest_trade_date = await connection.fetchval(
             "SELECT MAX(trade_date) FROM daily_indicators"
@@ -146,6 +158,7 @@ async def run_full_bullish_radar(
     limit_each = max(1, min(limit_each, 200))
     grouped: dict[str, dict[str, Any]] = {}
     merged: dict[str, dict[str, Any]] = {}
+    rejected_high_price_symbols: set[str] = set()
 
     for strategy in ("early_stage", "breakout", "pullback"):
         result = await screen_database_market(
@@ -193,7 +206,7 @@ async def run_full_bullish_radar(
 # V12: V7 liquidity + V11 strategies + early reversal + ATR trading plan
 # ---------------------------------------------------------------------------
 
-_V12_SNAPSHOT_QUERY = """
+_V12_SNAPSHOT_QUERY = f"""
     WITH latest_date AS (
         SELECT MAX(trade_date) AS trade_date FROM daily_indicators
     ),
@@ -263,6 +276,7 @@ _V12_SNAPSHOT_QUERY = """
     LEFT JOIN previous_bars p ON p.symbol = b.symbol
     LEFT JOIN atr_history a ON a.symbol = b.symbol AND a.trade_date = b.trade_date
     WHERE s.is_active = TRUE
+      AND {_COMMON_STOCK_FILTER}
 """
 
 
@@ -270,7 +284,7 @@ async def _fetch_v12_snapshot() -> tuple[list[dict[str, Any]], int, Any]:
     async with stock_database.acquire() as connection:
         rows = await connection.fetch(_V12_SNAPSHOT_QUERY)
         universe_count = int(await connection.fetchval(
-            "SELECT COUNT(*) FROM securities WHERE is_active=TRUE"
+            _COMMON_STOCK_UNIVERSE_COUNT_QUERY
         ) or 0)
         latest_trade_date = await connection.fetchval(
             "SELECT MAX(trade_date) FROM daily_indicators"
@@ -316,13 +330,23 @@ async def screen_database_market_v12(
     minimum_score = max(0.0, min(float(minimum_score), 100.0))
     config = load_v12_config()
     rows, universe_count, latest_trade_date = await _fetch_v12_snapshot()
-    candidates, rejection_summary = screen_v12_rows(
+    raw_candidates, rejection_summary = screen_v12_rows(
         rows=rows,
         strategy=strategy,
         minimum_score=minimum_score,
-        limit=limit,
+        limit=200,
         config=config,
     )
+    tiers = split_v12_price_tiers(raw_candidates, config)
+    primary_results = tiers["main"][:limit]
+    high_price_results = tiers["highPrice"][
+        : min(limit, config.high_price_limit)
+    ]
+    candidates = primary_results + high_price_results
+    for rank, candidate in enumerate(primary_results, start=1):
+        candidate["rank"] = rank
+    for rank, candidate in enumerate(high_price_results, start=1):
+        candidate["highPriceRank"] = rank
 
     saved = None
     if save_result:
@@ -341,6 +365,10 @@ async def screen_database_market_v12(
         "version": "V12",
         "strategy": strategy,
         "candidateCount": len(candidates),
+        "rawCandidateCount": len(raw_candidates),
+        "mainCandidateCount": len(primary_results),
+        "highPriceCandidateCount": len(high_price_results),
+        "excludedHighPriceCount": len(tiers["rejectedHighPrice"]),
         "universeCount": universe_count,
         "snapshotCount": len(rows),
         "latestTradeDate": latest_trade_date,
@@ -350,8 +378,17 @@ async def screen_database_market_v12(
             "minAverageVolume20Lots": config.min_average_volume20_lots,
             "minTradeValue": config.effective_min_trade_value,
         },
+        "priceRules": {
+            "primaryMaxPrice": config.primary_max_price,
+            "highPriceMinScore": config.high_price_min_score,
+            "highPriceMaxRiskPercent": config.high_price_max_risk_pct,
+            "highPriceLimit": config.high_price_limit,
+            "highPriceRequiresNoWarnings": True,
+        },
         "rejectionSummary": rejection_summary,
         "results": candidates,
+        "primaryResults": primary_results,
+        "highPriceStrongResults": high_price_results,
         "record": saved,
         "source": "PostgreSQL V12",
     }
@@ -372,13 +409,28 @@ async def run_full_bullish_radar_v12(
     merged: dict[str, dict[str, Any]] = {}
 
     for strategy in V12_STRATEGIES:
-        candidates, rejection_summary = screen_v12_rows(
+        raw_candidates, rejection_summary = screen_v12_rows(
             rows=rows,
             strategy=strategy,
             minimum_score=minimum_score,
-            limit=limit_each,
+            limit=200,
             config=config,
         )
+        tiers = split_v12_price_tiers(raw_candidates, config)
+        primary_results = tiers["main"][:limit_each]
+        high_price_results = tiers["highPrice"][
+            : min(limit_each, config.high_price_limit)
+        ]
+        rejected_high_price_symbols.update(
+            str(candidate.get("symbol") or "").strip()
+            for candidate in tiers["rejectedHighPrice"]
+            if str(candidate.get("symbol") or "").strip()
+        )
+        candidates = primary_results + high_price_results
+        for rank, candidate in enumerate(primary_results, start=1):
+            candidate["rank"] = rank
+        for rank, candidate in enumerate(high_price_results, start=1):
+            candidate["highPriceRank"] = rank
         record = None
         if save_result:
             record = await _save_v12_strategy(
@@ -395,10 +447,16 @@ async def run_full_bullish_radar_v12(
             "version": "V12",
             "strategy": strategy,
             "candidateCount": len(candidates),
+            "rawCandidateCount": len(raw_candidates),
+            "mainCandidateCount": len(primary_results),
+            "highPriceCandidateCount": len(high_price_results),
+            "excludedHighPriceCount": len(tiers["rejectedHighPrice"]),
             "universeCount": universe_count,
             "latestTradeDate": latest_trade_date,
             "rejectionSummary": rejection_summary,
             "results": candidates,
+            "primaryResults": primary_results,
+            "highPriceStrongResults": high_price_results,
             "record": record,
             "source": "PostgreSQL V12",
         }
@@ -434,14 +492,29 @@ async def run_full_bullish_radar_v12(
         ),
         reverse=True,
     )
-    for index, item in enumerate(ranked, start=1):
+    combined_tiers = split_v12_price_tiers(ranked, config)
+    primary_ranked = combined_tiers["main"]
+    high_price_ranked = combined_tiers["highPrice"][: config.high_price_limit]
+    for index, item in enumerate(primary_ranked, start=1):
         item["combinedRank"] = index
+        item["rank"] = index
+    for index, item in enumerate(high_price_ranked, start=1):
+        item["highPriceRank"] = index
+    displayed_candidates = primary_ranked + high_price_ranked
+    accepted_high_price_symbols = {
+        str(candidate.get("symbol") or "").strip()
+        for candidate in high_price_ranked
+        if str(candidate.get("symbol") or "").strip()
+    }
+    excluded_high_price_count = len(
+        rejected_high_price_symbols - accepted_high_price_symbols
+    )
 
     combined_record = None
     if save_result:
         combined_record = await stock_database_service.save_radar_result(
             strategy="v12_combined",
-            candidates=ranked,
+            candidates=displayed_candidates,
             run_date=date.today(),
             universe_count=universe_count,
             configuration={
@@ -457,7 +530,11 @@ async def run_full_bullish_radar_v12(
         "ok": True,
         "version": "V12",
         "strategies": list(V12_STRATEGIES),
-        "candidateCount": len(ranked),
+        "candidateCount": len(displayed_candidates),
+        "rawCandidateCount": len(ranked),
+        "mainCandidateCount": len(primary_ranked),
+        "highPriceCandidateCount": len(high_price_ranked),
+        "excludedHighPriceCount": excluded_high_price_count,
         "minimumScore": minimum_score,
         "limitEach": limit_each,
         "universeCount": universe_count,
@@ -468,9 +545,17 @@ async def run_full_bullish_radar_v12(
             "minAverageVolume20Lots": config.min_average_volume20_lots,
             "minTradeValue": config.effective_min_trade_value,
         },
-        "top10": ranked[:10],
-        "top5": ranked[:5],
-        "watchlistCandidates": ranked[:3],
+        "priceRules": {
+            "primaryMaxPrice": config.primary_max_price,
+            "highPriceMinScore": config.high_price_min_score,
+            "highPriceMaxRiskPercent": config.high_price_max_risk_pct,
+            "highPriceLimit": config.high_price_limit,
+            "highPriceRequiresNoWarnings": True,
+        },
+        "top10": primary_ranked[:10],
+        "top5": primary_ranked[:5],
+        "watchlistCandidates": primary_ranked[:3],
+        "highPriceStrongCandidates": high_price_ranked,
         "byStrategy": grouped,
         "record": combined_record,
         "source": "PostgreSQL V12",
