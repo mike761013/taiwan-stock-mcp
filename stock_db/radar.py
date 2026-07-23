@@ -158,7 +158,6 @@ async def run_full_bullish_radar(
     limit_each = max(1, min(limit_each, 200))
     grouped: dict[str, dict[str, Any]] = {}
     merged: dict[str, dict[str, Any]] = {}
-    rejected_high_price_symbols: set[str] = set()
 
     for strategy in ("early_stage", "breakout", "pullback"):
         result = await screen_database_market(
@@ -407,6 +406,7 @@ async def run_full_bullish_radar_v12(
 
     grouped: dict[str, dict[str, Any]] = {}
     merged: dict[str, dict[str, Any]] = {}
+    rejected_high_price_symbols: set[str] = set()
 
     for strategy in V12_STRATEGIES:
         raw_candidates, rejection_summary = screen_v12_rows(

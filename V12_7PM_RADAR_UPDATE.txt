@@ -1,6 +1,9 @@
 V12 七點雷達更新包
 ====================
 
+2026-07-23 修正：補上 V12 高價股排除追蹤初始化，避免正式雷達執行時
+出現「rejected_high_price_symbols is not defined」。
+
 請把下列 4 個檔案放到 GitHub 對應位置並覆蓋原檔：
 
 1. stock_db/v12.py

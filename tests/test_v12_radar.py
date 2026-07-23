@@ -1,3 +1,6 @@
+import asyncio
+
+from stock_db import radar
 from stock_db.v12 import (
     V12Config,
     build_trading_plan,
@@ -204,3 +207,24 @@ def test_semantic_validator_rejects_invalid_v12_output():
     assert "CHANGE_PERCENT_MISMATCH" in codes
     assert "INVALID_PRICE_BAND_ORDER" in codes
     assert "TRADABLE_STATUS_ABOVE_MAXIMUM_BUY" in codes
+
+
+def test_full_v12_radar_initialises_high_price_rejection_tracking(
+    monkeypatch,
+):
+    async def empty_snapshot():
+        return [], 0, None
+
+    monkeypatch.setattr(radar, "_fetch_v12_snapshot", empty_snapshot)
+
+    result = asyncio.run(
+        radar.run_full_bullish_radar_v12(
+            limit_each=10,
+            minimum_score=45,
+            save_result=False,
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["candidateCount"] == 0
+    assert result["excludedHighPriceCount"] == 0
