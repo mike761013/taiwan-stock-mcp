@@ -39,6 +39,13 @@
    - 禁止追價價
    - 建議初始部位
    - MA20／布林／爆量過熱扣分
+7. V7.1 同日官方資料備援
+   - 上市主來源：TWSE `STOCK_DAY_ALL`
+   - 上市備援：TWSE `MI_INDEX`
+   - 上櫃主來源：TPEx 最新日行情
+   - 上櫃備援：TPEx `dailyQuotes`
+   - 主來源日期落後時，自動切換到指定日期備援
+   - 兩市場仍無法對齊時，不寫入資料庫，也不產生正式雷達
 
 ## 安裝
 
@@ -51,10 +58,15 @@
 實際有修改／新增的核心檔案只有：
 
 - `server_v10_tools.py`（修改）
+- `stock_db/data_sources.py`（修改）
+- `stock_db/pipeline.py`（修改）
+- `stock_db/maintenance.py`（修改）
 - `stock_db/radar.py`（修改）
 - `stock_db/v12.py`（新增）
 - `v12_config.json`（新增）
 - `tests/test_v12_radar.py`（新增）
+- `tests/test_v12_official_fallback.py`（新增）
+- `scripts/verify_v12_fallback.py`（新增）
 
 `server.py`不用修改，因為它原本就會呼叫 `register_v10_tools(mcp)`，新增的V12工具會一起註冊。
 
@@ -87,6 +99,21 @@ save_result=true
 validate_v12_release
 limit_each=5
 minimum_score=0
+```
+
+執行收盤作業時，請確認回傳：
+
+```text
+fallbackEnabled=true
+finalMarketDates 的 TWSE 與 TPEx 日期相同
+dataIntegrity.allMarketsSameDate=true
+```
+
+如果主來源日期不同，正常情況還會看到：
+
+```text
+fallbackUsed=true
+fallbackMarkets=[日期落後的市場]
 ```
 
 ## 亞電驗證

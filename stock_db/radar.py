@@ -289,16 +289,51 @@ _V12_SNAPSHOT_QUERY = f"""
       AND {_COMMON_STOCK_FILTER}
 """
 
+_V12_MARKET_DATES_QUERY = f"""
+    SELECT CASE
+             WHEN UPPER(s.market) = 'OTC' THEN 'TPEX'
+             ELSE UPPER(s.market)
+           END AS market_key,
+           MAX(i.trade_date) AS trade_date
+    FROM daily_indicators i
+    JOIN securities s ON s.symbol = i.symbol
+    WHERE s.is_active = TRUE
+      AND {_COMMON_STOCK_FILTER}
+    GROUP BY CASE
+               WHEN UPPER(s.market) = 'OTC' THEN 'TPEX'
+               ELSE UPPER(s.market)
+             END
+"""
+
 
 async def _fetch_v12_snapshot() -> tuple[list[dict[str, Any]], int, Any]:
     async with stock_database.acquire() as connection:
+        market_date_rows = await connection.fetch(
+            _V12_MARKET_DATES_QUERY
+        )
+        market_dates = {
+            str(row["market_key"]): row["trade_date"]
+            for row in market_date_rows
+            if row["market_key"] in {"TWSE", "TPEX"}
+            and row["trade_date"] is not None
+        }
+        if set(market_dates) != {"TWSE", "TPEX"}:
+            raise RuntimeError(
+                "V12_MARKET_DATA_INCOMPLETE: "
+                f"marketDates={market_dates}; "
+                "請先完成具同日備援的收盤作業。"
+            )
+        if len(set(market_dates.values())) != 1:
+            raise RuntimeError(
+                "V12_MARKET_DATE_MISMATCH: "
+                f"marketDates={market_dates}; "
+                "上市與上櫃日期不同，正式雷達已拒絕執行。"
+            )
         rows = await connection.fetch(_V12_SNAPSHOT_QUERY)
         universe_count = int(await connection.fetchval(
             _COMMON_STOCK_UNIVERSE_COUNT_QUERY
         ) or 0)
-        latest_trade_date = await connection.fetchval(
-            "SELECT MAX(trade_date) FROM daily_indicators"
-        )
+        latest_trade_date = next(iter(market_dates.values()))
     return [dict(row) for row in rows], universe_count, latest_trade_date
 
 

@@ -4,6 +4,7 @@ from stock_db import pipeline
 from stock_db.pipeline import is_listed_otc_common_stock
 from stock_db.radar import (
     _COMMON_STOCK_UNIVERSE_COUNT_QUERY,
+    _V12_MARKET_DATES_QUERY,
     _V12_SNAPSHOT_QUERY,
 )
 
@@ -40,6 +41,13 @@ def test_v12_snapshot_uses_each_markets_latest_trade_date() -> None:
     )
 
 
+def test_v12_formal_radar_has_same_date_market_gate() -> None:
+    assert "MAX(i.trade_date)" in _V12_MARKET_DATES_QUERY
+    assert "WHEN UPPER(s.market) = 'OTC' THEN 'TPEX'" in (
+        _V12_MARKET_DATES_QUERY
+    )
+
+
 def test_daily_update_continuation_reuses_committed_snapshot(monkeypatch) -> None:
     async def initialize():
         return {"ok": True}
@@ -58,7 +66,7 @@ def test_daily_update_continuation_reuses_committed_snapshot(monkeypatch) -> Non
     monkeypatch.setattr(pipeline.stock_database_service, "initialize", initialize)
     monkeypatch.setattr(
         pipeline,
-        "fetch_official_daily_snapshot",
+        "fetch_official_daily_snapshot_with_fallback",
         fail_if_snapshot_is_downloaded,
     )
     monkeypatch.setattr(
@@ -104,13 +112,36 @@ def test_daily_update_persists_only_listed_otc_common_stocks(monkeypatch) -> Non
             "change_percent": 1,
             "source": "official",
         }
-        return [
+        rows = [
             {**base, "symbol": "2330", "name": "台積電", "market": "TWSE"},
             {**base, "symbol": "4939", "name": "亞電", "market": "TPEx"},
             {**base, "symbol": "0050", "name": "元大台灣50", "market": "TWSE"},
             {**base, "symbol": "00679B", "name": "元大美債20年", "market": "TWSE"},
             {**base, "symbol": "1101B", "name": "測試特別股", "market": "TWSE"},
         ]
+        return {
+            "ok": True,
+            "rows": rows,
+            "primaryMarketDates": {
+                "TWSE": "2026-07-22",
+                "TPEx": "2026-07-22",
+            },
+            "finalMarketDates": {
+                "TWSE": "2026-07-22",
+                "TPEx": "2026-07-22",
+            },
+            "referenceDate": "2026-07-22",
+            "targetDate": "2026-07-22",
+            "fallbackUsed": False,
+            "fallbackMarkets": [],
+            "fallbackAttempts": [],
+            "primaryErrors": {},
+            "dataIntegrity": {
+                "allMarketsPresent": True,
+                "allMarketsSameDate": True,
+                "matchesReferenceDate": True,
+            },
+        }
 
     async def upsert_securities(securities):
         captured_security_symbols.extend(item.symbol for item in securities)
@@ -129,7 +160,11 @@ def test_daily_update_persists_only_listed_otc_common_stocks(monkeypatch) -> Non
         return {"processed": 1}
 
     monkeypatch.setattr(pipeline.stock_database_service, "initialize", initialize)
-    monkeypatch.setattr(pipeline, "fetch_official_daily_snapshot", fetch_snapshot)
+    monkeypatch.setattr(
+        pipeline,
+        "fetch_official_daily_snapshot_with_fallback",
+        fetch_snapshot,
+    )
     monkeypatch.setattr(
         pipeline.stock_repository,
         "upsert_securities",

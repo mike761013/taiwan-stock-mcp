@@ -1,0 +1,59 @@
+V12 同日官方行情備援更新
+=========================
+
+這次把 V7.1 的行情備援功能正式補回 V12。
+
+請將更新包中的內容整包複製到原本 taiwan-stock-mcp 根目錄，
+Windows 詢問時選「取代目的地中的檔案」，再提交並推送 GitHub。
+
+主要更新檔：
+
+1. stock_db/data_sources.py
+2. stock_db/pipeline.py
+3. stock_db/maintenance.py
+4. stock_db/radar.py
+5. tests/test_v12_official_fallback.py
+6. scripts/verify_v12_fallback.py
+7. README_V12_INSTALL.txt
+
+新增行為：
+
+- 上市主來源：TWSE STOCK_DAY_ALL
+- 上市備援：TWSE MI_INDEX 指定日期盤後行情
+- 上櫃主來源：TPEx 最新日行情
+- 上櫃備援：TPEx dailyQuotes 指定日期盤後行情
+- FUGLE_API_KEY 存在時，以 2330 報價日期檢查兩個主來源是否同時落後
+- 任何落後市場會自動改抓目標日期備援
+- 備援資料必須通過日期、股票家數、OHLC、成交量與成交值檢查
+- 上市與上櫃仍無法對齊時，拒絕寫入資料庫
+- 收盤作業失敗時，不再繼續執行雷達或績效更新
+- V12 正式雷達會再次檢查資料庫內上市與上櫃的最新指標日期；
+  日期不同時拒絕執行及保存結果
+
+Render Environment 請維持：
+
+STOCK_DB_FALLBACK_ENABLED=true
+
+部署後先執行：
+
+收盤作業
+
+成功結果應符合：
+
+- ok=true
+- fallbackEnabled=true
+- finalMarketDates 內 TWSE 與 TPEx 日期相同
+- dataIntegrity.allMarketsSameDate=true
+
+如果主來源日期不同但備援成功，還會看到：
+
+- fallbackUsed=true
+- fallbackMarkets 顯示實際使用備援的市場
+
+確認收盤作業全部完成後，再執行：
+
+V12正式雷達
+
+離線驗證指令（選用）：
+
+python -m scripts.verify_v12_fallback

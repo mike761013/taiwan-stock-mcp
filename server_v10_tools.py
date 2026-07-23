@@ -19,7 +19,11 @@ from stock_db.radar import (
     screen_database_market,
     screen_database_market_v12,
 )
-from stock_db.v12 import V12_STRATEGIES, load_v12_config
+from stock_db.v12 import (
+    V12_STRATEGIES,
+    load_v12_config,
+    validate_v12_candidates,
+)
 from stock_db.service import stock_database_service
 
 
@@ -322,6 +326,20 @@ def register_v10_tools(mcp: Any) -> None:
             int(result.get("candidateCount", 0))
             for result in strategies.values()
         )
+        semantic_issues: list[dict[str, Any]] = []
+        for strategy, result in strategies.items():
+            semantic_issues.extend(
+                validate_v12_candidates(
+                    result.get("results") or [],
+                    context=f"strategies.{strategy}.results",
+                )
+            )
+        semantic_issues.extend(
+            validate_v12_candidates(
+                full.get("top10") or [],
+                context="fullRadar.top10",
+            )
+        )
         checks = {
             "databaseHealthy": health.get("status") == "healthy",
             "allStrategiesOk": all(result.get("ok") for result in strategies.values()),
@@ -333,6 +351,7 @@ def register_v10_tools(mcp: Any) -> None:
                 or int(after_stats.get("radar_candidates", 0))
                     > int(before_stats.get("radar_candidates", 0))
             ),
+            "semanticConsistency": not semantic_issues,
         }
         return {
             "ok": all(checks.values()),
@@ -340,6 +359,11 @@ def register_v10_tools(mcp: Any) -> None:
             "version": "V12",
             "checks": checks,
             "candidateCount": total_candidates,
+            "semanticValidation": {
+                "ok": not semantic_issues,
+                "issueCount": len(semantic_issues),
+                "issues": semantic_issues,
+            },
             "strategies": strategies,
             "fullRadar": full,
             "statisticsBefore": before_stats,

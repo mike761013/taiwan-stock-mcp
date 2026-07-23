@@ -10,7 +10,7 @@ from typing import Any, Sequence
 from .connection import stock_database
 from .data_sources import (
     fetch_finmind_history,
-    fetch_official_daily_snapshot,
+    fetch_official_daily_snapshot_with_fallback,
     fetch_security_master,
 )
 from .importers import row_to_daily_bar
@@ -313,8 +313,62 @@ async def update_official_daily(
     raw_rows: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
     written = 0
+    snapshot_metadata: dict[str, Any] = {
+        "primaryMarketDates": {},
+        "finalMarketDates": {},
+        "referenceDate": None,
+        "targetDate": None,
+        "fallbackEnabled": None,
+        "fallbackUsed": False,
+        "fallbackMarkets": [],
+        "fallbackAttempts": [],
+        "dataIntegrity": {
+            "reusedCommittedSnapshot": not refresh_snapshot,
+        },
+    }
     if refresh_snapshot:
-        raw_rows = await fetch_official_daily_snapshot()
+        snapshot = await fetch_official_daily_snapshot_with_fallback()
+        snapshot_metadata = {
+            key: snapshot.get(key)
+            for key in (
+                "primaryMarketDates",
+                "finalMarketDates",
+                "referenceDate",
+                "targetDate",
+                "fallbackEnabled",
+                "fallbackUsed",
+                "fallbackMarkets",
+                "fallbackAttempts",
+                "primaryErrors",
+                "dataIntegrity",
+            )
+        }
+        if not snapshot.get("ok"):
+            return {
+                "ok": False,
+                "errorCode": snapshot.get("errorCode"),
+                "error": snapshot.get("error"),
+                "scope": "TWSE_TPEX_COMMON_STOCKS",
+                "snapshotRefreshed": False,
+                "rawRowsFetched": 0,
+                "rowsFetched": 0,
+                "barsWritten": 0,
+                "universeCount": 0,
+                "batchSize": 0,
+                "batchSymbolCount": 0,
+                "batchSymbols": [],
+                "indicatorSymbols": 0,
+                "failedSymbols": 0,
+                "indicatorRowsWritten": 0,
+                "indicatorFailures": [],
+                "lastSymbol": start_after,
+                "hasMore": False,
+                "nextStartAfter": None,
+                "remainingSymbols": 0,
+                "startAfterFound": True,
+                **snapshot_metadata,
+            }
+        raw_rows = list(snapshot.get("rows") or [])
         rows = [
             row
             for row in raw_rows
@@ -387,4 +441,5 @@ async def update_official_daily(
         "nextStartAfter": last_symbol if has_more else None,
         "remainingSymbols": remaining_after,
         "startAfterFound": marker_found,
+        **snapshot_metadata,
     }

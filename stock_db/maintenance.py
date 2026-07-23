@@ -47,6 +47,12 @@ async def run_daily_maintenance(
         "remainingSymbols": int(market_update.get("remainingSymbols", 0)),
     }
 
+    # Do not run radar or performance finalisation against a rejected or
+    # partially failed market snapshot. In particular, a failed same-date
+    # fallback must never produce an apparently formal V12 radar result.
+    if not market_update.get("ok"):
+        return result
+
     if market_update.get("hasMore"):
         return result
 
