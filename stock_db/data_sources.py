@@ -663,7 +663,9 @@ async def _fetch_primary_market_snapshot(
         source = "TWSE OpenAPI STOCK_DAY_ALL"
     elif market == "TPEx":
         url = TPEX_DAILY_URL
-        source = "TPEx OpenAPI tpex_mainboard_daily_close_quotes"
+        # ``daily_bars.source`` is VARCHAR(32).  Keep the human-readable
+        # provider label within that database limit.
+        source = "TPEx OpenAPI daily_close"
     else:
         raise ValueError("market only supports TWSE or TPEx")
 
