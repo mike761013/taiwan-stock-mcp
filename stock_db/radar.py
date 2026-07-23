@@ -206,13 +206,22 @@ async def run_full_bullish_radar(
 # ---------------------------------------------------------------------------
 
 _V12_SNAPSHOT_QUERY = f"""
-    WITH latest_date AS (
+    WITH global_latest_date AS (
         SELECT MAX(trade_date) AS trade_date FROM daily_indicators
+    ),
+    market_latest_dates AS (
+        SELECT UPPER(s.market) AS market_key,
+               MAX(i.trade_date) AS trade_date
+        FROM daily_indicators i
+        JOIN securities s ON s.symbol = i.symbol
+        WHERE s.is_active = TRUE
+          AND {_COMMON_STOCK_FILTER}
+        GROUP BY UPPER(s.market)
     ),
     recent_bars AS (
         SELECT b.*
         FROM daily_bars b
-        CROSS JOIN latest_date d
+        CROSS JOIN global_latest_date d
         WHERE b.trade_date >= d.trade_date - INTERVAL '120 days'
     ),
     bar_windows AS (
@@ -268,10 +277,12 @@ _V12_SNAPSHOT_QUERY = f"""
            i.volatility_20, i.large_volume_low, i.technical_score,
            p.prev_open, p.prev_high, p.prev_low, p.prev_close, p.prev_volume,
            a.atr14
-    FROM latest_date d
-    JOIN daily_indicators i ON i.trade_date = d.trade_date
+    FROM daily_indicators i
     JOIN daily_bars b ON b.symbol = i.symbol AND b.trade_date = i.trade_date
     JOIN securities s ON s.symbol = b.symbol
+    JOIN market_latest_dates d
+      ON d.market_key = UPPER(s.market)
+     AND d.trade_date = i.trade_date
     LEFT JOIN previous_bars p ON p.symbol = b.symbol
     LEFT JOIN atr_history a ON a.symbol = b.symbol AND a.trade_date = b.trade_date
     WHERE s.is_active = TRUE

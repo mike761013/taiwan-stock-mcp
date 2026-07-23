@@ -31,6 +31,15 @@ def test_v12_snapshot_and_universe_count_share_the_same_scope() -> None:
     assert market_filter in _COMMON_STOCK_UNIVERSE_COUNT_QUERY
 
 
+def test_v12_snapshot_uses_each_markets_latest_trade_date() -> None:
+    assert "market_latest_dates AS" in _V12_SNAPSHOT_QUERY
+    assert "d.market_key = UPPER(s.market)" in _V12_SNAPSHOT_QUERY
+    assert "d.trade_date = i.trade_date" in _V12_SNAPSHOT_QUERY
+    assert "JOIN daily_indicators i ON i.trade_date = d.trade_date" not in (
+        _V12_SNAPSHOT_QUERY
+    )
+
+
 def test_daily_update_continuation_reuses_committed_snapshot(monkeypatch) -> None:
     async def initialize():
         return {"ok": True}
