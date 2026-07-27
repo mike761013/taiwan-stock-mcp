@@ -1,0 +1,82 @@
+V12 收盤作業 500 檔批次加速包
+版本日期：2026-07-27
+
+【怎麼安裝】
+
+1. 解壓縮 V12_Fast_Close_500_Update.zip。
+2. 打開解壓縮後的 V12_Fast_Close_500_Update 資料夾。
+3. 全選資料夾裡面的所有檔案與資料夾。
+4. 複製到 GitHub Desktop 使用的 taiwan-stock-mcp 專案根目錄。
+   就是可以看到 server.py、server_v10_tools.py、stock_db、tests 的那一層。
+5. Windows 詢問時選擇「取代目的地中的檔案」。
+
+注意：
+- 要複製「更新包裡面的內容」，不要把最外層
+  V12_Fast_Close_500_Update 資料夾整個塞進專案。
+- 不要刪除專案裡其他檔案。
+- 不需要碰 .git 資料夾。
+
+【應該出現在 GitHub Desktop 的異動】
+
+修改：
+- server_v10_tools.py
+- stock_db/maintenance.py
+- stock_db/pipeline.py
+- stock_db/repository.py
+- stock_db/service.py
+- tests/test_common_stock_scope.py
+
+新增：
+- tests/test_daily_indicator_bulk.py
+- scripts/verify_fast_close_500.py
+- APPLY_V12_FAST_CLOSE_500.txt
+- VERIFY_V12_FAST_CLOSE_500.bat
+
+【這次修改做了什麼】
+
+- 收盤指標批次上限由 100 提高到 500。
+- 每批股票只讀取最近 61 根日 K。
+- 500 檔使用一次資料庫批次讀取。
+- 500 筆最新指標使用一次資料庫批次寫入。
+- 保留原本 Python 指標公式，避免 MA、布林、波動率與大量低點語意改變。
+- 正式範圍仍然只使用上市／上櫃普通股。
+- 收盤批次不會增加 Fugle API 用量。
+- 備援來源與兩市場同日驗證邏輯保持不變。
+
+【上傳前驗證】
+
+在專案根目錄雙擊：
+
+VERIFY_V12_FAST_CLOSE_500.bat
+
+看到 TESTS PASSED 才繼續。
+
+【GitHub Desktop】
+
+1. Summary 可填：
+   Speed up V12 close maintenance with 500-stock bulk indicators
+2. 按 Commit to main。
+3. 按 Push origin。
+4. 等 Render 自動部署完成。
+
+【部署後第一次驗證】
+
+對 ChatGPT 下：
+
+validate_v12_release
+limit_each=5
+minimum_score=0
+
+下一個交易日收盤後再下：
+
+收盤作業
+
+正常結果應看到：
+- scope = TWSE_TPEX_COMMON_STOCKS
+- batchSize = 500
+- indicatorCalculationMode = bulk_latest_61_bars
+- failedSymbols = 0
+- completed = true
+
+若第一批仍逾時，不會打到 Fugle 上限；可先改用 batch_size=300。
+資料寫入使用 UPSERT，重跑不會建立重複日 K 或重複指標。

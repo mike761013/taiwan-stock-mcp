@@ -101,11 +101,11 @@ def register_v10_tools(mcp: Any) -> None:
 
     @mcp.tool()
     async def update_stock_database_daily(
-        batch_size: int = 50,
+        batch_size: int = 500,
         start_after: str | None = None,
         concurrency: int = 6,
     ) -> dict:
-        """更新官方當日日K，並分批計算最新指標以避免免費版逾時。"""
+        """更新官方當日日K，以最多500檔批次計算最新指標。"""
         return await update_official_daily(
             batch_size=batch_size,
             start_after=start_after,
@@ -253,13 +253,13 @@ def register_v10_tools(mcp: Any) -> None:
     async def run_v11_daily_maintenance(
         run_radar: bool = True,
         update_performance: bool = True,
-        batch_size: int = 50,
+        batch_size: int = 500,
         start_after: str | None = None,
         concurrency: int = 6,
         radar_limit_each: int = 20,
         radar_minimum_score: float = 45,
     ) -> dict:
-        """免費版可續傳的每日更新；重複傳入 nextStartAfter 直到 completed。"""
+        """500檔批次每日更新；重複傳入 nextStartAfter 直到 completed。"""
         return await _maintenance(
             run_radar,
             update_performance,
@@ -274,7 +274,7 @@ def register_v10_tools(mcp: Any) -> None:
     async def run_v10_daily_maintenance(
         run_radar: bool = True,
         update_performance: bool = True,
-        batch_size: int = 50,
+        batch_size: int = 500,
         start_after: str | None = None,
         concurrency: int = 6,
         radar_limit_each: int = 20,

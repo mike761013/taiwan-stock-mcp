@@ -291,7 +291,7 @@ async def calculate_all_indicators(
 
 
 async def update_official_daily(
-    batch_size: int = 50,
+    batch_size: int = 500,
     start_after: str | None = None,
     concurrency: int = 6,
 ) -> dict[str, Any]:
@@ -307,7 +307,7 @@ async def update_official_daily(
         return init
 
     # The first request refreshes the official snapshot. Continuation requests
-    # reuse the committed snapshot so every 100-symbol batch does not download
+    # reuse the committed snapshot so every continuation batch does not download
     # the same 11k-row payload again.
     refresh_snapshot = not start_after
     raw_rows: list[dict[str, Any]] = []
@@ -392,31 +392,33 @@ async def update_official_daily(
 
     all_symbols = await _latest_common_stock_symbols()
     remaining, marker_found = _resume_slice(all_symbols, start_after)
-    batch_size = max(1, min(batch_size, 100))
+    batch_size = max(1, min(batch_size, 500))
     target_symbols = remaining[:batch_size]
 
-    semaphore = asyncio.Semaphore(max(1, min(concurrency, 8)))
     processed = failed = indicator_rows_written = 0
     indicator_failures: list[dict[str, str]] = []
-
-    async def one(symbol: str) -> None:
-        nonlocal processed, failed, indicator_rows_written
-        async with semaphore:
-            try:
-                result = await stock_database_service.calculate_symbol_indicators(
-                    symbol,
-                    latest_only=True,
+    if target_symbols:
+        try:
+            indicator_result = (
+                await stock_database_service.calculate_latest_indicators_bulk(
+                    target_symbols,
+                    lookback_bars=61,
                 )
-                indicator_rows_written += int(result.get("processed", 0))
-                processed += 1
-            except Exception as exc:
-                failed += 1
-                indicator_failures.append({
-                    "symbol": symbol,
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
-
-    await asyncio.gather(*(one(symbol) for symbol in target_symbols))
+            )
+            processed = int(indicator_result.get("processedSymbols", 0))
+            failed = int(indicator_result.get("failedSymbols", 0))
+            indicator_rows_written = int(
+                indicator_result.get("indicatorRowsWritten", 0)
+            )
+            indicator_failures = list(
+                indicator_result.get("failures") or []
+            )
+        except Exception as exc:
+            failed = len(target_symbols)
+            indicator_failures = [{
+                "symbol": "__BATCH__",
+                "error": f"{type(exc).__name__}: {exc}",
+            }]
 
     remaining_after = max(0, len(remaining) - len(target_symbols))
     has_more = remaining_after > 0
@@ -430,6 +432,7 @@ async def update_official_daily(
         "barsWritten": written,
         "universeCount": len(all_symbols),
         "batchSize": batch_size,
+        "indicatorCalculationMode": "bulk_latest_61_bars",
         "batchSymbolCount": len(target_symbols),
         "batchSymbols": target_symbols,
         "indicatorSymbols": processed,

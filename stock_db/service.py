@@ -67,6 +67,72 @@ class StockDatabaseService:
             "latestOnly": latest_only,
         }
 
+    async def calculate_latest_indicators_bulk(
+        self,
+        symbols: Sequence[str],
+        lookback_bars: int = 61,
+    ) -> dict[str, Any]:
+        """Calculate and write one latest indicator row per symbol in bulk.
+
+        This keeps the existing Python indicator formulas, but avoids fetching
+        thousands of historical bars and opening one write transaction for
+        every symbol.
+        """
+        unique_symbols = list(dict.fromkeys(
+            str(symbol).strip() for symbol in symbols if str(symbol).strip()
+        ))
+        if not unique_symbols:
+            return {
+                "ok": True,
+                "requestedSymbols": 0,
+                "processedSymbols": 0,
+                "failedSymbols": 0,
+                "indicatorRowsWritten": 0,
+                "failures": [],
+                "lookbackBars": lookback_bars,
+            }
+
+        bars_by_symbol = (
+            await self.repository.get_recent_daily_bars_for_symbols(
+                unique_symbols,
+                limit_per_symbol=lookback_bars,
+            )
+        )
+        rows: list[DailyIndicator] = []
+        failures: list[dict[str, str]] = []
+
+        for symbol in unique_symbols:
+            try:
+                bars = bars_by_symbol.get(symbol) or []
+                if not bars:
+                    raise ValueError("no daily bars")
+                latest = calculate_indicators(bars)[-1]
+                rows.append(DailyIndicator(
+                    symbol=latest["symbol"],
+                    trade_date=latest["trade_date"],
+                    values={
+                        key: value
+                        for key, value in latest.items()
+                        if key not in {"symbol", "trade_date"}
+                    },
+                ))
+            except Exception as exc:
+                failures.append({
+                    "symbol": symbol,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+
+        written = await self.repository.bulk_upsert_indicators(rows)
+        return {
+            "ok": not failures,
+            "requestedSymbols": len(unique_symbols),
+            "processedSymbols": len(rows),
+            "failedSymbols": len(failures),
+            "indicatorRowsWritten": written,
+            "failures": failures[:100],
+            "lookbackBars": lookback_bars,
+        }
+
     async def cleanup(
         self,
         retention_years: int = 3,

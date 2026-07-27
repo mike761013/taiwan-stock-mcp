@@ -58,10 +58,15 @@ def test_daily_update_continuation_reuses_committed_snapshot(monkeypatch) -> Non
     async def latest_common_stock_symbols():
         return ["1101", "2330"]
 
-    async def calculate_symbol_indicators(symbol, latest_only=False):
-        assert symbol == "2330"
-        assert latest_only is True
-        return {"processed": 1}
+    async def calculate_latest_indicators_bulk(symbols, lookback_bars=61):
+        assert symbols == ["2330"]
+        assert lookback_bars == 61
+        return {
+            "processedSymbols": 1,
+            "failedSymbols": 0,
+            "indicatorRowsWritten": 1,
+            "failures": [],
+        }
 
     monkeypatch.setattr(pipeline.stock_database_service, "initialize", initialize)
     monkeypatch.setattr(
@@ -76,11 +81,16 @@ def test_daily_update_continuation_reuses_committed_snapshot(monkeypatch) -> Non
     )
     monkeypatch.setattr(
         pipeline.stock_database_service,
-        "calculate_symbol_indicators",
-        calculate_symbol_indicators,
+        "calculate_latest_indicators_bulk",
+        calculate_latest_indicators_bulk,
     )
 
-    result = asyncio.run(pipeline.update_official_daily(start_after="1101"))
+    result = asyncio.run(
+        pipeline.update_official_daily(
+            batch_size=500,
+            start_after="1101",
+        )
+    )
 
     assert result["ok"] is True
     assert result["scope"] == "TWSE_TPEX_COMMON_STOCKS"
@@ -89,6 +99,8 @@ def test_daily_update_continuation_reuses_committed_snapshot(monkeypatch) -> Non
     assert result["rowsFetched"] == 0
     assert result["barsWritten"] == 0
     assert result["universeCount"] == 2
+    assert result["batchSize"] == 500
+    assert result["indicatorCalculationMode"] == "bulk_latest_61_bars"
     assert result["indicatorSymbols"] == 1
     assert result["remainingSymbols"] == 0
 
@@ -154,10 +166,15 @@ def test_daily_update_persists_only_listed_otc_common_stocks(monkeypatch) -> Non
     async def latest_common_stock_symbols():
         return ["2330", "4939"]
 
-    async def calculate_symbol_indicators(symbol, latest_only=False):
-        assert symbol in {"2330", "4939"}
-        assert latest_only is True
-        return {"processed": 1}
+    async def calculate_latest_indicators_bulk(symbols, lookback_bars=61):
+        assert symbols == ["2330", "4939"]
+        assert lookback_bars == 61
+        return {
+            "processedSymbols": 2,
+            "failedSymbols": 0,
+            "indicatorRowsWritten": 2,
+            "failures": [],
+        }
 
     monkeypatch.setattr(pipeline.stock_database_service, "initialize", initialize)
     monkeypatch.setattr(
@@ -182,8 +199,8 @@ def test_daily_update_persists_only_listed_otc_common_stocks(monkeypatch) -> Non
     )
     monkeypatch.setattr(
         pipeline.stock_database_service,
-        "calculate_symbol_indicators",
-        calculate_symbol_indicators,
+        "calculate_latest_indicators_bulk",
+        calculate_latest_indicators_bulk,
     )
 
     result = asyncio.run(pipeline.update_official_daily(batch_size=10))

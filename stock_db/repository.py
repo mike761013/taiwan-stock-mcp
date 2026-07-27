@@ -181,6 +181,70 @@ class StockRepository:
             rows = await connection.fetch(query, *args)
         return [dict(row) for row in rows]
 
+    async def get_recent_daily_bars_for_symbols(
+        self,
+        symbols: Sequence[str],
+        limit_per_symbol: int = 61,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Fetch each symbol's latest bars with one database round trip.
+
+        Sixty-one bars are enough to reproduce the latest MA60, Bollinger,
+        volume-ratio, 20-day volatility and large-volume-low values.
+        """
+        unique_symbols = list(dict.fromkeys(
+            str(symbol).strip() for symbol in symbols if str(symbol).strip()
+        ))
+        if not unique_symbols:
+            return {}
+
+        limit_per_symbol = max(1, min(int(limit_per_symbol), 120))
+        query = """
+            WITH target_symbols AS (
+                SELECT UNNEST($1::varchar[]) AS symbol
+            )
+            SELECT
+                bars.symbol,
+                bars.trade_date,
+                bars.open,
+                bars.high,
+                bars.low,
+                bars.close,
+                bars.volume,
+                bars.turnover,
+                bars.change_percent,
+                bars.source
+            FROM target_symbols AS target
+            CROSS JOIN LATERAL (
+                SELECT
+                    daily.symbol,
+                    daily.trade_date,
+                    daily.open,
+                    daily.high,
+                    daily.low,
+                    daily.close,
+                    daily.volume,
+                    daily.turnover,
+                    daily.change_percent,
+                    daily.source
+                FROM daily_bars AS daily
+                WHERE daily.symbol = target.symbol
+                ORDER BY daily.trade_date DESC
+                LIMIT $2
+            ) AS bars
+            ORDER BY bars.symbol, bars.trade_date ASC
+        """
+        async with self.database.acquire() as connection:
+            rows = await connection.fetch(
+                query,
+                unique_symbols,
+                limit_per_symbol,
+            )
+
+        grouped = {symbol: [] for symbol in unique_symbols}
+        for row in rows:
+            grouped.setdefault(str(row["symbol"]), []).append(dict(row))
+        return grouped
+
     async def get_symbols_with_daily_bars(self) -> list[str]:
         """Return active symbols that currently have at least one daily bar."""
         async with self.database.acquire() as connection:

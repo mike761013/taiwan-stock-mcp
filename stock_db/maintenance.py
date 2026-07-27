@@ -12,7 +12,7 @@ from .radar import run_full_bullish_radar
 async def run_daily_maintenance(
     run_radar: bool = True,
     update_performance: bool = True,
-    batch_size: int = 50,
+    batch_size: int = 500,
     start_after: str | None = None,
     concurrency: int = 6,
     radar_limit_each: int = 20,
@@ -21,6 +21,8 @@ async def run_daily_maintenance(
     """Run one resumable daily-maintenance step.
 
     Repeatedly call the same tool with nextStartAfter until completed=true.
+    Daily indicators use a bulk latest-61-bars path, so 500-symbol batches do
+    not consume Fugle quota or open one database transaction per symbol.
     Radar and performance are executed only after all daily indicators finish.
     """
     try:
