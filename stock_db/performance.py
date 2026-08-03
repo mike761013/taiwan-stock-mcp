@@ -18,6 +18,8 @@ _HORIZONS = (
     ("d20", "return_d20"),
 )
 _ALLOWED_REPORT_VERSIONS = {"V12", "V11", "ALL"}
+DEFAULT_PERFORMANCE_UPDATE_LIMIT = 5000
+MAX_PERFORMANCE_UPDATE_LIMIT = 20000
 
 
 def _as_float(value: Any) -> float | None:
@@ -297,8 +299,18 @@ def build_weekly_report(
     }
 
 
-async def update_signal_performance(limit: int = 500) -> dict[str, Any]:
-    limit = max(1, min(limit, 5000))
+async def update_signal_performance(
+    limit: int = DEFAULT_PERFORMANCE_UPDATE_LIMIT,
+) -> dict[str, Any]:
+    """Update radar returns without starving newly recorded signals.
+
+    Pending D20 rows remain eligible for several weeks.  Ordering only by the
+    oldest run date caused those rows to consume the old 500-row limit every
+    day, so newer signals were never calculated.  Never-processed signals are
+    now selected first, followed by the stalest calculated rows, and the daily
+    default is large enough to cover the active 20-session window.
+    """
+    limit = max(1, min(int(limit), MAX_PERFORMANCE_UPDATE_LIMIT))
     async with stock_database.acquire() as connection:
         signals = await connection.fetch("""
             SELECT c.radar_run_id, c.symbol, r.run_date
@@ -307,7 +319,12 @@ async def update_signal_performance(limit: int = 500) -> dict[str, Any]:
             LEFT JOIN signal_performance p
               ON p.radar_run_id=c.radar_run_id AND p.symbol=c.symbol
             WHERE p.radar_run_id IS NULL OR p.return_d20 IS NULL
-            ORDER BY r.run_date ASC
+            ORDER BY
+              CASE WHEN p.radar_run_id IS NULL THEN 0 ELSE 1 END,
+              p.calculated_at ASC NULLS FIRST,
+              r.run_date DESC,
+              c.radar_run_id DESC,
+              c.symbol ASC
             LIMIT $1
         """, limit)
         processed = 0
@@ -362,7 +379,13 @@ async def update_signal_performance(limit: int = 500) -> dict[str, Any]:
                 round((max(highs) / entry - 1) * 100, 4) if highs else None,
                 round((min(lows) / entry - 1) * 100, 4) if lows else None)
             processed += 1
-    return {"ok": True, "processed": processed}
+    return {
+        "ok": True,
+        "processed": processed,
+        "selected": len(signals),
+        "limit": limit,
+        "newSignalsPrioritised": True,
+    }
 
 
 async def performance_summary(strategy: str | None = None) -> dict[str, Any]:

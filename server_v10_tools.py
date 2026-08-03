@@ -6,6 +6,7 @@ from typing import Any
 
 from stock_db.maintenance import run_daily_maintenance
 from stock_db.performance import (
+    DEFAULT_PERFORMANCE_UPDATE_LIMIT,
     performance_summary,
     update_signal_performance,
     weekly_performance_report,
@@ -230,8 +231,10 @@ def register_v10_tools(mcp: Any) -> None:
         )
 
     @mcp.tool()
-    async def update_radar_signal_performance(limit: int = 500) -> dict:
-        """更新雷達訊號 1/3/5/10/20 日績效。"""
+    async def update_radar_signal_performance(
+        limit: int = DEFAULT_PERFORMANCE_UPDATE_LIMIT,
+    ) -> dict:
+        """優先更新新訊號，再更新最久未計算的1/3/5/10/20日績效。"""
         return await update_signal_performance(limit)
 
     async def _maintenance(
@@ -441,4 +444,3 @@ def register_v10_tools(mcp: Any) -> None:
             "statisticsBefore": before_stats,
             "statisticsAfter": after_stats,
         }
-

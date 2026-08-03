@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from .performance import update_signal_performance
+from .performance import (
+    DEFAULT_PERFORMANCE_UPDATE_LIMIT,
+    update_signal_performance,
+)
 from .pipeline import update_official_daily
 from .radar import run_full_bullish_radar
 
@@ -72,7 +75,9 @@ async def run_daily_maintenance(
 
     if update_performance:
         try:
-            result["performance"] = await update_signal_performance()
+            result["performance"] = await update_signal_performance(
+                limit=DEFAULT_PERFORMANCE_UPDATE_LIMIT,
+            )
         except Exception as exc:
             result["ok"] = False
             result["performanceError"] = f"{type(exc).__name__}: {exc}"
