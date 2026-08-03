@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from stock_db.maintenance import run_daily_maintenance
-from stock_db.performance import performance_summary, update_signal_performance
+from stock_db.performance import (
+    performance_summary,
+    update_signal_performance,
+    weekly_performance_report,
+)
 from stock_db.pipeline import (
     backfill_all_market,
     backfill_symbols,
@@ -297,6 +301,20 @@ def register_v10_tools(mcp: Any) -> None:
     ) -> dict:
         """查詢雷達策略績效摘要。"""
         return await performance_summary(strategy)
+    @mcp.tool()
+    async def get_radar_weekly_report(
+        start_date: str | None = None,
+        end_date: str | None = None,
+        version: str = "V12",
+        top_n: int = 10,
+    ) -> dict:
+        """依日期與雷達版本產生週報，空值不計失敗且同日同股去重。"""
+        return await weekly_performance_report(
+            start_date=start_date,
+            end_date=end_date,
+            version=version,
+            top_n=top_n,
+        )
 
     @mcp.tool()
     async def validate_v12_release(
@@ -423,3 +441,4 @@ def register_v10_tools(mcp: Any) -> None:
             "statisticsBefore": before_stats,
             "statisticsAfter": after_stats,
         }
+
