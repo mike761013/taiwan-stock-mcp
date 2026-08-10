@@ -15,7 +15,7 @@ from .v12 import (
 )
 
 
-_STRATEGIES = {"early_stage", "breakout", "pullback"}
+_STRATEGIES = {"early_stage", "breakout", "pullback", "reversal_reclaim"}
 _COMMON_STOCK_FILTER = """
           UPPER(s.market) IN ('TWSE', 'TPEX', 'OTC')
           AND s.symbol ~ '^[1-9][0-9]{3}$'
@@ -37,6 +37,14 @@ async def screen_database_market(
     strategy = strategy.strip().lower()
     if strategy not in _STRATEGIES:
         raise ValueError(f"strategy must be one of {sorted(_STRATEGIES)}")
+    # reversal_reclaim is a V12 pattern and needs the richer V12 snapshot.
+    if strategy == "reversal_reclaim":
+        return await screen_database_market_v12(
+            strategy=strategy,
+            limit=limit,
+            minimum_score=minimum_score,
+            save_result=save_result,
+        )
     limit = max(1, min(limit, 200))
     minimum_score = max(0.0, min(float(minimum_score), 100.0))
 

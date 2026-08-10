@@ -68,6 +68,14 @@ class V12Config:
     reversal_max_upper_shadow_pct: float = 2.50
     reversal_min_score: float = 65.0
 
+    # Pullback V2: healthy retracement inside an established bullish structure.
+    pullback_max_distance_ma10_pct: float = 3.0
+    pullback_max_distance_ma20_pct: float = 4.0
+    pullback_max_below_ma20_pct: float = 2.0
+    pullback_max_volume_ratio20: float = 1.30
+    pullback_preferred_volume_ratio20: float = 0.80
+    pullback_min_stabilization_signals: int = 2
+
     # ATR and stop management.
     atr_period: int = 14
     atr_stop_multiple: float = 0.25
@@ -256,6 +264,11 @@ def reversal_reclaim_score(
     if close > ma10 > 0:
         score += 10
         reasons.append("站回MA10")
+    if ma5 >= ma10 > 0:
+        score += 5
+        reasons.append("MA5已追上或站上MA10")
+    elif ma5 > 0 and ma10 > 0:
+        warnings.append("MA5仍低於MA10，屬較早期反轉")
     if ma20 > 0 and ma20_distance <= config.reversal_max_distance_ma20_pct:
         score += 15
         reasons.append("貼近MA20，尚未明顯乖離")
@@ -305,6 +318,119 @@ def reversal_reclaim_score(
     return core_pass and score >= config.reversal_min_score, score, reasons, warnings
 
 
+
+def pullback_v2_score(
+    row: Mapping[str, Any], config: V12Config
+) -> tuple[bool, float, list[str], list[str], list[str]]:
+    """Score a healthy bullish pullback; return pass, score, reasons, warnings, signals."""
+    close = _number(row, "close")
+    low = _number(row, "low")
+    high = _number(row, "high")
+    prev_low = _number(row, "prev_low")
+    prev_high = _number(row, "prev_high")
+    ma5 = _number(row, "ma5")
+    ma10 = _number(row, "ma10")
+    ma20 = _number(row, "ma20")
+    ma60 = _number(row, "ma60")
+    volume_ratio = _number(row, "volume_ratio")
+    large_volume_low = _number(row, "large_volume_low")
+    close_position = _close_position(row)
+
+    reasons: list[str] = []
+    warnings: list[str] = []
+    signals: list[str] = []
+    score = 0.0
+
+    # Established bullish structure is mandatory. Reversal candidates belong
+    # to reversal_reclaim instead of being mixed into pullback.
+    trend_ok = ma20 >= ma60 > 0 and close >= ma60
+    if ma5 >= ma10 >= ma20 > 0:
+        score += 20
+        reasons.append("MA5>MA10>MA20，多頭短中期結構完整")
+    elif ma10 >= ma20 >= ma60 > 0:
+        score += 14
+        reasons.append("MA10>MA20>MA60，多頭結構仍在")
+    elif trend_ok:
+        score += 8
+        reasons.append("MA20守在MA60之上")
+    else:
+        warnings.append("未形成可接受的多頭回測結構")
+
+    dist10 = abs(_distance_pct(close, ma10)) if ma10 > 0 else 999.0
+    dist20 = _distance_pct(close, ma20) if ma20 > 0 else -999.0
+    near_support = False
+    if ma10 > 0 and dist10 <= config.pullback_max_distance_ma10_pct:
+        score += 18
+        near_support = True
+        reasons.append("回測MA10附近")
+    if (
+        ma20 > 0
+        and -config.pullback_max_below_ma20_pct
+        <= dist20
+        <= config.pullback_max_distance_ma20_pct
+    ):
+        score += 20
+        near_support = True
+        reasons.append("回測MA20支撐區")
+
+    # Healthy pullbacks should contract in volume. Unlike the old shared
+    # scoring model, low volume is a positive feature here.
+    if 0 < volume_ratio <= config.pullback_preferred_volume_ratio20:
+        score += 15
+        reasons.append("回檔量縮，賣壓收斂")
+    elif volume_ratio <= 1.0:
+        score += 9
+        reasons.append("回檔量能低於20日均量")
+    elif volume_ratio <= config.pullback_max_volume_ratio20:
+        score += 3
+    else:
+        score -= 12
+        warnings.append("回檔量能偏大")
+
+    structure_ok = True
+    if large_volume_low > 0:
+        if close >= large_volume_low:
+            score += 12
+            reasons.append("守住滾動大量低點")
+        else:
+            structure_ok = False
+            warnings.append("跌破滾動大量低點")
+    if close < ma60:
+        structure_ok = False
+        warnings.append("跌破MA60，已非健康多頭回測")
+
+    # Stabilisation: require at least two independent signs before promotion.
+    if prev_low > 0 and low >= prev_low:
+        signals.append("低點未再下移")
+        score += 6
+    if close_position >= 0.55:
+        signals.append("收盤位於當日振幅上半部")
+        score += 5
+    if ma5 > 0 and close >= ma5:
+        signals.append("收回MA5")
+        score += 6
+    if prev_high > 0 and close > prev_high:
+        signals.append("突破前一日高點")
+        score += 8
+    if close > _number(row, "open"):
+        signals.append("收紅K")
+        score += 4
+
+    stabilization_ok = len(signals) >= config.pullback_min_stabilization_signals
+    if not stabilization_ok:
+        warnings.append(
+            f"止穩訊號僅{len(signals)}項，低於{config.pullback_min_stabilization_signals}項"
+        )
+
+    core_pass = (
+        trend_ok
+        and near_support
+        and structure_ok
+        and stabilization_ok
+        and 0 < volume_ratio <= config.pullback_max_volume_ratio20
+    )
+    return core_pass, _clamp(score), reasons, warnings, signals
+
 def strategy_passes(row: Mapping[str, Any], strategy: str, config: V12Config) -> bool:
     close = _number(row, "close")
     ma5 = _number(row, "ma5")
@@ -326,12 +452,8 @@ def strategy_passes(row: Mapping[str, Any], strategy: str, config: V12Config) ->
             and volume_ratio >= 1.2
         )
     if strategy == "pullback":
-        return (
-            ma20 >= ma60 > 0
-            and close >= ma20
-            and ma5 > 0
-            and close <= ma5 * 1.03
-        )
+        passed, _, _, _, _ = pullback_v2_score(row, config)
+        return passed
     if strategy == "reversal_reclaim":
         passed, _, _, _ = reversal_reclaim_score(row, config)
         return passed
@@ -500,6 +622,11 @@ def build_v12_candidate(
 
     if strategy == "reversal_reclaim":
         _, raw_score, reasons, pattern_warnings = reversal_reclaim_score(row, config)
+    elif strategy == "pullback":
+        _, raw_score, reasons, pattern_warnings, stabilization_signals = pullback_v2_score(
+            row, config
+        )
+        reasons = reasons + [f"止穩：{signal}" for signal in stabilization_signals]
     else:
         raw_score = _v11_base_score(row)
         reasons = _strategy_reasons(row, strategy)
