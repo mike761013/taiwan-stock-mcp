@@ -1,4 +1,4 @@
-台股 V12.2 策略修正更新包
+台股 V12.2.1 策略與效能修正更新包
 日期：2026-08-10
 
 安裝方式
@@ -12,7 +12,7 @@
 
 建議 Commit summary
 ===================
-Fix V12 bottom reversal and pullback rules
+Fix V12 bottom reversal, pullback, and scan timeout
 
 本次修正
 ========
@@ -35,6 +35,10 @@ Fix V12 bottom reversal and pullback rules
    - 不再強制要求收紅K、突破前高或單日上漲。
 
 3. radar.py 新增20／60日高低區間及前兩日資料，供底部位置判斷。
+
+4. 部署後效能修正：
+   - 20／60日區間改為與前日資料共用單次分組聚合。
+   - 移除額外的全市場價格視窗掃描，避免screen_market_v12逾時。
 
 回歸驗證
 ========
