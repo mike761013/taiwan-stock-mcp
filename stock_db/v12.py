@@ -1,8 +1,8 @@
 """Pure V12 bullish-radar rules and trading-plan helpers.
 
-V12 keeps the existing V11 strategies, adds ``reversal_reclaim`` for earlier
-entries, applies V7-style liquidity gates, and separates signal quality from
-whether the current price is still tradable.
+V12 keeps the existing V11 strategies, uses ``reversal_reclaim`` for bottoming
+signals near recent lows, applies V7-style liquidity gates, and separates
+signal quality from whether the current price is still tradable.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ V12_STATUS_LABELS = {
     "BUY_ON_BREAKOUT": "突破時買進",
     "EARLY_ENTRY": "早期進場",
     "EARLY_ENTRY_SMALL_POSITION": "早期進場（小部位）",
+    "BOTTOM_REVERSAL_WATCH": "底部止跌觀察",
     "PRICE_CONFIRMATION_REQUIRED": "等待價格確認",
     "SMALL_POSITION_OR_SKIP": "小部位或略過",
     "WAIT_PULLBACK": "等待拉回",
@@ -59,20 +60,29 @@ class V12Config:
     high_price_max_risk_pct: float = 6.0
     high_price_limit: int = 5
 
-    # Early reversal/reclaim pattern.
+    # Bottom reversal/reclaim pattern. A candidate must still be close to its
+    # recent low; a one-day surge near MA20 is not sufficient by itself.
     reversal_min_change_pct: float = 5.0
-    reversal_min_close_position: float = 0.80
+    reversal_min_close_position: float = 0.55
     reversal_max_distance_ma20_pct: float = 2.0
     reversal_min_volume_ratio20: float = 0.40
     reversal_max_volume_ratio20: float = 2.50
     reversal_max_upper_shadow_pct: float = 2.50
     reversal_min_score: float = 65.0
+    reversal_max_range_position20: float = 0.45
+    reversal_max_distance_low20_pct: float = 15.0
+    reversal_max_distance_low20_atr: float = 2.50
+    reversal_min_drawdown20_pct: float = 10.0
+    reversal_min_stabilization_signals: int = 2
 
-    # Pullback V2: healthy retracement inside an established bullish structure.
+    # Pullback V3: strict bullish alignment while MA5 and the rolling
+    # high-volume low remain intact. A down close is allowed and rewarded when
+    # volume contracts.
+    pullback_max_distance_ma5_pct: float = 3.0
     pullback_max_distance_ma10_pct: float = 3.0
     pullback_max_distance_ma20_pct: float = 4.0
     pullback_max_below_ma20_pct: float = 2.0
-    pullback_max_volume_ratio20: float = 1.30
+    pullback_max_volume_ratio20: float = 1.50
     pullback_preferred_volume_ratio20: float = 0.80
     pullback_min_stabilization_signals: int = 2
 
@@ -176,6 +186,13 @@ def _upper_shadow_pct(row: Mapping[str, Any]) -> float:
     return max(0.0, high - max(open_price, close)) / close * 100 if close > 0 else 0.0
 
 
+def _lower_shadow_pct(row: Mapping[str, Any]) -> float:
+    low = _number(row, "low")
+    close = _number(row, "close")
+    open_price = _number(row, "open")
+    return max(0.0, min(open_price, close) - low) / close * 100 if close > 0 else 0.0
+
+
 def _distance_pct(value: float, reference: float, absolute: bool = False) -> float:
     if reference <= 0:
         return 0.0
@@ -194,6 +211,30 @@ def _bullish_engulfing(row: Mapping[str, Any]) -> bool:
         and min(current_open, current_close) <= min(previous_open, previous_close)
         and max(current_open, current_close) >= max(previous_open, previous_close)
     )
+
+
+def _bottom_context(row: Mapping[str, Any]) -> dict[str, float]:
+    """Return normalized recent-bottom measurements supplied by radar.py."""
+    close = _number(row, "close")
+    high20 = _number(row, "high20")
+    low20 = _number(row, "low20")
+    atr14 = _number(row, "atr14")
+    span20 = high20 - low20
+    distance_from_low = max(0.0, close - low20)
+    return {
+        "high20": high20,
+        "low20": low20,
+        "rangePosition20": distance_from_low / span20 if span20 > 0 else 999.0,
+        "distanceFromLow20Percent": (
+            distance_from_low / low20 * 100 if low20 > 0 else 999.0
+        ),
+        "distanceFromLow20ATR": (
+            distance_from_low / atr14 if atr14 > 0 else 999.0
+        ),
+        "drawdownFromHigh20Percent": (
+            max(0.0, (high20 - close) / high20 * 100) if high20 > 0 else 0.0
+        ),
+    }
 
 
 def liquidity_result(row: Mapping[str, Any], config: V12Config) -> dict[str, Any]:
@@ -239,80 +280,125 @@ def _v11_base_score(row: Mapping[str, Any]) -> float:
 def reversal_reclaim_score(
     row: Mapping[str, Any], config: V12Config
 ) -> tuple[bool, float, list[str], list[str]]:
+    """Score a bottoming setup instead of rewarding a one-day price spike."""
     close = _number(row, "close")
     open_price = _number(row, "open")
+    low = _number(row, "low")
     prev_high = _number(row, "prev_high")
+    prev_low = _number(row, "prev_low")
+    prev_close = _number(row, "prev_close")
+    prev2_low = _number(row, "prev2_low")
     ma5 = _number(row, "ma5")
     ma10 = _number(row, "ma10")
     ma20 = _number(row, "ma20")
     volume_ratio = _number(row, "volume_ratio")
+    large_volume_low = _number(row, "large_volume_low")
     close_position = _close_position(row)
     change_pct = _daily_change_pct(row)
     upper_shadow = _upper_shadow_pct(row)
+    lower_shadow = _lower_shadow_pct(row)
     ma20_distance = _distance_pct(close, ma20, absolute=True)
+    bottom = _bottom_context(row)
 
     score = 0.0
     reasons: list[str] = []
     warnings: list[str] = []
+    stabilization_signals: list[str] = []
+
+    near_bottom = (
+        bottom["high20"] > bottom["low20"] > 0
+        and 0.0 <= bottom["rangePosition20"] <= config.reversal_max_range_position20
+        and bottom["distanceFromLow20Percent"]
+        <= config.reversal_max_distance_low20_pct
+        and bottom["distanceFromLow20ATR"]
+        <= config.reversal_max_distance_low20_atr
+        and bottom["drawdownFromHigh20Percent"]
+        >= config.reversal_min_drawdown20_pct
+    )
+    if near_bottom:
+        score += 30
+        reasons.append(
+            f"接近20日底部：距低點{bottom['distanceFromLow20Percent']:.1f}%"
+        )
+        reasons.append(
+            f"仍較20日高點回落{bottom['drawdownFromHigh20Percent']:.1f}%"
+        )
+    else:
+        warnings.append("已不在設定的20日底部區，排除單日急彈假訊號")
+
+    if prev_low > 0 and low >= prev_low:
+        stabilization_signals.append("低點未再下移")
+        score += 12
+    elif prev2_low > 0 and low >= prev2_low:
+        stabilization_signals.append("未再跌破前兩日低點")
+        score += 8
+    if prev_close > 0 and close > prev_close:
+        stabilization_signals.append("收盤高於前一日")
+        score += 10
+    if close_position >= config.reversal_min_close_position:
+        stabilization_signals.append("收盤位於當日振幅上半部")
+        score += 10
+    if close >= ma5 > 0:
+        stabilization_signals.append("站回MA5")
+        score += 10
+    if _bullish_engulfing(row):
+        stabilization_signals.append("多方吞噬前一日黑K")
+        score += 10
+    if lower_shadow >= 1.0:
+        stabilization_signals.append("出現承接下影線")
+        score += 6
 
     if close > prev_high > 0:
-        score += 15
+        score += 6
         reasons.append("收盤突破前一日高點")
-    if close > ma5 > 0:
-        score += 10
-        reasons.append("站回MA5")
     if close > ma10 > 0:
-        score += 10
+        score += 5
         reasons.append("站回MA10")
-    if ma5 >= ma10 > 0:
-        score += 5
-        reasons.append("MA5已追上或站上MA10")
-    elif ma5 > 0 and ma10 > 0:
-        warnings.append("MA5仍低於MA10，屬較早期反轉")
     if ma20 > 0 and ma20_distance <= config.reversal_max_distance_ma20_pct:
-        score += 15
-        reasons.append("貼近MA20，尚未明顯乖離")
-    if close_position >= config.reversal_min_close_position:
-        score += 15
-        reasons.append("收盤接近當日最高")
-    if change_pct >= config.reversal_min_change_pct:
-        score += 10
-        reasons.append("單日強勢反轉")
-    if config.reversal_min_volume_ratio20 <= volume_ratio < 1.0:
-        score += 10
-        reasons.append("低量強漲，疑似供給收縮")
-    elif 1.0 <= volume_ratio <= config.reversal_max_volume_ratio20:
-        score += 7
-        reasons.append("量能溫和放大")
-    if _bullish_engulfing(row):
-        score += 10
-        reasons.append("多方吞噬前一日黑K")
-    if close > open_price:
         score += 5
+        reasons.append("接近MA20壓力區")
+    if change_pct >= config.reversal_min_change_pct:
+        score += 4
+        reasons.append("單日反彈達反轉觀察門檻")
+    if config.reversal_min_volume_ratio20 <= volume_ratio < 1.0:
+        score += 8
+        reasons.append("量能收斂，賣壓減輕")
+    elif 1.0 <= volume_ratio <= config.reversal_max_volume_ratio20:
+        score += 5
+        reasons.append("量能溫和放大")
+    if close > open_price:
+        score += 3
+
+    reasons.extend(f"止跌：{signal}" for signal in stabilization_signals)
 
     if upper_shadow > config.reversal_max_upper_shadow_pct:
-        score -= 15
+        score -= 10
         warnings.append("上影線偏長")
-    if ma20_distance > 5.0:
-        score -= 15
-        warnings.append("距MA20過遠")
     if volume_ratio > 4.0:
         score -= 10
         warnings.append("爆量過熱")
+    if large_volume_low > 0 and close < large_volume_low:
+        score -= 8
+        warnings.append("尚未收復滾動大量低點")
+    if change_pct >= config.strong_day_change_pct:
+        warnings.append("單日漲幅過大，只列觀察、不追價")
 
-    core_pass = all(
-        (
-            close > prev_high > 0,
-            close > ma5 > 0,
-            close > ma10 > 0,
-            ma20 > 0 and ma20_distance <= config.reversal_max_distance_ma20_pct,
-            close_position >= config.reversal_min_close_position,
-            change_pct >= config.reversal_min_change_pct,
-            config.reversal_min_volume_ratio20
-            <= volume_ratio
-            <= config.reversal_max_volume_ratio20,
-            upper_shadow <= config.reversal_max_upper_shadow_pct,
-        )
+    stabilization_ok = (
+        len(stabilization_signals) >= config.reversal_min_stabilization_signals
+    )
+    recovery_ok = (
+        close > prev_close > 0
+        or close >= ma5 > 0
+        or _bullish_engulfing(row)
+    )
+    core_pass = (
+        near_bottom
+        and stabilization_ok
+        and recovery_ok
+        and close_position >= config.reversal_min_close_position
+        and config.reversal_min_volume_ratio20
+        <= volume_ratio
+        <= config.reversal_max_volume_ratio20
     )
     score = _clamp(score)
     return core_pass and score >= config.reversal_min_score, score, reasons, warnings
@@ -325,7 +411,6 @@ def pullback_v2_score(
     """Score a healthy bullish pullback; return pass, score, reasons, warnings, signals."""
     close = _number(row, "close")
     low = _number(row, "low")
-    high = _number(row, "high")
     prev_low = _number(row, "prev_low")
     prev_high = _number(row, "prev_high")
     ma5 = _number(row, "ma5")
@@ -341,63 +426,63 @@ def pullback_v2_score(
     signals: list[str] = []
     score = 0.0
 
-    # Established bullish structure is mandatory. Reversal candidates belong
-    # to reversal_reclaim instead of being mixed into pullback.
-    trend_ok = ma20 >= ma60 > 0 and close >= ma60
-    if ma5 >= ma10 >= ma20 > 0:
-        score += 20
-        reasons.append("MA5>MA10>MA20，多頭短中期結構完整")
-    elif ma10 >= ma20 >= ma60 > 0:
-        score += 14
-        reasons.append("MA10>MA20>MA60，多頭結構仍在")
-    elif trend_ok:
-        score += 8
-        reasons.append("MA20守在MA60之上")
+    # The user-defined pullback is deliberately strict: the entire moving-
+    # average stack must be bullish and both MA5 and the rolling high-volume
+    # low must remain intact on a closing basis. The candle may close down.
+    trend_ok = ma5 > ma10 > ma20 > ma60 > 0
+    if trend_ok:
+        score += 25
+        reasons.append("MA5>MA10>MA20>MA60，完整多頭排列")
     else:
-        warnings.append("未形成可接受的多頭回測結構")
+        warnings.append("均線未形成MA5>MA10>MA20>MA60完整多頭排列")
 
-    dist10 = abs(_distance_pct(close, ma10)) if ma10 > 0 else 999.0
-    dist20 = _distance_pct(close, ma20) if ma20 > 0 else -999.0
-    near_support = False
-    if ma10 > 0 and dist10 <= config.pullback_max_distance_ma10_pct:
-        score += 18
-        near_support = True
-        reasons.append("回測MA10附近")
-    if (
-        ma20 > 0
-        and -config.pullback_max_below_ma20_pct
-        <= dist20
-        <= config.pullback_max_distance_ma20_pct
-    ):
+    dist5 = _distance_pct(close, ma5) if ma5 > 0 else 999.0
+    ma5_hold = ma5 > 0 and close >= ma5
+    near_ma5 = ma5_hold and dist5 <= config.pullback_max_distance_ma5_pct
+    if ma5_hold:
         score += 20
-        near_support = True
-        reasons.append("回測MA20支撐區")
+        reasons.append("收盤守住MA5")
+    else:
+        warnings.append("收盤跌破MA5")
+    if near_ma5:
+        score += 10 if dist5 > 1.0 else 15
+        reasons.append(f"收盤距MA5僅{dist5:.1f}%")
+    elif ma5_hold:
+        warnings.append("雖守住MA5，但距離已超出健康回檔區")
 
     # Healthy pullbacks should contract in volume. Unlike the old shared
     # scoring model, low volume is a positive feature here.
     if 0 < volume_ratio <= config.pullback_preferred_volume_ratio20:
-        score += 15
-        reasons.append("回檔量縮，賣壓收斂")
+        score += 10
+        reasons.append("量縮，賣壓收斂")
     elif volume_ratio <= 1.0:
-        score += 9
-        reasons.append("回檔量能低於20日均量")
+        score += 7
+        reasons.append("量能低於20日均量")
     elif volume_ratio <= config.pullback_max_volume_ratio20:
-        score += 3
+        score += 2
+        warnings.append("量能略高，仍需觀察賣壓")
     else:
         score -= 12
-        warnings.append("回檔量能偏大")
+        warnings.append("量能過大，不屬健康回檔")
 
-    structure_ok = True
-    if large_volume_low > 0:
-        if close >= large_volume_low:
-            score += 12
-            reasons.append("守住滾動大量低點")
-        else:
-            structure_ok = False
-            warnings.append("跌破滾動大量低點")
-    if close < ma60:
-        structure_ok = False
-        warnings.append("跌破MA60，已非健康多頭回測")
+    massive_low_hold = large_volume_low > 0 and close >= large_volume_low
+    if massive_low_hold:
+        score += 15
+        reasons.append("收盤守住滾動大量低點")
+    elif large_volume_low <= 0:
+        warnings.append("缺少滾動大量低點，無法確認支撐")
+    else:
+        warnings.append("收盤跌破滾動大量低點")
+
+    change_pct = _daily_change_pct(row)
+    if change_pct < 0:
+        score += 15
+        reasons.append("收跌但MA5與大量低點支撐未破")
+        if volume_ratio <= 1.0:
+            score += 5
+            reasons.append("收跌量縮，屬健康整理")
+    else:
+        score += 4
 
     # Stabilisation: require at least two independent signs before promotion.
     if prev_low > 0 and low >= prev_low:
@@ -406,9 +491,12 @@ def pullback_v2_score(
     if close_position >= 0.55:
         signals.append("收盤位於當日振幅上半部")
         score += 5
-    if ma5 > 0 and close >= ma5:
-        signals.append("收回MA5")
-        score += 6
+    if low >= ma5 > 0:
+        signals.append("盤中與收盤都守住MA5")
+        score += 5
+    elif ma5_hold:
+        signals.append("盤中跌破MA5後收回")
+        score += 3
     if prev_high > 0 and close > prev_high:
         signals.append("突破前一日高點")
         score += 8
@@ -416,17 +504,10 @@ def pullback_v2_score(
         signals.append("收紅K")
         score += 4
 
-    stabilization_ok = len(signals) >= config.pullback_min_stabilization_signals
-    if not stabilization_ok:
-        warnings.append(
-            f"止穩訊號僅{len(signals)}項，低於{config.pullback_min_stabilization_signals}項"
-        )
-
     core_pass = (
         trend_ok
-        and near_support
-        and structure_ok
-        and stabilization_ok
+        and near_ma5
+        and massive_low_hold
         and 0 < volume_ratio <= config.pullback_max_volume_ratio20
     )
     return core_pass, _clamp(score), reasons, warnings, signals
@@ -515,13 +596,11 @@ def trading_adjustment(
             adjustment -= 8
             warnings.append("極端爆量，短線過熱")
 
-    # A strong reversal near MA20 with restrained volume should not be punished.
-    if (
-        change_pct >= config.strong_day_change_pct
-        and distance_ma20 >= 5.0
-    ):
+    # A near-limit-up day is still useful as a signal, but it must never be
+    # promoted as an immediate early entry.
+    if change_pct >= config.strong_day_change_pct:
         adjustment -= 8
-        warnings.append("單日漲幅與乖離同時偏大")
+        warnings.append("單日漲幅過大，等待回測而非追價")
 
     if close < open_price and close_position <= 0.25:
         adjustment -= 15
@@ -535,6 +614,7 @@ def build_trading_plan(
 ) -> dict[str, Any]:
     close = _number(row, "close")
     low = _number(row, "low") or close
+    ma5 = _number(row, "ma5")
     ma20 = _number(row, "ma20")
     atr14 = _number(row, "atr14")
     prev_high = _number(row, "prev_high")
@@ -554,7 +634,11 @@ def build_trading_plan(
         entry_high = trigger + atr14 * 0.10
     elif strategy == "reversal_reclaim":
         entry_low = max(signal_defense, close - atr14 * config.entry_low_atr_multiple)
-        entry_high = max(close, ma20 if ma20 > 0 else close)
+        entry_high = close + atr14 * 0.10
+    elif strategy == "pullback":
+        reference = ma5 if ma5 > 0 else close
+        entry_low = max(signal_defense, reference - atr14 * 0.20)
+        entry_high = min(close, reference + atr14 * 0.20)
     else:
         reference = ma20 if ma20 > 0 else close
         entry_low = max(signal_defense, reference - atr14 * 0.20)
@@ -571,18 +655,25 @@ def build_trading_plan(
     # Price tradability takes precedence over strategy/risk labels. Previously
     # pullback candidates could be reported as BUY_ZONE even when the signal
     # price was already above maximumBuyPrice.
-    if close >= no_chase:
+    change_pct = _daily_change_pct(row)
+    if strategy == "reversal_reclaim" and change_pct >= config.strong_day_change_pct:
+        status = "DO_NOT_CHASE"
+        initial_position = 0
+    elif close >= no_chase:
         status = "DO_NOT_CHASE"
         initial_position = 0
     elif close > maximum_buy:
         status = "WAIT_PULLBACK"
         initial_position = 0
     elif risk_pct > config.max_entry_to_hard_stop_risk_pct:
-        status = "EARLY_ENTRY_SMALL_POSITION" if strategy == "reversal_reclaim" else "SMALL_POSITION_OR_SKIP"
-        initial_position = 30
+        status = "BOTTOM_REVERSAL_WATCH" if strategy == "reversal_reclaim" else "SMALL_POSITION_OR_SKIP"
+        initial_position = 0 if strategy == "reversal_reclaim" else 30
+    elif strategy == "reversal_reclaim" and close < ma20:
+        status = "BOTTOM_REVERSAL_WATCH"
+        initial_position = 0
     elif strategy == "reversal_reclaim":
-        status = "EARLY_ENTRY"
-        initial_position = 40
+        status = "EARLY_ENTRY_SMALL_POSITION"
+        initial_position = 30
     elif strategy == "breakout":
         status = "BUY_ON_BREAKOUT"
         initial_position = 40
@@ -643,8 +734,16 @@ def build_v12_candidate(
     elif adjustment <= -10 and action_code not in {
         "SMALL_POSITION_OR_SKIP",
         "EARLY_ENTRY_SMALL_POSITION",
+        "BOTTOM_REVERSAL_WATCH",
     }:
         action_code = "WAIT_PULLBACK"
+
+    if action_code != plan["statusCode"]:
+        plan = dict(plan)
+        plan["statusCode"] = action_code
+        plan["status"] = v12_status_label(action_code)
+        if action_code in {"DO_NOT_CHASE", "WAIT_PULLBACK"}:
+            plan["initialPositionPercent"] = 0
 
     item = dict(row)
     # The database column historically stores the official daily price change
@@ -676,8 +775,15 @@ def build_v12_candidate(
             "dailyChangePercent": round(daily_change_percent, 2),
             "closePosition": round(_close_position(row), 4),
             "upperShadowPercent": round(_upper_shadow_pct(row), 2),
+            "lowerShadowPercent": round(_lower_shadow_pct(row), 2),
         }
     )
+    if strategy == "reversal_reclaim":
+        bottom = _bottom_context(row)
+        item["bottomContext"] = {
+            key: round(value, 4) if isinstance(value, float) else value
+            for key, value in bottom.items()
+        }
     return item
 
 

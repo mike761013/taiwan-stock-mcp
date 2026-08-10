@@ -210,7 +210,7 @@ async def run_full_bullish_radar(
 
 
 # ---------------------------------------------------------------------------
-# V12: V7 liquidity + V11 strategies + early reversal + ATR trading plan
+# V12: V7 liquidity + V11 strategies + bottom reversal + ATR trading plan
 # ---------------------------------------------------------------------------
 
 _V12_SNAPSHOT_QUERY = f"""
@@ -242,6 +242,26 @@ _V12_SNAPSHOT_QUERY = f"""
                ) AS reverse_rank
         FROM recent_bars b
     ),
+    price_ranges AS (
+        SELECT symbol, trade_date,
+               MAX(high) OVER (
+                   PARTITION BY symbol ORDER BY trade_date
+                   ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+               ) AS high20,
+               MIN(low) OVER (
+                   PARTITION BY symbol ORDER BY trade_date
+                   ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+               ) AS low20,
+               MAX(high) OVER (
+                   PARTITION BY symbol ORDER BY trade_date
+                   ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+               ) AS high60,
+               MIN(low) OVER (
+                   PARTITION BY symbol ORDER BY trade_date
+                   ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+               ) AS low60
+        FROM bar_windows
+    ),
     true_ranges AS (
         SELECT symbol, trade_date,
                GREATEST(
@@ -268,13 +288,16 @@ _V12_SNAPSHOT_QUERY = f"""
     ),
     previous_bars AS (
         SELECT symbol,
-               open AS prev_open,
-               high AS prev_high,
-               low AS prev_low,
-               close AS prev_close,
-               volume AS prev_volume
+               MAX(open) FILTER (WHERE reverse_rank = 2) AS prev_open,
+               MAX(high) FILTER (WHERE reverse_rank = 2) AS prev_high,
+               MAX(low) FILTER (WHERE reverse_rank = 2) AS prev_low,
+               MAX(close) FILTER (WHERE reverse_rank = 2) AS prev_close,
+               MAX(volume) FILTER (WHERE reverse_rank = 2) AS prev_volume,
+               MAX(low) FILTER (WHERE reverse_rank = 3) AS prev2_low,
+               MAX(close) FILTER (WHERE reverse_rank = 3) AS prev2_close
         FROM bar_windows
-        WHERE reverse_rank = 2
+        WHERE reverse_rank IN (2, 3)
+        GROUP BY symbol
     )
     SELECT b.symbol, s.name, s.market, b.trade_date,
            b.open, b.high, b.low, b.close, b.volume, b.turnover,
@@ -284,6 +307,8 @@ _V12_SNAPSHOT_QUERY = f"""
            i.bollinger_mid, i.bollinger_upper, i.bollinger_lower,
            i.volatility_20, i.large_volume_low, i.technical_score,
            p.prev_open, p.prev_high, p.prev_low, p.prev_close, p.prev_volume,
+           p.prev2_low, p.prev2_close,
+           r.high20, r.low20, r.high60, r.low60,
            a.atr14
     FROM daily_indicators i
     JOIN daily_bars b ON b.symbol = i.symbol AND b.trade_date = i.trade_date
@@ -292,6 +317,7 @@ _V12_SNAPSHOT_QUERY = f"""
       ON d.market_key = UPPER(s.market)
      AND d.trade_date = i.trade_date
     LEFT JOIN previous_bars p ON p.symbol = b.symbol
+    LEFT JOIN price_ranges r ON r.symbol = b.symbol AND r.trade_date = b.trade_date
     LEFT JOIN atr_history a ON a.symbol = b.symbol AND a.trade_date = b.trade_date
     WHERE s.is_active = TRUE
       AND {_COMMON_STOCK_FILTER}
