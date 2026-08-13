@@ -199,7 +199,7 @@ def register_v10_tools(mcp: Any) -> None:
         minimum_score: float = 45,
         save_result: bool = True,
     ) -> dict:
-        """執行V12四種看漲策略，輸出買進區、最高買價、ATR防守與不追價訊號。"""
+        """執行V12四種看漲策略，輸出激進低接、確認買點、分批比例與失敗條件。"""
         return await run_full_bullish_radar_v12_core(
             limit_each=limit_each,
             minimum_score=minimum_score,

@@ -35,12 +35,15 @@ def asia_electronic_2026_07_15():
         "volume_ratio": 0.57,
         "bollinger_upper": 68.0,
         "large_volume_low": 53.2,
+        "high20": 72.0,
+        "low20": 53.2,
+        "prev2_low": 52.8,
         "technical_score": 70,
         "atr14": 4.34,
     }
 
 
-def test_reversal_reclaim_finds_asia_electronic_one_day_earlier():
+def test_reversal_reclaim_records_asia_electronic_without_chasing():
     row = asia_electronic_2026_07_15()
     row["change_percent"] = 5.5  # Official feeds store the price change amount.
     candidate = build_v12_candidate(
@@ -51,8 +54,8 @@ def test_reversal_reclaim_finds_asia_electronic_one_day_earlier():
     assert candidate is not None
     assert candidate["strategy"] == "reversal_reclaim"
     assert candidate["total_score"] >= 80
-    assert candidate["action"] == "早期進場（小部位）"
-    assert candidate["actionCode"] == "EARLY_ENTRY_SMALL_POSITION"
+    assert candidate["action"] == "不追價"
+    assert candidate["actionCode"] == "DO_NOT_CHASE"
     assert candidate["tradingPlan"]["signalPrice"] == 60.8
     assert candidate["tradingPlan"]["signalDefensePrice"] == 56.2
     assert candidate["tradingPlan"]["hardStopPrice"] < 56.2
@@ -157,6 +160,7 @@ def test_pullback_plan_normalises_reversed_entry_bounds_and_waits_above_maximum(
         "trade_date": "2026-07-22",
         "low": 41.55,
         "close": 41.9,
+        "ma5": 41.25,
         "ma20": 41.25,
         "atr14": 1.1428571428571429,
     }
@@ -175,6 +179,7 @@ def test_pullback_plan_keeps_buy_zone_when_signal_is_inside_normalised_range():
         "trade_date": "2026-07-22",
         "low": 104.0,
         "close": 104.0,
+        "ma5": 101.745,
         "ma20": 101.745,
         "atr14": 3.3142857142857143,
     }
@@ -184,6 +189,48 @@ def test_pullback_plan_keeps_buy_zone_when_signal_is_inside_normalised_range():
     assert plan["maximumBuyPrice"] == 104.5
     assert plan["status"] == "買進區"
     assert plan["statusCode"] == "BUY_ZONE"
+
+
+def test_dual_entry_plan_exposes_aggressive_confirmed_split_and_failure():
+    row = {
+        "trade_date": "2026-08-12",
+        "open": 85.4,
+        "high": 85.4,
+        "low": 82.9,
+        "close": 83.8,
+        "prev_high": 86.5,
+        "ma5": 85.98,
+        "ma20": 77.42,
+        "large_volume_low": 78.0,
+        "atr14": 3.5,
+    }
+    plan = build_trading_plan(row, "pullback", V12Config())
+
+    assert plan["aggressiveEntry"]["entryLow"] == 82.9
+    assert plan["aggressiveEntry"]["entryHigh"] == 83.2
+    assert plan["aggressiveEntry"]["positionPercent"] == 40
+    assert plan["confirmationEntry"]["price"] == 85.3
+    assert plan["confirmationEntry"]["positionPercent"] == 60
+    assert plan["confirmationEntry"]["availableBelowNoChase"] is True
+    assert plan["positionPlan"] == {
+        "aggressiveEntryPercent": 40,
+        "confirmationEntryPercent": 60,
+        "maximumPlannedPercent": 100,
+        "description": "激進低接先買40%，確認後再買60%",
+    }
+    assert plan["failureCondition"]["price"] == 82.9
+    assert plan["failureCondition"]["confirmation"] == "收盤確認"
+
+
+def test_reversal_watch_disables_aggressive_entry_until_confirmation():
+    row = asia_electronic_2026_07_15()
+    row.update({"close": 58.0, "prev_close": 57.0, "ma20": 61.0})
+    plan = build_trading_plan(row, "reversal_reclaim", V12Config())
+
+    assert plan["statusCode"] == "BOTTOM_REVERSAL_WATCH"
+    assert plan["aggressiveEntry"]["positionPercent"] == 0
+    assert plan["confirmationEntry"]["positionPercent"] == 30
+    assert plan["positionPlan"]["maximumPlannedPercent"] == 30
 
 
 def test_semantic_validator_rejects_invalid_v12_output():

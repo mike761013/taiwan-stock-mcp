@@ -97,6 +97,8 @@ class V12Config:
     entry_low_atr_multiple: float = 0.30
     max_buy_atr_multiple: float = 0.20
     no_chase_atr_multiple: float = 0.60
+    aggressive_entry_atr_multiple: float = 0.10
+    confirmation_ma5_atr_discount: float = 0.20
 
     # Trading-quality penalties.
     ma20_distance_warning_pct: float = 8.0
@@ -609,6 +611,153 @@ def trading_adjustment(
     return adjustment, warnings
 
 
+def _dual_entry_position_split(
+    strategy: str,
+    status: str,
+) -> tuple[int, int]:
+    """Return incremental position sizes for aggressive and confirmed entries."""
+    if status == "BOTTOM_REVERSAL_WATCH":
+        return 0, 30
+    if status == "SMALL_POSITION_OR_SKIP":
+        return 20, 30
+    if strategy in {"early_stage", "reversal_reclaim"}:
+        return 30, 70
+    return 40, 60
+
+
+def _failure_reference_reasons(
+    row: Mapping[str, Any],
+    signal_defense: float,
+    atr14: float,
+) -> list[str]:
+    """Explain which nearby structures make the fixed failure price meaningful."""
+    reasons = ["收盤跌破訊號K低點，代表本次低接／收復結構失效"]
+    tolerance = max(atr14 * 0.25, signal_defense * 0.005)
+    nearby_references = (
+        ("前波壓力轉支撐失敗", _number(row, "prev_high")),
+        ("滾動大量低點失守", _number(row, "large_volume_low")),
+        ("MA20支撐失守", _number(row, "ma20")),
+    )
+    for label, value in nearby_references:
+        if value > 0 and abs(value - signal_defense) <= tolerance:
+            reasons.append(label)
+    return reasons
+
+
+def _build_dual_entry_plan(
+    row: Mapping[str, Any],
+    strategy: str,
+    config: V12Config,
+    *,
+    status: str,
+    signal_defense: float,
+    hard_stop: float,
+    maximum_buy: float,
+    no_chase: float,
+    atr14: float,
+    breakout_trigger: float,
+) -> dict[str, Any]:
+    """Build an explicit low-catch + confirmation plan without changing legacy fields."""
+    close = _number(row, "close")
+    open_price = _number(row, "open") or close
+    ma5 = _number(row, "ma5")
+    ma20 = _number(row, "ma20")
+
+    aggressive_low = signal_defense
+    aggressive_high = min(
+        maximum_buy,
+        signal_defense + atr14 * config.aggressive_entry_atr_multiple,
+    )
+    aggressive_low, aggressive_high = sorted((aggressive_low, aggressive_high))
+
+    body_midpoint = (open_price + close) / 2.0
+    discounted_ma5 = (
+        ma5 - atr14 * config.confirmation_ma5_atr_discount
+        if ma5 > 0
+        else 0.0
+    )
+    if strategy == "breakout":
+        confirmation_candidates = (breakout_trigger, body_midpoint)
+        confirmation_detail = "突破價回測不破或跌破後快速收復，且量能不低於20日均量"
+    elif strategy == "reversal_reclaim":
+        confirmation_candidates = (body_midpoint, ma5, ma20)
+        confirmation_detail = "止跌低點不破，並收盤站回MA20"
+    elif strategy == "pullback":
+        confirmation_candidates = (body_midpoint, discounted_ma5)
+        confirmation_detail = "低點不再下移，並收復MA5附近或訊號K實體中值"
+    else:
+        confirmation_candidates = (body_midpoint, discounted_ma5, ma20)
+        confirmation_detail = "短均線維持上彎，並收復訊號K實體中值"
+
+    confirmation_price = max(
+        aggressive_high,
+        *(value for value in confirmation_candidates if value > 0),
+    )
+    confirmation_available = confirmation_price <= no_chase
+    aggressive_percent, confirmation_percent = _dual_entry_position_split(
+        strategy,
+        status,
+    )
+
+    rounded_aggressive_low = round_tw_price(aggressive_low)
+    rounded_aggressive_high = round_tw_price(aggressive_high)
+    rounded_confirmation = round_tw_price(confirmation_price)
+    rounded_defense = round_tw_price(signal_defense)
+    rounded_hard_stop = round_tw_price(hard_stop)
+    rounded_no_chase = round_tw_price(no_chase)
+
+    return {
+        "aggressiveEntry": {
+            "label": "激進低接點",
+            "entryLow": rounded_aggressive_low,
+            "entryHigh": rounded_aggressive_high,
+            "positionPercent": aggressive_percent,
+            "conditions": [
+                f"價格進入{rounded_aggressive_low}～{rounded_aggressive_high}",
+                f"{rounded_defense}未被收盤有效跌破",
+                "至少出現低點不再下移、下影線或外盤回升其中一項承接訊號",
+            ],
+            "cancelWhen": f"收盤跌破{rounded_defense}",
+        },
+        "confirmationEntry": {
+            "label": "確認買點",
+            "price": rounded_confirmation,
+            "positionPercent": confirmation_percent,
+            "availableBelowNoChase": confirmation_available,
+            "conditions": [
+                f"站回{rounded_confirmation}且維持在盤中均價之上",
+                confirmation_detail,
+                f"成交價不得高於不追價線{rounded_no_chase}",
+            ],
+            "actionWhenUnavailable": (
+                None
+                if confirmation_available
+                else "確認價已高於不追價線，不追價；等待重新回測"
+            ),
+        },
+        "positionPlan": {
+            "aggressiveEntryPercent": aggressive_percent,
+            "confirmationEntryPercent": confirmation_percent,
+            "maximumPlannedPercent": aggressive_percent + confirmation_percent,
+            "description": (
+                f"激進低接先買{aggressive_percent}%，確認後再買"
+                f"{confirmation_percent}%"
+            ),
+        },
+        "failureCondition": {
+            "price": rounded_defense,
+            "confirmation": "收盤確認",
+            "action": "取消尚未成交的分批；已持有部位退出",
+            "reasons": _failure_reference_reasons(
+                row,
+                signal_defense,
+                atr14,
+            ),
+            "legacyEmergencyHardStopPrice": rounded_hard_stop,
+        },
+    }
+
+
 def build_trading_plan(
     row: Mapping[str, Any], strategy: str, config: V12Config
 ) -> dict[str, Any]:
@@ -619,6 +768,7 @@ def build_trading_plan(
     atr14 = _number(row, "atr14")
     prev_high = _number(row, "prev_high")
     bollinger_upper = _number(row, "bollinger_upper")
+    breakout_trigger = 0.0
 
     signal_defense = low
     stop_buffer = max(
@@ -630,6 +780,7 @@ def build_trading_plan(
     if strategy == "breakout":
         trigger_candidates = [value for value in (prev_high, bollinger_upper) if value > 0]
         trigger = max(trigger_candidates) if trigger_candidates else close
+        breakout_trigger = trigger
         entry_low = max(signal_defense, trigger - atr14 * 0.20)
         entry_high = trigger + atr14 * 0.10
     elif strategy == "reversal_reclaim":
@@ -684,6 +835,19 @@ def build_trading_plan(
         status = "PRICE_CONFIRMATION_REQUIRED"
         initial_position = 30
 
+    dual_entry_plan = _build_dual_entry_plan(
+        row,
+        strategy,
+        config,
+        status=status,
+        signal_defense=signal_defense,
+        hard_stop=hard_stop,
+        maximum_buy=maximum_buy,
+        no_chase=no_chase,
+        atr14=atr14,
+        breakout_trigger=breakout_trigger,
+    )
+
     return {
         "status": v12_status_label(status),
         "statusCode": status,
@@ -701,6 +865,7 @@ def build_trading_plan(
         "softBreakAction": f"減碼{int(config.soft_break_reduce_ratio * 100)}%，進入洗盤觀察",
         "hardStopAction": "收盤確認跌破後退出剩餘部位",
         "reclaimAction": "快速收復固定防守與前一日黑K中值時分批買回",
+        **dual_entry_plan,
     }
 
 
@@ -967,6 +1132,91 @@ def validate_v12_candidates(
                     "path": path,
                     "status": status,
                     "signalPrice": signal_price,
+                    "noChasePrice": no_chase,
+                }
+            )
+
+        aggressive = plan.get("aggressiveEntry")
+        confirmation = plan.get("confirmationEntry")
+        position_plan = plan.get("positionPlan")
+        failure = plan.get("failureCondition")
+        if not all(
+            isinstance(value, Mapping)
+            for value in (aggressive, confirmation, position_plan, failure)
+        ):
+            issues.append(
+                {
+                    "code": "MISSING_DUAL_ENTRY_PLAN",
+                    "symbol": symbol,
+                    "path": path,
+                }
+            )
+            continue
+
+        aggressive_low = _number(aggressive, "entryLow")
+        aggressive_high = _number(aggressive, "entryHigh")
+        if not (
+            0 < aggressive_low
+            <= aggressive_high
+            <= maximum_buy
+            <= no_chase
+        ):
+            issues.append(
+                {
+                    "code": "INVALID_AGGRESSIVE_ENTRY_RANGE",
+                    "symbol": symbol,
+                    "path": path,
+                    "entryLow": aggressive_low,
+                    "entryHigh": aggressive_high,
+                    "maximumBuyPrice": maximum_buy,
+                    "noChasePrice": no_chase,
+                }
+            )
+
+        aggressive_percent = int(_number(position_plan, "aggressiveEntryPercent"))
+        confirmation_percent = int(_number(position_plan, "confirmationEntryPercent"))
+        maximum_planned = int(_number(position_plan, "maximumPlannedPercent"))
+        if not (
+            0 <= aggressive_percent <= 100
+            and 0 <= confirmation_percent <= 100
+            and aggressive_percent + confirmation_percent == maximum_planned
+            and maximum_planned <= 100
+        ):
+            issues.append(
+                {
+                    "code": "INVALID_DUAL_ENTRY_POSITION_SPLIT",
+                    "symbol": symbol,
+                    "path": path,
+                    "aggressiveEntryPercent": aggressive_percent,
+                    "confirmationEntryPercent": confirmation_percent,
+                    "maximumPlannedPercent": maximum_planned,
+                }
+            )
+
+        failure_price = _number(failure, "price")
+        signal_defense = _number(plan, "signalDefensePrice")
+        if failure_price != signal_defense:
+            issues.append(
+                {
+                    "code": "FAILURE_PRICE_MISMATCH",
+                    "symbol": symbol,
+                    "path": path,
+                    "failurePrice": failure_price,
+                    "signalDefensePrice": signal_defense,
+                }
+            )
+
+        confirmation_price = _number(confirmation, "price")
+        confirmation_available = bool(
+            confirmation.get("availableBelowNoChase")
+        )
+        if confirmation_available != (confirmation_price <= no_chase):
+            issues.append(
+                {
+                    "code": "CONFIRMATION_AVAILABILITY_MISMATCH",
+                    "symbol": symbol,
+                    "path": path,
+                    "confirmationPrice": confirmation_price,
                     "noChasePrice": no_chase,
                 }
             )

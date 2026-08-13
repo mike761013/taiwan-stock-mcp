@@ -35,6 +35,8 @@
   "entry_low_atr_multiple": 0.3,
   "max_buy_atr_multiple": 0.2,
   "no_chase_atr_multiple": 0.6,
+  "aggressive_entry_atr_multiple": 0.1,
+  "confirmation_ma5_atr_discount": 0.2,
   "ma20_distance_warning_pct": 8.0,
   "ma20_distance_danger_pct": 12.0,
   "bollinger_excess_warning_pct": 2.0,
