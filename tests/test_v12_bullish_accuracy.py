@@ -7,8 +7,10 @@ from stock_db.performance import simulate_signal_execution
 from stock_db.v12 import (
     V12Config,
     apply_execution_prior,
+    build_trading_plan,
     predictive_quality_score,
     strategy_passes,
+    validate_v12_candidates,
 )
 
 
@@ -317,3 +319,50 @@ def test_release_validation_reuses_full_radar_snapshot(monkeypatch):
     assert result["snapshotScanCount"] == 1
     assert result["checks"]["accuracyEngineLoaded"] is True
     assert calls == {"full": 1, "statistics": 2}
+
+
+def test_pullback_above_ideal_range_requires_confirmation():
+    row = {
+        "trade_date": "2026-08-14",
+        "open": 50.0,
+        "high": 50.5,
+        "low": 49.0,
+        "close": 50.3,
+        "prev_close": 50.0,
+        "ma5": 50.0,
+        "ma20": 48.0,
+        "atr14": 1.0,
+    }
+    plan = build_trading_plan(row, "pullback", V12Config())
+    assert plan["idealEntryHigh"] == 50.2
+    assert plan["signalPrice"] == 50.3
+    assert plan["maximumBuyPrice"] == 50.4
+    assert plan["statusCode"] == "PRICE_CONFIRMATION_REQUIRED"
+    assert plan["initialPositionPercent"] == 0
+
+    candidate = {
+        **row,
+        "symbol": "TEST",
+        "change_percent": 0.6,
+        "tradingPlan": plan,
+    }
+    assert validate_v12_candidates([candidate]) == []
+
+
+def test_rounded_no_chase_boundary_is_do_not_chase():
+    row = {
+        "trade_date": "2026-08-14",
+        "open": 38.6,
+        "high": 38.8,
+        "low": 38.0,
+        "close": 38.73,
+        "prev_close": 38.5,
+        "prev_high": 38.6,
+        "bollinger_upper": 38.5,
+        "ma5": 38.3,
+        "ma20": 37.8,
+        "atr14": 0.2,
+    }
+    plan = build_trading_plan(row, "breakout", V12Config())
+    assert plan["signalPrice"] == plan["noChasePrice"] == 38.75
+    assert plan["statusCode"] == "DO_NOT_CHASE"

@@ -12,7 +12,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from stock_db.performance import simulate_signal_execution
 from stock_db.radar import _V12_SNAPSHOT_QUERY
-from stock_db.v12 import V12Config, predictive_quality_score, strategy_passes
+from stock_db.v12 import (
+    V12Config,
+    build_trading_plan,
+    predictive_quality_score,
+    strategy_passes,
+)
 
 
 def _plan(action: str = "BUY_ZONE") -> dict:
@@ -133,11 +138,49 @@ def main() -> None:
     assert "indicator_windows AS" not in _V12_SNAPSHOT_QUERY
     assert "LEFT JOIN LATERAL" in _V12_SNAPSHOT_QUERY
 
+    pullback_plan = build_trading_plan(
+        {
+            "trade_date": "2026-08-14",
+            "open": 50.0,
+            "high": 50.5,
+            "low": 49.0,
+            "close": 50.3,
+            "prev_close": 50.0,
+            "ma5": 50.0,
+            "ma20": 48.0,
+            "atr14": 1.0,
+        },
+        "pullback",
+        config,
+    )
+    assert pullback_plan["statusCode"] == "PRICE_CONFIRMATION_REQUIRED"
+
+    no_chase_plan = build_trading_plan(
+        {
+            "trade_date": "2026-08-14",
+            "open": 38.6,
+            "high": 38.8,
+            "low": 38.0,
+            "close": 38.73,
+            "prev_close": 38.5,
+            "prev_high": 38.6,
+            "bollinger_upper": 38.5,
+            "ma5": 38.3,
+            "ma20": 37.8,
+            "atr14": 0.2,
+        },
+        "breakout",
+        config,
+    )
+    assert no_chase_plan["signalPrice"] == no_chase_plan["noChasePrice"]
+    assert no_chase_plan["statusCode"] == "DO_NOT_CHASE"
+
     print("PASS: do-not-chase signals are not bought at the signal close")
     print("PASS: aggressive and confirmation entries are weighted correctly")
     print("PASS: weak-close false breakouts are rejected")
     print("PASS: exhausted five-day moves receive a lower bullish score")
     print("PASS: previous-day moving averages use the indexed lookup")
+    print("PASS: public price bands and action labels are semantically aligned")
     print("ALL V12.1 BULLISH ACCURACY CHECKS PASSED")
 
 

@@ -993,7 +993,6 @@ def _build_dual_entry_plan(
         aggressive_high,
         *(value for value in confirmation_candidates if value > 0),
     )
-    confirmation_available = confirmation_price <= no_chase
     aggressive_percent, confirmation_percent = _dual_entry_position_split(
         strategy,
         status,
@@ -1005,6 +1004,7 @@ def _build_dual_entry_plan(
     rounded_defense = round_tw_price(signal_defense)
     rounded_hard_stop = round_tw_price(hard_stop)
     rounded_no_chase = round_tw_price(no_chase)
+    confirmation_available = rounded_confirmation <= rounded_no_chase
 
     return {
         "aggressiveEntry": {
@@ -1103,6 +1103,18 @@ def build_trading_plan(
     no_chase = entry_high + atr14 * config.no_chase_atr_multiple
     risk_pct = (entry_high - hard_stop) / entry_high * 100 if entry_high > 0 else 0.0
 
+    # Status codes are public trading instructions, so compare the same
+    # tick-rounded prices that the user sees.  Comparing raw floats could
+    # publish signalPrice == noChasePrice while still labelling the candidate
+    # WAIT_PULLBACK.  A pullback above the ideal range but still below the
+    # maximum buy price is not the low-catch BUY_ZONE; it requires price
+    # confirmation instead.
+    rounded_signal_price = round_tw_price(close)
+    rounded_entry_low = round_tw_price(entry_low)
+    rounded_entry_high = round_tw_price(entry_high)
+    rounded_maximum_buy = round_tw_price(maximum_buy)
+    rounded_no_chase = round_tw_price(no_chase)
+
     # Price tradability takes precedence over strategy/risk labels. Previously
     # pullback candidates could be reported as BUY_ZONE even when the signal
     # price was already above maximumBuyPrice.
@@ -1110,10 +1122,10 @@ def build_trading_plan(
     if strategy == "reversal_reclaim" and change_pct >= config.strong_day_change_pct:
         status = "DO_NOT_CHASE"
         initial_position = 0
-    elif close >= no_chase:
+    elif rounded_signal_price >= rounded_no_chase:
         status = "DO_NOT_CHASE"
         initial_position = 0
-    elif close > maximum_buy:
+    elif rounded_signal_price > rounded_maximum_buy:
         status = "WAIT_PULLBACK"
         initial_position = 0
     elif risk_pct > config.max_entry_to_hard_stop_risk_pct:
@@ -1129,8 +1141,12 @@ def build_trading_plan(
         status = "BUY_ON_BREAKOUT"
         initial_position = 40
     elif strategy == "pullback":
-        status = "BUY_ZONE"
-        initial_position = 40
+        if rounded_entry_low <= rounded_signal_price <= rounded_entry_high:
+            status = "BUY_ZONE"
+            initial_position = 40
+        else:
+            status = "PRICE_CONFIRMATION_REQUIRED"
+            initial_position = 0
     else:
         status = "PRICE_CONFIRMATION_REQUIRED"
         initial_position = 30
@@ -1152,11 +1168,11 @@ def build_trading_plan(
         "status": v12_status_label(status),
         "statusCode": status,
         "signalDate": str(row.get("trade_date") or ""),
-        "signalPrice": round_tw_price(close),
-        "idealEntryLow": round_tw_price(entry_low),
-        "idealEntryHigh": round_tw_price(entry_high),
-        "maximumBuyPrice": round_tw_price(maximum_buy),
-        "noChasePrice": round_tw_price(no_chase),
+        "signalPrice": rounded_signal_price,
+        "idealEntryLow": rounded_entry_low,
+        "idealEntryHigh": rounded_entry_high,
+        "maximumBuyPrice": rounded_maximum_buy,
+        "noChasePrice": rounded_no_chase,
         "signalDefensePrice": round_tw_price(signal_defense),
         "hardStopPrice": round_tw_price(hard_stop),
         "atr14": round_tw_price(atr14),
