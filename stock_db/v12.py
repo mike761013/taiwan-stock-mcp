@@ -1220,6 +1220,8 @@ def build_v12_candidate(
     if adjustment <= -25:
         action_code = "DO_NOT_CHASE"
     elif adjustment <= -10 and action_code not in {
+        "DO_NOT_CHASE",
+        "WAIT_PULLBACK",
         "SMALL_POSITION_OR_SKIP",
         "EARLY_ENTRY_SMALL_POSITION",
         "BOTTOM_REVERSAL_WATCH",
