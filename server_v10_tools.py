@@ -34,6 +34,90 @@ from stock_db.v12 import (
 from stock_db.service import stock_database_service
 
 
+async def validate_v12_release_core(
+    limit_each: int = 5,
+    minimum_score: float = 0,
+) -> dict:
+    """Validate V12 from one shared market snapshot.
+
+    ``run_full_bullish_radar_v12_core`` already evaluates and persists every
+    individual strategy before it writes the combined run.  Re-running the
+    four strategies here used to execute the expensive market snapshot query
+    five times and could exceed the free-tier statement timeout.  Reuse the
+    per-strategy results returned by the full radar instead.
+    """
+    health = await stock_database_service.health()
+    before = await stock_database_service.statistics()
+    full = await run_full_bullish_radar_v12_core(
+        limit_each=limit_each,
+        minimum_score=minimum_score,
+        save_result=True,
+    )
+    strategies = dict(full.get("byStrategy") or {})
+    after = await stock_database_service.statistics()
+    before_stats = before.get("statistics", {})
+    after_stats = after.get("statistics", {})
+    total_candidates = sum(
+        int(result.get("candidateCount", 0))
+        for result in strategies.values()
+    )
+    semantic_issues: list[dict[str, Any]] = []
+    for strategy, result in strategies.items():
+        semantic_issues.extend(
+            validate_v12_candidates(
+                result.get("results") or [],
+                context=f"strategies.{strategy}.results",
+            )
+        )
+    semantic_issues.extend(
+        validate_v12_candidates(
+            full.get("top10") or [],
+            context="fullRadar.top10",
+        )
+    )
+    expected_strategies = set(V12_STRATEGIES)
+    checks = {
+        "databaseHealthy": health.get("status") == "healthy",
+        "allStrategiesOk": (
+            expected_strategies.issubset(strategies)
+            and all(
+                strategies[strategy].get("ok")
+                for strategy in expected_strategies
+            )
+        ),
+        "fullRadarOk": bool(full.get("ok")),
+        "accuracyEngineLoaded": (
+            full.get("accuracyEngine") == "V12.1_FORWARD_BULLISH"
+        ),
+        "radarRunsWritten": int(after_stats.get("radar_runs", 0))
+            > int(before_stats.get("radar_runs", 0)),
+        "radarCandidatesWritten": (
+            total_candidates == 0
+            or int(after_stats.get("radar_candidates", 0))
+                > int(before_stats.get("radar_candidates", 0))
+        ),
+        "semanticConsistency": not semantic_issues,
+    }
+    return {
+        "ok": all(checks.values()),
+        "releaseReady": all(checks.values()),
+        "version": "V12",
+        "accuracyEngine": full.get("accuracyEngine"),
+        "snapshotScanCount": 1,
+        "checks": checks,
+        "candidateCount": total_candidates,
+        "semanticValidation": {
+            "ok": not semantic_issues,
+            "issueCount": len(semantic_issues),
+            "issues": semantic_issues,
+        },
+        "strategies": strategies,
+        "fullRadar": full,
+        "statisticsBefore": before_stats,
+        "statisticsAfter": after_stats,
+    }
+
+
 def register_v10_tools(mcp: Any) -> None:
     """Keep the existing registration function so current server imports work."""
 
@@ -344,72 +428,8 @@ def register_v10_tools(mcp: Any) -> None:
         limit_each: int = 5,
         minimum_score: float = 0,
     ) -> dict:
-        """驗證資料庫、V12四策略、合併雷達及寫入功能。"""
-        health = await stock_database_service.health()
-        before = await stock_database_service.statistics()
-        strategies: dict[str, dict] = {}
-        for strategy in V12_STRATEGIES:
-            strategies[strategy] = await screen_database_market_v12(
-                strategy=strategy,
-                limit=limit_each,
-                minimum_score=minimum_score,
-                save_result=True,
-            )
-        full = await run_full_bullish_radar_v12_core(
-            limit_each=limit_each,
-            minimum_score=minimum_score,
-            save_result=True,
-        )
-        after = await stock_database_service.statistics()
-        before_stats = before.get("statistics", {})
-        after_stats = after.get("statistics", {})
-        total_candidates = sum(
-            int(result.get("candidateCount", 0))
-            for result in strategies.values()
-        )
-        semantic_issues: list[dict[str, Any]] = []
-        for strategy, result in strategies.items():
-            semantic_issues.extend(
-                validate_v12_candidates(
-                    result.get("results") or [],
-                    context=f"strategies.{strategy}.results",
-                )
-            )
-        semantic_issues.extend(
-            validate_v12_candidates(
-                full.get("top10") or [],
-                context="fullRadar.top10",
-            )
-        )
-        checks = {
-            "databaseHealthy": health.get("status") == "healthy",
-            "allStrategiesOk": all(result.get("ok") for result in strategies.values()),
-            "fullRadarOk": bool(full.get("ok")),
-            "radarRunsWritten": int(after_stats.get("radar_runs", 0))
-                > int(before_stats.get("radar_runs", 0)),
-            "radarCandidatesWritten": (
-                total_candidates == 0
-                or int(after_stats.get("radar_candidates", 0))
-                    > int(before_stats.get("radar_candidates", 0))
-            ),
-            "semanticConsistency": not semantic_issues,
-        }
-        return {
-            "ok": all(checks.values()),
-            "releaseReady": all(checks.values()),
-            "version": "V12",
-            "checks": checks,
-            "candidateCount": total_candidates,
-            "semanticValidation": {
-                "ok": not semantic_issues,
-                "issueCount": len(semantic_issues),
-                "issues": semantic_issues,
-            },
-            "strategies": strategies,
-            "fullRadar": full,
-            "statisticsBefore": before_stats,
-            "statisticsAfter": after_stats,
-        }
+        """單次快照驗證資料庫、V12四策略、合併雷達及寫入功能。"""
+        return await validate_v12_release_core(limit_each, minimum_score)
 
     @mcp.tool()
     async def validate_v11_release(

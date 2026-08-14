@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from stock_db.performance import simulate_signal_execution
+from stock_db.radar import _V12_SNAPSHOT_QUERY
 from stock_db.v12 import V12Config, predictive_quality_score, strategy_passes
 
 
@@ -123,10 +130,14 @@ def main() -> None:
     )
     assert healthy > exhausted
 
+    assert "indicator_windows AS" not in _V12_SNAPSHOT_QUERY
+    assert "LEFT JOIN LATERAL" in _V12_SNAPSHOT_QUERY
+
     print("PASS: do-not-chase signals are not bought at the signal close")
     print("PASS: aggressive and confirmation entries are weighted correctly")
     print("PASS: weak-close false breakouts are rejected")
     print("PASS: exhausted five-day moves receive a lower bullish score")
+    print("PASS: previous-day moving averages use the indexed lookup")
     print("ALL V12.1 BULLISH ACCURACY CHECKS PASSED")
 
 

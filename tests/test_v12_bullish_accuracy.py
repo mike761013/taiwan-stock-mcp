@@ -1,6 +1,7 @@
 import asyncio
 from datetime import date, timedelta
 
+import server_v10_tools
 from stock_db import radar
 from stock_db.performance import simulate_signal_execution
 from stock_db.v12 import (
@@ -243,3 +244,76 @@ def test_full_radar_top10_excludes_wait_and_do_not_chase(monkeypatch):
         "WATCH"
     ]
     assert result["bullishTop10"][0]["symbol"] == "WATCH"
+
+
+def test_v12_snapshot_uses_indexed_previous_indicator_lookup():
+    query = radar._V12_SNAPSHOT_QUERY
+    assert "indicator_windows AS" not in query
+    assert "LEFT JOIN LATERAL" in query
+    assert "WHERE previous.symbol = i.symbol" in query
+    assert "ORDER BY previous.trade_date DESC" in query
+    assert "LIMIT 1" in query
+
+
+def test_release_validation_reuses_full_radar_snapshot(monkeypatch):
+    calls = {"full": 0, "statistics": 0}
+
+    class FakeService:
+        async def health(self):
+            return {"status": "healthy"}
+
+        async def statistics(self):
+            calls["statistics"] += 1
+            if calls["statistics"] == 1:
+                return {
+                    "statistics": {
+                        "radar_runs": 10,
+                        "radar_candidates": 20,
+                    }
+                }
+            return {
+                "statistics": {
+                    "radar_runs": 15,
+                    "radar_candidates": 24,
+                }
+            }
+
+    async def full_radar(**kwargs):
+        calls["full"] += 1
+        return {
+            "ok": True,
+            "accuracyEngine": "V12.1_FORWARD_BULLISH",
+            "top10": [],
+            "byStrategy": {
+                strategy: {
+                    "ok": True,
+                    "strategy": strategy,
+                    "candidateCount": 1,
+                    "results": [],
+                }
+                for strategy in server_v10_tools.V12_STRATEGIES
+            },
+        }
+
+    monkeypatch.setattr(
+        server_v10_tools,
+        "stock_database_service",
+        FakeService(),
+    )
+    monkeypatch.setattr(
+        server_v10_tools,
+        "run_full_bullish_radar_v12_core",
+        full_radar,
+    )
+
+    result = asyncio.run(
+        server_v10_tools.validate_v12_release_core(
+            limit_each=5,
+            minimum_score=0,
+        )
+    )
+    assert result["ok"] is True
+    assert result["releaseReady"] is True
+    assert result["snapshotScanCount"] == 1
+    assert result["checks"]["accuracyEngineLoaded"] is True
+    assert calls == {"full": 1, "statistics": 2}

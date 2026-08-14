@@ -245,15 +245,6 @@ _V12_SNAPSHOT_QUERY = f"""
                ) AS reverse_rank
         FROM recent_bars b
     ),
-    indicator_windows AS (
-        SELECT i.*,
-               ROW_NUMBER() OVER (
-                   PARTITION BY i.symbol ORDER BY i.trade_date DESC
-               ) AS reverse_rank
-        FROM daily_indicators i
-        CROSS JOIN global_latest_date d
-        WHERE i.trade_date >= d.trade_date - INTERVAL '120 days'
-    ),
     true_ranges AS (
         SELECT symbol, trade_date,
                GREATEST(
@@ -297,16 +288,6 @@ _V12_SNAPSHOT_QUERY = f"""
         FROM bar_windows
         WHERE reverse_rank <= 60
         GROUP BY symbol
-    ),
-    previous_indicators AS (
-        SELECT symbol,
-               MAX(ma5) FILTER (WHERE reverse_rank = 2) AS prev_ma5,
-               MAX(ma10) FILTER (WHERE reverse_rank = 2) AS prev_ma10,
-               MAX(ma20) FILTER (WHERE reverse_rank = 2) AS prev_ma20,
-               MAX(ma60) FILTER (WHERE reverse_rank = 2) AS prev_ma60
-        FROM indicator_windows
-        WHERE reverse_rank <= 2
-        GROUP BY symbol
     )
     SELECT b.symbol, s.name, s.market, b.trade_date,
            b.open, b.high, b.low, b.close, b.volume, b.turnover,
@@ -328,7 +309,17 @@ _V12_SNAPSHOT_QUERY = f"""
       ON d.market_key = UPPER(s.market)
     AND d.trade_date = i.trade_date
     LEFT JOIN previous_bars p ON p.symbol = b.symbol
-    LEFT JOIN previous_indicators pi ON pi.symbol = b.symbol
+    LEFT JOIN LATERAL (
+        SELECT previous.ma5 AS prev_ma5,
+               previous.ma10 AS prev_ma10,
+               previous.ma20 AS prev_ma20,
+               previous.ma60 AS prev_ma60
+        FROM daily_indicators previous
+        WHERE previous.symbol = i.symbol
+          AND previous.trade_date < i.trade_date
+        ORDER BY previous.trade_date DESC
+        LIMIT 1
+    ) pi ON TRUE
     LEFT JOIN atr_history a ON a.symbol = b.symbol AND a.trade_date = b.trade_date
     WHERE s.is_active = TRUE
       AND {_COMMON_STOCK_FILTER}
