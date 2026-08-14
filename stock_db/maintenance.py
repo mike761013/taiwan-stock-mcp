@@ -6,6 +6,7 @@ from typing import Any
 
 from .performance import (
     DEFAULT_PERFORMANCE_UPDATE_LIMIT,
+    update_signal_execution_performance,
     update_signal_performance,
 )
 from .pipeline import update_official_daily
@@ -77,6 +78,11 @@ async def run_daily_maintenance(
         try:
             result["performance"] = await update_signal_performance(
                 limit=DEFAULT_PERFORMANCE_UPDATE_LIMIT,
+            )
+            result["executionPerformance"] = (
+                await update_signal_execution_performance(
+                    limit=DEFAULT_PERFORMANCE_UPDATE_LIMIT,
+                )
             )
         except Exception as exc:
             result["ok"] = False

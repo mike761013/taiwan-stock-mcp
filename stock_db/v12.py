@@ -39,6 +39,16 @@ V12_HIGH_PRICE_ELIGIBLE_STATUS_CODES = frozenset(
     }
 )
 
+V12_ACTIONABLE_STATUS_CODES = frozenset(
+    {
+        "BUY_ZONE",
+        "BUY_ON_BREAKOUT",
+        "EARLY_ENTRY",
+        "EARLY_ENTRY_SMALL_POSITION",
+        "PRICE_CONFIRMATION_REQUIRED",
+    }
+)
+
 
 def v12_status_label(status_code: str) -> str:
     """Return a Chinese display label while keeping a stable machine code."""
@@ -106,6 +116,37 @@ class V12Config:
     bollinger_excess_warning_pct: float = 2.0
     extreme_volume_ratio: float = 5.0
     strong_day_change_pct: float = 8.5
+
+    # V12.1 forward-bullish ranking.  The legacy technical score is useful,
+    # but it over-rewards a stock merely for already being extended.  Blend it
+    # with structure, candle quality, trend slope and support quality instead.
+    bullish_raw_score_weight: float = 0.55
+    bullish_quality_score_weight: float = 0.45
+    ranking_bullish_weight: float = 0.75
+    ranking_execution_weight: float = 0.25
+    consensus_bonus_per_extra_strategy: float = 2.0
+    consensus_bonus_cap: float = 4.0
+
+    # Immediate false-breakout / late-entry protection.
+    breakout_min_close_position: float = 0.55
+    breakout_max_distance_ma20_pct: float = 12.0
+    breakout_max_volume_ratio20: float = 4.0
+    predictive_max_5day_change_pct: float = 12.0
+    predictive_max_upper_shadow_pct: float = 3.0
+
+    # Early-stage candidates must still be close enough to the base.  Missing
+    # previous-MA fields remain backward compatible with older snapshots.
+    early_max_distance_ma20_pct: float = 6.0
+    early_max_volume_ratio20: float = 2.5
+    early_min_close_position: float = 0.45
+
+    # Historical execution performance is only allowed to make a small,
+    # confidence-weighted adjustment.  This prevents a short hot streak from
+    # taking over the model.
+    execution_prior_min_samples: int = 30
+    execution_prior_full_confidence_samples: int = 120
+    execution_prior_max_adjustment: float = 8.0
+    execution_entry_window_sessions: int = 3
 
     @property
     def effective_min_trade_value(self) -> float:
@@ -506,13 +547,264 @@ def pullback_v2_score(
         signals.append("收紅K")
         score += 4
 
+    stabilization_ok = (
+        len(signals) >= config.pullback_min_stabilization_signals
+    )
+    if not stabilization_ok:
+        warnings.append(
+            f"止穩訊號僅{len(signals)}項，低於"
+            f"{config.pullback_min_stabilization_signals}項"
+        )
+
     core_pass = (
         trend_ok
         and near_ma5
         and massive_low_hold
         and 0 < volume_ratio <= config.pullback_max_volume_ratio20
+        and stabilization_ok
     )
     return core_pass, _clamp(score), reasons, warnings, signals
+
+
+def _five_day_change_pct(row: Mapping[str, Any]) -> float:
+    close = _number(row, "close")
+    close5 = _number(row, "close5")
+    return (close / close5 - 1) * 100 if close5 > 0 else 0.0
+
+
+def predictive_quality_score(
+    row: Mapping[str, Any], strategy: str, config: V12Config
+) -> tuple[float, list[str], list[str]]:
+    """Score features that are more likely to persist after the signal day.
+
+    The old technical score mostly answered "is this stock already strong?".
+    This score instead rewards rising structure, support, a healthy close and
+    non-exhaustive volume, while penalising late five-day acceleration and
+    upper-shadow rejection.  Every input is available on the signal date, so
+    the score has no future-data leakage.
+    """
+    close = _number(row, "close")
+    open_price = _number(row, "open")
+    ma5 = _number(row, "ma5")
+    ma10 = _number(row, "ma10")
+    ma20 = _number(row, "ma20")
+    ma60 = _number(row, "ma60")
+    prev_ma5 = _number(row, "prev_ma5")
+    prev_ma20 = _number(row, "prev_ma20")
+    prev_high = _number(row, "prev_high")
+    prev_low = _number(row, "prev_low")
+    prev_close = _number(row, "prev_close")
+    volume_ratio = _number(row, "volume_ratio")
+    large_volume_low = _number(row, "large_volume_low")
+    close_position = _close_position(row)
+    upper_shadow = _upper_shadow_pct(row)
+    change_pct = _daily_change_pct(row)
+    change5 = _five_day_change_pct(row)
+    dist20 = _distance_pct(close, ma20) if ma20 > 0 else 999.0
+    dist5 = _distance_pct(close, ma5) if ma5 > 0 else 999.0
+    bottom = _bottom_context(row)
+
+    score = 50.0
+    positives: list[str] = []
+    risks: list[str] = []
+
+    if prev_ma20 > 0:
+        if ma20 > prev_ma20 * 1.001:
+            score += 8
+            positives.append("MA20持續上彎")
+        elif ma20 >= prev_ma20 * 0.999:
+            score += 2
+        else:
+            score -= 10
+            risks.append("MA20仍下彎")
+    if prev_ma5 > 0:
+        if ma5 > prev_ma5:
+            score += 6
+            positives.append("MA5斜率向上")
+        else:
+            score -= 4
+            risks.append("MA5斜率轉弱")
+
+    if close_position >= 0.70:
+        score += 8
+        positives.append("收盤接近日高")
+    elif close_position >= 0.55:
+        score += 4
+    elif close_position <= 0.30:
+        score -= 10
+        risks.append("收盤接近日低")
+
+    if upper_shadow <= 1.5:
+        score += 4
+    elif upper_shadow > config.predictive_max_upper_shadow_pct:
+        score -= 10
+        risks.append("長上影顯示追價承接不足")
+    if close > open_price > 0:
+        score += 4
+
+    if large_volume_low > 0:
+        if close >= large_volume_low:
+            score += 6
+            positives.append("守住滾動大量低點")
+        else:
+            score -= 12
+            risks.append("收盤仍在滾動大量低點下方")
+
+    if dist20 > config.ma20_distance_danger_pct:
+        score -= 18
+        risks.append("距MA20過遠，後續回歸風險高")
+    elif dist20 > config.ma20_distance_warning_pct:
+        score -= 10
+        risks.append("距MA20偏遠")
+
+    if change5 > config.predictive_max_5day_change_pct:
+        score -= 15
+        risks.append("五日漲幅過大，容易進入短線兌現")
+    elif change5 > config.predictive_max_5day_change_pct * 0.67:
+        score -= 8
+        risks.append("五日漲幅偏快")
+    if change_pct >= config.strong_day_change_pct:
+        score -= 10
+        risks.append("訊號日漲幅過大")
+
+    if strategy == "early_stage":
+        if ma5 > ma10 > ma20 > 0:
+            score += 10
+            positives.append("短中期均線剛形成多頭結構")
+        elif ma5 >= ma20 > 0:
+            score += 5
+        if 0 <= dist20 <= 4.0:
+            score += 10
+            positives.append("仍靠近MA20基座")
+        elif dist20 <= config.early_max_distance_ma20_pct:
+            score += 5
+        if 0.8 <= volume_ratio <= 1.8:
+            score += 8
+            positives.append("量能溫和而非爆量")
+        elif volume_ratio > config.early_max_volume_ratio20:
+            score -= 8
+            risks.append("早期型態卻已明顯爆量")
+        if 0.25 <= bottom["rangePosition20"] <= 0.80:
+            score += 6
+        elif bottom["rangePosition20"] > 0.90:
+            score -= 6
+            risks.append("已接近20日區間頂端")
+
+    elif strategy == "breakout":
+        if prev_high > 0 and close >= prev_high:
+            score += 8
+            positives.append("收盤有效越過前一日高點")
+        elif prev_high > 0:
+            score -= 10
+            risks.append("未能收過前一日高點")
+        if close_position >= 0.70:
+            score += 8
+        if 1.2 <= volume_ratio <= 2.5:
+            score += 8
+            positives.append("突破量能健康")
+        elif volume_ratio <= 3.5:
+            score += 3
+        else:
+            score -= 10
+            risks.append("突破量能疑似高潮量")
+        if 0 <= dist20 <= 6.0:
+            score += 6
+        elif dist20 > 8.0:
+            score -= 10
+            risks.append("突破位置離MA20過遠")
+
+    elif strategy == "pullback":
+        if ma5 > ma10 > ma20 > ma60 > 0:
+            score += 10
+            positives.append("完整多頭排列")
+        if 0 <= dist5 <= 1.5:
+            score += 10
+            positives.append("貼近MA5且尚未失守")
+        elif 0 <= dist5 <= config.pullback_max_distance_ma5_pct:
+            score += 5
+        if 0 < volume_ratio <= config.pullback_preferred_volume_ratio20:
+            score += 8
+            positives.append("拉回量縮")
+        elif volume_ratio <= 1.0:
+            score += 5
+        elif volume_ratio > config.pullback_max_volume_ratio20:
+            score -= 10
+        if prev_low > 0 and _number(row, "low") >= prev_low:
+            score += 5
+            positives.append("低點未再下移")
+
+    elif strategy == "reversal_reclaim":
+        if bottom["rangePosition20"] <= 0.30:
+            score += 10
+            positives.append("仍在20日底部三成區")
+        elif bottom["rangePosition20"] <= config.reversal_max_range_position20:
+            score += 5
+        if bottom["drawdownFromHigh20Percent"] >= 15.0:
+            score += 5
+        if prev_low > 0 and _number(row, "low") >= prev_low:
+            score += 5
+            positives.append("低點止跌")
+        if prev_close > 0 and close > prev_close:
+            score += 5
+        if config.reversal_min_volume_ratio20 <= volume_ratio <= 1.5:
+            score += 6
+            positives.append("底部量能未失控")
+
+    return _clamp(score), positives, risks
+
+
+def actionability_adjustment(
+    action_code: str, maximum_risk_percent: float
+) -> tuple[float, list[str]]:
+    """Keep directional potential separate from whether it is buyable now."""
+    status_adjustment = {
+        "BUY_ZONE": 8.0,
+        "BUY_ON_BREAKOUT": 5.0,
+        "EARLY_ENTRY": 5.0,
+        "EARLY_ENTRY_SMALL_POSITION": 3.0,
+        "PRICE_CONFIRMATION_REQUIRED": 2.0,
+        "SMALL_POSITION_OR_SKIP": -6.0,
+        "BOTTOM_REVERSAL_WATCH": -8.0,
+        "WAIT_PULLBACK": -10.0,
+        "DO_NOT_CHASE": -25.0,
+    }.get(action_code, -5.0)
+    risk_penalty = max(0.0, maximum_risk_percent - 5.0) * 1.5
+    details = [f"操作狀態調整{status_adjustment:+.1f}"]
+    if risk_penalty:
+        details.append(f"停損距離扣分-{risk_penalty:.1f}")
+    return status_adjustment - risk_penalty, details
+
+
+def apply_execution_prior(
+    candidate: Mapping[str, Any],
+    prior: Mapping[str, Any] | None,
+    config: V12Config,
+) -> dict[str, Any]:
+    """Apply a capped out-of-sample execution prior to one candidate."""
+    item = dict(candidate)
+    adjustment = _number(prior or {}, "adjustment")
+    adjustment = max(
+        -config.execution_prior_max_adjustment,
+        min(adjustment, config.execution_prior_max_adjustment),
+    )
+    bullish_score = _clamp(_number(item, "bullish_score") + adjustment)
+    execution_score = _clamp(_number(item, "execution_score") + adjustment)
+    ranking_score = _clamp(
+        bullish_score * config.ranking_bullish_weight
+        + execution_score * config.ranking_execution_weight
+    )
+    item.update(
+        {
+            "historical_execution_adjustment": round(adjustment, 2),
+            "executionPrior": dict(prior or {}),
+            "bullish_score": round(bullish_score, 2),
+            "total_score": round(bullish_score, 2),
+            "finalScore": round(bullish_score, 2),
+            "execution_score": round(execution_score, 2),
+            "ranking_score": round(ranking_score, 2),
+        }
+    )
+    return item
 
 def strategy_passes(row: Mapping[str, Any], strategy: str, config: V12Config) -> bool:
     close = _number(row, "close")
@@ -523,16 +815,24 @@ def strategy_passes(row: Mapping[str, Any], strategy: str, config: V12Config) ->
     volume_ratio = _number(row, "volume_ratio")
 
     if strategy == "early_stage":
+        distance_ma20 = _distance_pct(close, ma20) if ma20 > 0 else 999.0
         return (
             ma5 >= ma20 > 0
             and close >= ma20
-            and 0.8 <= volume_ratio <= 2.5
+            and distance_ma20 <= config.early_max_distance_ma20_pct
+            and 0.8 <= volume_ratio <= config.early_max_volume_ratio20
+            and _close_position(row) >= config.early_min_close_position
         )
     if strategy == "breakout":
+        distance_ma20 = _distance_pct(close, ma20) if ma20 > 0 else 999.0
+        prev_high = _number(row, "prev_high")
         return (
             bollinger_upper > 0
             and close >= bollinger_upper
-            and volume_ratio >= 1.2
+            and (prev_high <= 0 or close >= prev_high)
+            and 1.2 <= volume_ratio <= config.breakout_max_volume_ratio20
+            and distance_ma20 <= config.breakout_max_distance_ma20_pct
+            and _close_position(row) >= config.breakout_min_close_position
         )
     if strategy == "pullback":
         passed, _, _, _, _ = pullback_v2_score(row, config)
@@ -888,8 +1188,15 @@ def build_v12_candidate(
         reasons = _strategy_reasons(row, strategy)
         pattern_warnings = []
 
+    quality_score, quality_reasons, quality_warnings = predictive_quality_score(
+        row, strategy, config
+    )
     adjustment, trading_warnings = trading_adjustment(row, config)
-    final_score = _clamp(raw_score + adjustment)
+    bullish_score = _clamp(
+        raw_score * config.bullish_raw_score_weight
+        + quality_score * config.bullish_quality_score_weight
+        + adjustment
+    )
     plan = build_trading_plan(row, strategy, config)
 
     # A heavily penalised setup is observable but should not be presented as a buy.
@@ -910,6 +1217,16 @@ def build_v12_candidate(
         if action_code in {"DO_NOT_CHASE", "WAIT_PULLBACK"}:
             plan["initialPositionPercent"] = 0
 
+    execution_adjustment, execution_reasons = actionability_adjustment(
+        action_code,
+        _number(plan, "maximumRiskPercent"),
+    )
+    execution_score = _clamp(bullish_score + execution_adjustment)
+    ranking_score = _clamp(
+        bullish_score * config.ranking_bullish_weight
+        + execution_score * config.ranking_execution_weight
+    )
+
     item = dict(row)
     # The database column historically stores the official daily price change
     # amount even though it is named change_percent. Keep that value under an
@@ -922,14 +1239,25 @@ def build_v12_candidate(
             "change_percent": daily_change_percent,
             "strategy": strategy,
             "strategies": [strategy],
+            "accuracyEngine": "V12.1_FORWARD_BULLISH",
             "raw_score": round(raw_score, 2),
+            "predictive_quality_score": round(quality_score, 2),
             "trading_adjustment": round(adjustment, 2),
-            "total_score": round(final_score, 2),
-            "finalScore": round(final_score, 2),
+            "bullish_score": round(bullish_score, 2),
+            "execution_score": round(execution_score, 2),
+            "ranking_score": round(ranking_score, 2),
+            "historical_execution_adjustment": 0.0,
+            "total_score": round(bullish_score, 2),
+            "finalScore": round(bullish_score, 2),
             "action": v12_status_label(action_code),
             "actionCode": action_code,
-            "reasons": reasons,
-            "warnings": pattern_warnings + trading_warnings,
+            "reasons": reasons + [
+                f"後勢品質：{reason}" for reason in quality_reasons
+            ],
+            "warnings": (
+                pattern_warnings + quality_warnings + trading_warnings
+            ),
+            "executionScoreDetails": execution_reasons,
             "liquidity": liquidity,
             "tradingPlan": plan,
             # These are deliberately frozen in the signal snapshot.
@@ -1253,7 +1581,8 @@ def screen_v12_rows(
 
     accepted.sort(
         key=lambda item: (
-            float(item.get("total_score") or 0),
+            float(item.get("ranking_score") or item.get("total_score") or 0),
+            float(item.get("bullish_score") or item.get("total_score") or 0),
             -float(item.get("tradingPlan", {}).get("maximumRiskPercent") or 999),
             float(item.get("volume_ratio") or 0),
         ),

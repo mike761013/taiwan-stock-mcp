@@ -6,9 +6,12 @@ from datetime import date
 from typing import Any
 
 from .connection import stock_database
+from .performance import execution_strategy_priors
 from .service import stock_database_service
 from .v12 import (
+    V12_ACTIONABLE_STATUS_CODES,
     V12_STRATEGIES,
+    apply_execution_prior,
     load_v12_config,
     screen_v12_rows,
     split_v12_price_tiers,
@@ -242,6 +245,15 @@ _V12_SNAPSHOT_QUERY = f"""
                ) AS reverse_rank
         FROM recent_bars b
     ),
+    indicator_windows AS (
+        SELECT i.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY i.symbol ORDER BY i.trade_date DESC
+               ) AS reverse_rank
+        FROM daily_indicators i
+        CROSS JOIN global_latest_date d
+        WHERE i.trade_date >= d.trade_date - INTERVAL '120 days'
+    ),
     true_ranges AS (
         SELECT symbol, trade_date,
                GREATEST(
@@ -275,12 +287,25 @@ _V12_SNAPSHOT_QUERY = f"""
                MAX(volume) FILTER (WHERE reverse_rank = 2) AS prev_volume,
                MAX(low) FILTER (WHERE reverse_rank = 3) AS prev2_low,
                MAX(close) FILTER (WHERE reverse_rank = 3) AS prev2_close,
+               MAX(close) FILTER (WHERE reverse_rank = 6) AS close5,
+               MAX(close) FILTER (WHERE reverse_rank = 11) AS close10,
+               MAX(close) FILTER (WHERE reverse_rank = 21) AS close20,
                MAX(high) FILTER (WHERE reverse_rank <= 20) AS high20,
                MIN(low) FILTER (WHERE reverse_rank <= 20) AS low20,
                MAX(high) FILTER (WHERE reverse_rank <= 60) AS high60,
                MIN(low) FILTER (WHERE reverse_rank <= 60) AS low60
         FROM bar_windows
         WHERE reverse_rank <= 60
+        GROUP BY symbol
+    ),
+    previous_indicators AS (
+        SELECT symbol,
+               MAX(ma5) FILTER (WHERE reverse_rank = 2) AS prev_ma5,
+               MAX(ma10) FILTER (WHERE reverse_rank = 2) AS prev_ma10,
+               MAX(ma20) FILTER (WHERE reverse_rank = 2) AS prev_ma20,
+               MAX(ma60) FILTER (WHERE reverse_rank = 2) AS prev_ma60
+        FROM indicator_windows
+        WHERE reverse_rank <= 2
         GROUP BY symbol
     )
     SELECT b.symbol, s.name, s.market, b.trade_date,
@@ -292,7 +317,9 @@ _V12_SNAPSHOT_QUERY = f"""
            i.volatility_20, i.large_volume_low, i.technical_score,
            p.prev_open, p.prev_high, p.prev_low, p.prev_close, p.prev_volume,
            p.prev2_low, p.prev2_close,
+           p.close5, p.close10, p.close20,
            p.high20, p.low20, p.high60, p.low60,
+           pi.prev_ma5, pi.prev_ma10, pi.prev_ma20, pi.prev_ma60,
            a.atr14
     FROM daily_indicators i
     JOIN daily_bars b ON b.symbol = i.symbol AND b.trade_date = i.trade_date
@@ -301,6 +328,7 @@ _V12_SNAPSHOT_QUERY = f"""
       ON d.market_key = UPPER(s.market)
     AND d.trade_date = i.trade_date
     LEFT JOIN previous_bars p ON p.symbol = b.symbol
+    LEFT JOIN previous_indicators pi ON pi.symbol = b.symbol
     LEFT JOIN atr_history a ON a.symbol = b.symbol AND a.trade_date = b.trade_date
     WHERE s.is_active = TRUE
       AND {_COMMON_STOCK_FILTER}
@@ -392,6 +420,14 @@ async def screen_database_market_v12(
     minimum_score = max(0.0, min(float(minimum_score), 100.0))
     config = load_v12_config()
     rows, universe_count, latest_trade_date = await _fetch_v12_snapshot()
+    priors = (
+        await execution_strategy_priors(
+            minimum_samples=config.execution_prior_min_samples,
+            full_confidence_samples=config.execution_prior_full_confidence_samples,
+            maximum_adjustment=config.execution_prior_max_adjustment,
+        )
+        if rows else {}
+    )
     raw_candidates, rejection_summary = screen_v12_rows(
         rows=rows,
         strategy=strategy,
@@ -399,12 +435,33 @@ async def screen_database_market_v12(
         limit=200,
         config=config,
     )
+    raw_candidates = [
+        apply_execution_prior(candidate, priors.get(strategy), config)
+        for candidate in raw_candidates
+    ]
+    raw_candidates.sort(
+        key=lambda item: (
+            float(item.get("ranking_score") or 0),
+            float(item.get("bullish_score") or 0),
+        ),
+        reverse=True,
+    )
     tiers = split_v12_price_tiers(raw_candidates, config)
     primary_results = tiers["main"][:limit]
     high_price_results = tiers["highPrice"][
         : min(limit, config.high_price_limit)
     ]
     candidates = primary_results + high_price_results
+    actionable_results = [
+        candidate for candidate in candidates
+        if str(candidate.get("actionCode") or "")
+        in V12_ACTIONABLE_STATUS_CODES
+    ]
+    watch_results = [
+        candidate for candidate in candidates
+        if str(candidate.get("actionCode") or "")
+        not in V12_ACTIONABLE_STATUS_CODES
+    ]
     for rank, candidate in enumerate(primary_results, start=1):
         candidate["rank"] = rank
     for rank, candidate in enumerate(high_price_results, start=1):
@@ -425,12 +482,15 @@ async def screen_database_market_v12(
     return {
         "ok": True,
         "version": "V12",
+        "accuracyEngine": "V12.1_FORWARD_BULLISH",
         "strategy": strategy,
         "candidateCount": len(candidates),
         "rawCandidateCount": len(raw_candidates),
         "mainCandidateCount": len(primary_results),
         "highPriceCandidateCount": len(high_price_results),
         "excludedHighPriceCount": len(tiers["rejectedHighPrice"]),
+        "actionableCandidateCount": len(actionable_results),
+        "watchCandidateCount": len(watch_results),
         "universeCount": universe_count,
         "snapshotCount": len(rows),
         "latestTradeDate": latest_trade_date,
@@ -449,9 +509,12 @@ async def screen_database_market_v12(
         },
         "rejectionSummary": rejection_summary,
         "results": candidates,
+        "actionableResults": actionable_results,
+        "watchResults": watch_results,
         "primaryResults": primary_results,
         "highPriceStrongResults": high_price_results,
         "record": saved,
+        "executionPriors": priors,
         "source": "PostgreSQL V12",
     }
 
@@ -466,6 +529,14 @@ async def run_full_bullish_radar_v12(
     minimum_score = max(0.0, min(float(minimum_score), 100.0))
     config = load_v12_config()
     rows, universe_count, latest_trade_date = await _fetch_v12_snapshot()
+    priors = (
+        await execution_strategy_priors(
+            minimum_samples=config.execution_prior_min_samples,
+            full_confidence_samples=config.execution_prior_full_confidence_samples,
+            maximum_adjustment=config.execution_prior_max_adjustment,
+        )
+        if rows else {}
+    )
 
     grouped: dict[str, dict[str, Any]] = {}
     merged: dict[str, dict[str, Any]] = {}
@@ -478,6 +549,17 @@ async def run_full_bullish_radar_v12(
             minimum_score=minimum_score,
             limit=200,
             config=config,
+        )
+        raw_candidates = [
+            apply_execution_prior(candidate, priors.get(strategy), config)
+            for candidate in raw_candidates
+        ]
+        raw_candidates.sort(
+            key=lambda item: (
+                float(item.get("ranking_score") or 0),
+                float(item.get("bullish_score") or 0),
+            ),
+            reverse=True,
         )
         tiers = split_v12_price_tiers(raw_candidates, config)
         primary_results = tiers["main"][:limit_each]
@@ -536,8 +618,14 @@ async def run_full_bullish_radar_v12(
 
             strategies = set(existing.get("strategies") or [])
             strategies.add(strategy)
-            if float(candidate.get("total_score") or 0) > float(
-                existing.get("total_score") or 0
+            if float(
+                candidate.get("ranking_score")
+                or candidate.get("total_score")
+                or 0
+            ) > float(
+                existing.get("ranking_score")
+                or existing.get("total_score")
+                or 0
             ):
                 replacement = dict(candidate)
                 replacement["strategies"] = sorted(strategies)
@@ -548,13 +636,33 @@ async def run_full_bullish_radar_v12(
     ranked = sorted(
         merged.values(),
         key=lambda item: (
-            float(item.get("total_score") or 0),
+            float(item.get("ranking_score") or item.get("total_score") or 0)
+            + min(
+                config.consensus_bonus_cap,
+                max(0, len(item.get("strategies") or []) - 1)
+                * config.consensus_bonus_per_extra_strategy,
+            ),
+            float(item.get("bullish_score") or item.get("total_score") or 0),
             len(item.get("strategies") or []),
             -float((item.get("tradingPlan") or {}).get("maximumRiskPercent") or 999),
             float(item.get("volume_ratio") or 0),
         ),
         reverse=True,
     )
+    for item in ranked:
+        consensus_bonus = min(
+            config.consensus_bonus_cap,
+            max(0, len(item.get("strategies") or []) - 1)
+            * config.consensus_bonus_per_extra_strategy,
+        )
+        item["consensusBonus"] = round(consensus_bonus, 2)
+        item["ranking_score"] = round(
+            min(
+                100.0,
+                float(item.get("ranking_score") or 0) + consensus_bonus,
+            ),
+            2,
+        )
     combined_tiers = split_v12_price_tiers(ranked, config)
     primary_ranked = combined_tiers["main"]
     high_price_ranked = combined_tiers["highPrice"][: config.high_price_limit]
@@ -563,6 +671,28 @@ async def run_full_bullish_radar_v12(
         item["rank"] = index
     for index, item in enumerate(high_price_ranked, start=1):
         item["highPriceRank"] = index
+    actionable_primary = [
+        item for item in primary_ranked
+        if str(item.get("actionCode") or "")
+        in V12_ACTIONABLE_STATUS_CODES
+    ]
+    watch_primary = [
+        item for item in primary_ranked
+        if str(item.get("actionCode") or "")
+        not in V12_ACTIONABLE_STATUS_CODES
+    ]
+    for index, item in enumerate(actionable_primary, start=1):
+        item["actionableRank"] = index
+    bullish_ranked = sorted(
+        primary_ranked,
+        key=lambda item: (
+            float(item.get("bullish_score") or item.get("total_score") or 0),
+            float(item.get("ranking_score") or 0),
+        ),
+        reverse=True,
+    )
+    for index, item in enumerate(bullish_ranked, start=1):
+        item["bullishRank"] = index
     displayed_candidates = primary_ranked + high_price_ranked
     accepted_high_price_symbols = {
         str(candidate.get("symbol") or "").strip()
@@ -592,11 +722,14 @@ async def run_full_bullish_radar_v12(
     return {
         "ok": True,
         "version": "V12",
+        "accuracyEngine": "V12.1_FORWARD_BULLISH",
         "strategies": list(V12_STRATEGIES),
         "candidateCount": len(displayed_candidates),
         "rawCandidateCount": len(ranked),
         "mainCandidateCount": len(primary_ranked),
         "highPriceCandidateCount": len(high_price_ranked),
+        "actionableCandidateCount": len(actionable_primary),
+        "watchCandidateCount": len(watch_primary),
         "excludedHighPriceCount": excluded_high_price_count,
         "minimumScore": minimum_score,
         "limitEach": limit_each,
@@ -615,11 +748,25 @@ async def run_full_bullish_radar_v12(
             "highPriceLimit": config.high_price_limit,
             "highPriceRequiresNoWarnings": True,
         },
-        "top10": primary_ranked[:10],
-        "top5": primary_ranked[:5],
-        "watchlistCandidates": primary_ranked[:3],
+        "top10": actionable_primary[:10],
+        "top5": actionable_primary[:5],
+        "actionableCandidates": actionable_primary,
+        "bullishTop10": bullish_ranked[:10],
+        "watchlistCandidates": watch_primary[:10],
         "highPriceStrongCandidates": high_price_ranked,
         "byStrategy": grouped,
         "record": combined_record,
+        "executionPriors": priors,
+        "rankingMethod": {
+            "bullishWeight": config.ranking_bullish_weight,
+            "executionWeight": config.ranking_execution_weight,
+            "top10Excludes": [
+                "WAIT_PULLBACK",
+                "DO_NOT_CHASE",
+                "BOTTOM_REVERSAL_WATCH",
+                "SMALL_POSITION_OR_SKIP",
+            ],
+            "historicalAdjustmentUsesExecutionOnly": True,
+        },
         "source": "PostgreSQL V12",
     }

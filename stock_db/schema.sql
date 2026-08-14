@@ -103,6 +103,42 @@ CREATE TABLE IF NOT EXISTS signal_performance (
         REFERENCES radar_candidates(radar_run_id, symbol) ON DELETE CASCADE
 );
 
+-- V12.1 execution-aware performance.  The legacy signal_performance table is
+-- intentionally retained as a close-to-close baseline.  This table records
+-- whether the published low-catch / confirmation plan would actually fill.
+CREATE TABLE IF NOT EXISTS signal_execution_performance (
+    radar_run_id BIGINT NOT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    strategy VARCHAR(32) NOT NULL,
+    signal_date DATE NOT NULL,
+    execution_status VARCHAR(24) NOT NULL,
+    status_reason TEXT,
+    aggressive_fill_date DATE,
+    aggressive_fill_price NUMERIC(14,4),
+    aggressive_fill_percent NUMERIC(8,4),
+    confirmation_fill_date DATE,
+    confirmation_fill_price NUMERIC(14,4),
+    confirmation_fill_percent NUMERIC(8,4),
+    entry_date DATE,
+    weighted_entry_price NUMERIC(14,4),
+    filled_position_percent NUMERIC(8,4),
+    exit_date DATE,
+    exit_price NUMERIC(14,4),
+    exit_reason VARCHAR(32),
+    return_d1 NUMERIC(10,4),
+    return_d3 NUMERIC(10,4),
+    return_d5 NUMERIC(10,4),
+    return_d10 NUMERIC(10,4),
+    return_d20 NUMERIC(10,4),
+    max_favorable_percent NUMERIC(10,4),
+    max_adverse_percent NUMERIC(10,4),
+    evaluated_through DATE,
+    calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (radar_run_id, symbol),
+    FOREIGN KEY (radar_run_id, symbol)
+        REFERENCES radar_candidates(radar_run_id, symbol) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS database_jobs (
     id BIGSERIAL PRIMARY KEY,
     job_type VARCHAR(50) NOT NULL,
@@ -126,6 +162,8 @@ CREATE INDEX IF NOT EXISTS idx_radar_runs_date_strategy
     ON radar_runs(run_date DESC, strategy);
 CREATE INDEX IF NOT EXISTS idx_radar_candidates_score
     ON radar_candidates(radar_run_id, total_score DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_execution_strategy
+    ON signal_execution_performance(strategy, execution_status, signal_date);
 CREATE INDEX IF NOT EXISTS idx_database_jobs_status
     ON database_jobs(status, created_at DESC);
 

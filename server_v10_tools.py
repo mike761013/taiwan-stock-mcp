@@ -7,7 +7,9 @@ from typing import Any
 from stock_db.maintenance import run_daily_maintenance
 from stock_db.performance import (
     DEFAULT_PERFORMANCE_UPDATE_LIMIT,
+    execution_performance_summary,
     performance_summary,
+    update_signal_execution_performance,
     update_signal_performance,
     weekly_performance_report,
 )
@@ -237,6 +239,17 @@ def register_v10_tools(mcp: Any) -> None:
         """優先更新新訊號，再更新最久未計算的1/3/5/10/20日績效。"""
         return await update_signal_performance(limit)
 
+    @mcp.tool()
+    async def update_v12_execution_performance(
+        limit: int = DEFAULT_PERFORMANCE_UPDATE_LIMIT,
+        entry_window_sessions: int = 3,
+    ) -> dict:
+        """依激進低接、確認買點、分批及收盤失敗條件更新真實可執行績效。"""
+        return await update_signal_execution_performance(
+            limit=limit,
+            entry_window_sessions=entry_window_sessions,
+        )
+
     async def _maintenance(
         run_radar: bool,
         update_performance: bool,
@@ -304,6 +317,13 @@ def register_v10_tools(mcp: Any) -> None:
     ) -> dict:
         """查詢雷達策略績效摘要。"""
         return await performance_summary(strategy)
+
+    @mcp.tool()
+    async def get_v12_execution_performance_summary(
+        strategy: str | None = None,
+    ) -> dict:
+        """只統計真正觸及V12雙買點的訊號，不把未成交當成虧損。"""
+        return await execution_performance_summary(strategy)
     @mcp.tool()
     async def get_radar_weekly_report(
         start_date: str | None = None,
