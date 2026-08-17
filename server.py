@@ -1,5 +1,7 @@
 ﻿import asyncio
+import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -22,6 +24,7 @@ except ImportError:  # Redis is optional; memory cache still works.
 PORT = int(os.environ.get("PORT", "8000"))
 FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+TDCC_SHAREHOLDING_URL = "https://opendata.tdcc.com.tw/getOD.ashx?id=1-5"
 TWSE_DAILY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX_DAILY_CLOSE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 
@@ -40,6 +43,16 @@ _redis_client: Any = None
 _redis_init_attempted = False
 _redis_error: str | None = None
 
+# TDCC 的 1-5 開放資料是一份包含全市場的 CSV。使用獨立記憶體快取，
+# 避免深查多檔股票時為每個代號重複下載整份檔案，也避免把大型 CSV
+# 寫進容量有限的免費 Redis。個股的週資料摘要仍會另外寫入共用快取，
+# 有 REDIS_URL 時可跨 Render 休眠／部署保留歷史比較。
+_tdcc_distribution_cache: dict[str, Any] = {
+    "expiresAt": 0.0,
+    "bySymbol": {},
+}
+_tdcc_distribution_lock = asyncio.Lock()
+
 CACHE_STATS: dict[str, int] = {
     "memoryHits": 0,
     "redisHits": 0,
@@ -47,6 +60,7 @@ CACHE_STATS: dict[str, int] = {
     "writes": 0,
     "fugleUpstreamRequests": 0,
     "finmindUpstreamRequests": 0,
+    "tdccUpstreamRequests": 0,
     "officialMarketUpstreamRequests": 0,
     "upstreamErrors": 0,
 }
@@ -110,6 +124,33 @@ def _finmind_ttl(dataset: str) -> int:
     if 8 <= now.hour < 19:
         return 2 * 3600
     return 10 * 3600
+
+
+def _tdcc_distribution_ttl() -> int:
+    """TDCC 股權分散每週更新；更新日前後縮短快取以較快取得新一期。"""
+    now = _taipei_now()
+    return 6 * 3600 if now.weekday() in {4, 5} else 24 * 3600
+
+
+# TDCC 持股分級以「股」為單位。第 1～15 級才是實際持股級距；
+# 第 16 級為差異數調整、第 17 級為合計，兩者不能重複計入比例。
+TDCC_HOLDING_LEVELS: dict[int, tuple[str, int | None]] = {
+    1: ("1-999股", 999),
+    2: ("1,000-5,000股", 5_000),
+    3: ("5,001-10,000股", 10_000),
+    4: ("10,001-15,000股", 15_000),
+    5: ("15,001-20,000股", 20_000),
+    6: ("20,001-30,000股", 30_000),
+    7: ("30,001-40,000股", 40_000),
+    8: ("40,001-50,000股", 50_000),
+    9: ("50,001-100,000股", 100_000),
+    10: ("100,001-200,000股", 200_000),
+    11: ("200,001-400,000股", 400_000),
+    12: ("400,001-600,000股", 600_000),
+    13: ("600,001-800,000股", 800_000),
+    14: ("800,001-1,000,000股", 1_000_000),
+    15: ("1,000,001股以上", None),
+}
 
 
 async def _get_redis_client() -> Any:
@@ -594,68 +635,268 @@ async def _get_lending_data(symbol: str, days: int) -> dict[str, Any]:
     }
 
 
-async def _get_distribution_data(symbol: str, days: int) -> dict[str, Any]:
-    start, end = _days_range(days, 28, 365)
-    rows = await _finmind_get(
-        "TaiwanStockHoldingSharesPer",
-        symbol,
-        start,
-        end,
-    )
-    if not rows:
+def _tdcc_number(value: Any) -> float:
+    """將 TDCC CSV 的千分位、百分號與空值安全轉為數字。"""
+    raw = str(value or "").strip().replace(",", "").replace("%", "")
+    if raw in {"", "-", "--", "N/A", "null", "None"}:
+        return 0.0
+    try:
+        number = float(raw)
+        return number if math.isfinite(number) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _normalize_tdcc_date(value: Any) -> str:
+    """把西元／民國日期統一成 YYYY-MM-DD；無法辨識時保留原值。"""
+    raw = str(value or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    try:
+        if len(digits) == 8:
+            return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8])).isoformat()
+        if len(digits) == 7:
+            return date(int(digits[:3]) + 1911, int(digits[3:5]), int(digits[5:7])).isoformat()
+    except ValueError:
+        pass
+    return raw
+
+
+def _parse_tdcc_distribution_csv(content: bytes | str) -> dict[str, list[dict[str, Any]]]:
+    """解析 TDCC OpenData 1-5，回傳依證券代號分組的 17 級資料。"""
+    if isinstance(content, bytes):
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = content.decode("big5", errors="replace")
+    else:
+        text = content.lstrip("\ufeff")
+
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise RuntimeError("TDCC 股權分散 CSV 沒有欄位標題。")
+
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    required_rows = 0
+    for raw_row in reader:
+        row = {
+            str(key or "").lstrip("\ufeff").strip(): value
+            for key, value in raw_row.items()
+        }
+
+        def pick(*names: str) -> Any:
+            for name in names:
+                if name in row:
+                    return row[name]
+            return None
+
+        symbol = str(pick("證券代號", "股票代號") or "").strip().upper()
+        level_raw = str(pick("持股分級", "持股/單位數分級") or "").strip()
+        level_match = re.search(r"\d+", level_raw)
+        if not symbol or not level_match:
+            continue
+        level_code = int(level_match.group())
+        if not 1 <= level_code <= 17:
+            continue
+
+        required_rows += 1
+        by_symbol.setdefault(symbol, []).append({
+            "date": _normalize_tdcc_date(pick("資料日期", "日期")),
+            "levelCode": level_code,
+            "people": _as_int(_tdcc_number(pick("人數", "持有人數"))),
+            "shares": _as_int(_tdcc_number(pick("股數", "持有股數"))),
+            "percent": _tdcc_number(
+                pick(
+                    "占集保庫存數比例%",
+                    "佔集保庫存數比例%",
+                    "占集保庫存數比例",
+                    "佔集保庫存數比例",
+                )
+            ),
+        })
+
+    if not required_rows or not by_symbol:
         raise RuntimeError(
-            "查無股權分散資料。此資料集需要 FinMind backer 或 sponsor 方案。"
+            "TDCC 股權分散 CSV 格式與預期不同，找不到證券代號或持股分級。"
         )
+    return by_symbol
+
+
+async def _get_tdcc_distribution_table(
+    force_refresh: bool = False,
+) -> dict[str, list[dict[str, Any]]]:
+    """下載一次全市場 TDCC CSV，供同一批深查的所有股票共用。"""
+    now_epoch = time.time()
+    cached = _tdcc_distribution_cache.get("bySymbol") or {}
+    if (
+        not force_refresh
+        and cached
+        and float(_tdcc_distribution_cache.get("expiresAt", 0)) > now_epoch
+    ):
+        return cached
+
+    async with _tdcc_distribution_lock:
+        now_epoch = time.time()
+        cached = _tdcc_distribution_cache.get("bySymbol") or {}
+        if (
+            not force_refresh
+            and cached
+            and float(_tdcc_distribution_cache.get("expiresAt", 0)) > now_epoch
+        ):
+            return cached
+
+        CACHE_STATS["tdccUpstreamRequests"] += 1
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=15.0),
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(
+                    TDCC_SHAREHOLDING_URL,
+                    headers={
+                        "Accept": "text/csv,*/*;q=0.8",
+                        "User-Agent": (
+                            "Mozilla/5.0 (compatible; TaiwanStockMCP/12.0; "
+                            "+https://github.com/mike761013/taiwan-stock-mcp)"
+                        ),
+                    },
+                )
+            if response.status_code == 429:
+                raise RuntimeError("TDCC 開放資料請求過於頻繁，請稍後再試。")
+            response.raise_for_status()
+            table = _parse_tdcc_distribution_csv(response.content)
+        except RuntimeError:
+            CACHE_STATS["upstreamErrors"] += 1
+            raise
+        except Exception as exc:
+            CACHE_STATS["upstreamErrors"] += 1
+            raise RuntimeError(f"TDCC 股權分散公開資料讀取失敗：{exc}") from exc
+
+        _tdcc_distribution_cache["bySymbol"] = table
+        _tdcc_distribution_cache["expiresAt"] = now_epoch + _tdcc_distribution_ttl()
+        return table
+
+
+def _summarize_tdcc_distribution(
+    day: str,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    levels: list[dict[str, Any]] = []
+    small_percent = 0.0
+    small_people = 0
+    total_people: int | None = None
+    total_shares: int | None = None
+
+    for row in sorted(rows, key=lambda item: int(item.get("levelCode", 99))):
+        level_code = int(row.get("levelCode", 0))
+        people = _as_int(_tdcc_number(row.get("people")))
+        shares = _as_int(_tdcc_number(row.get("shares")))
+        percent = _tdcc_number(row.get("percent"))
+
+        if level_code == 17:
+            total_people = people
+            total_shares = shares
+            continue
+        if level_code == 16:
+            continue
+        level_info = TDCC_HOLDING_LEVELS.get(level_code)
+        if level_info is None:
+            continue
+
+        label, upper = level_info
+        if upper is not None and upper <= 100_000:
+            small_percent += percent
+            small_people += people
+        levels.append({
+            "level": label,
+            "levelCode": level_code,
+            "people": people,
+            "percent": _round(percent),
+            "shares": shares,
+        })
+
+    if not levels:
+        raise RuntimeError("TDCC 查到股票代號，但沒有可用的持股級距。")
+    return {
+        "date": day,
+        "under100LotsPercent": _round(small_percent),
+        "under100LotsPeople": small_people,
+        "totalPeople": total_people,
+        "totalShares": total_shares,
+        "levels": levels,
+    }
+
+
+async def _remember_tdcc_distribution(
+    symbol: str,
+    latest: dict[str, Any],
+) -> dict[str, Any] | None:
+    """保留每週摘要；有 REDIS_URL 時可跨休眠／部署取得前一期變化。"""
+    payload = {"symbol": symbol}
+    stored = await _cache_get("tdcc:distribution:history", payload)
+    history = stored if isinstance(stored, list) else []
+    current = {
+        "date": latest.get("date"),
+        "under100LotsPercent": latest.get("under100LotsPercent"),
+        "under100LotsPeople": latest.get("under100LotsPeople"),
+    }
+    history = [
+        item for item in history
+        if isinstance(item, dict) and item.get("date") != current["date"]
+    ]
+    history.append(current)
+    history.sort(key=lambda item: str(item.get("date", "")))
+    history = history[-54:]
+    await _cache_set(
+        "tdcc:distribution:history",
+        payload,
+        history,
+        370 * 24 * 3600,
+    )
+    return history[-2] if len(history) >= 2 else None
+
+
+async def _get_distribution_data(
+    symbol: str,
+    days: int,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    # 保留 days 參數相容舊工具；TDCC 免費 CSV 本身只提供最新一期。
+    _days_range(days, 28, 365)
+    table = await _get_tdcc_distribution_table(force_refresh=force_refresh)
+    rows = table.get(symbol, [])
+    if not rows:
+        raise RuntimeError(f"TDCC 最新股權分散資料查無證券代號 {symbol}。")
 
     by_date: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        by_date.setdefault(str(row.get("date")), []).append(row)
+        day = str(row.get("date") or "")
+        if day:
+            by_date.setdefault(day, []).append(row)
+    if not by_date:
+        raise RuntimeError(f"TDCC 查到 {symbol}，但資料日期為空。")
 
-    dates = sorted(by_date)
-    latest_date = dates[-1]
-
-    def summarize(day: str) -> dict[str, Any]:
-        levels = []
-        small_percent = 0.0
-        small_people = 0
-        for row in by_date[day]:
-            level = str(row.get("HoldingSharesLevel", ""))
-            digits = [int(x) for x in re.findall(r"\d+", level.replace(",", ""))]
-            upper = max(digits) if digits else None
-            percent = _number(row, "percent")
-            people = _as_int(_number(row, "people"))
-            unit = _as_int(_number(row, "unit"))
-            if upper is not None and upper <= 100000:
-                small_percent += percent
-                small_people += people
-            levels.append({
-                "level": level,
-                "people": people,
-                "percent": _round(percent),
-                "shares": unit,
-            })
-        return {
-            "date": day,
-            "under100LotsPercent": _round(small_percent),
-            "under100LotsPeople": small_people,
-            "levels": sorted(levels, key=lambda x: x["level"]),
-        }
-
-    latest = summarize(latest_date)
-    previous = summarize(dates[-2]) if len(dates) >= 2 else None
+    latest_date = sorted(by_date)[-1]
+    latest = _summarize_tdcc_distribution(latest_date, by_date[latest_date])
+    previous = await _remember_tdcc_distribution(symbol, latest)
+    previous_percent = (
+        _safe_float(previous.get("under100LotsPercent")) if previous else None
+    )
 
     return {
         "symbol": symbol,
         "latest": latest,
-        "previousUnder100LotsPercent": (
-            previous["under100LotsPercent"] if previous else None
-        ),
+        "previousUnder100LotsPercent": previous_percent,
         "under100LotsPercentChange": (
-            _round(latest["under100LotsPercent"] - previous["under100LotsPercent"])
-            if previous else None
+            _round(_safe_float(latest["under100LotsPercent"]) - previous_percent)
+            if previous_percent is not None else None
         ),
-        "source": "FinMind TaiwanStockHoldingSharesPer",
-        "access": "FinMind backer 或 sponsor 會員",
+        "source": "TDCC OpenData 1-5 集保戶股權分散表",
+        "access": "免費公開資料，無需 Token",
+        "updateFrequency": "每週更新",
+        "historyNote": (
+            "TDCC 免費 CSV 只提供最新一期；系統留存第二期後才會顯示前期變化。"
+            "設定 REDIS_URL 可在 Render 休眠或重新部署後保留週資料。"
+        ),
     }
 
 
@@ -1542,13 +1783,18 @@ async def get_securities_lending(symbol: str, days: int = 30) -> dict:
 
 
 @mcp.tool()
-async def get_shareholding_distribution(symbol: str, days: int = 120) -> dict:
+async def get_shareholding_distribution(
+    symbol: str,
+    days: int = 120,
+    force_refresh: bool = False,
+) -> dict:
     """
     取得股權持股分級，並計算百張以下持股比例及相較前一期變化。
-    注意：FinMind 此資料集需要 backer 或 sponsor 方案。
+    資料來源為 TDCC 集保結算所免費公開資料，不需要 FinMind 付費會員。
+    TDCC 每週更新；force_refresh=true 可略過本機 TDCC 快取。
     """
     symbol = _validate_symbol(symbol)
-    result = await _get_distribution_data(symbol, days)
+    result = await _get_distribution_data(symbol, days, force_refresh=force_refresh)
     result["fetchedAtUtc"] = datetime.now(timezone.utc).isoformat()
     return result
 
@@ -1842,8 +2088,8 @@ async def get_stock_full_analysis(
 ) -> dict:
     """
     一次取得單檔股票的即時報價、180 日技術面、三大法人、融資融券、
-    外資持股與借券成交。include_distribution=true 時另查股權分散；
-    該資料可能需要 FinMind 付費方案。
+    外資持股與借券成交。include_distribution=true 時另由 TDCC 免費公開資料
+    查詢最新一期股權分散。
     """
     symbol = _validate_symbol(symbol)
 
@@ -1902,7 +2148,10 @@ async def get_stock_full_analysis(
             "risks": risks,
         }
 
-    output["source"] = "Fugle MarketData API v1.0 + FinMind API v4"
+    output["source"] = (
+        "Fugle MarketData API v1.0 + FinMind API v4"
+        + (" + TDCC OpenData 1-5" if include_distribution else "")
+    )
     output["fetchedAtUtc"] = datetime.now(timezone.utc).isoformat()
     return output
 
@@ -1948,6 +2197,8 @@ async def get_cache_status() -> dict:
             "finmindDaytime": 7200,
             "finmindNight": 36000,
             "shareholdingDistribution": 86400,
+            "tdccShareholdingFridaySaturday": 21600,
+            "tdccShareholdingOtherDays": 86400,
         },
         "note": (
             "未設定 REDIS_URL 時使用記憶體快取；免費 Render 休眠或重新部署後會清空。"
@@ -1960,7 +2211,7 @@ async def get_cache_status() -> dict:
 @mcp.tool()
 async def clear_cache(scope: str = "all") -> dict:
     """
-    清除快取。scope 支援 all、quote、market、snapshot、historical、finmind。
+    清除快取。scope 支援 all、quote、market、snapshot、historical、finmind、tdcc。
     一般情況不必清除；需要強制取得最新資料時使用。
     """
     scope = scope.lower().strip()
@@ -1970,9 +2221,12 @@ async def clear_cache(scope: str = "all") -> dict:
         "snapshot": "official:market",
         "historical": "fugle:historical",
         "finmind": "finmind:",
+        "tdcc": "tdcc:",
     }
     if scope not in {"all", *namespace_map.keys()}:
-        raise ValueError("scope 僅支援 all、quote、market、snapshot、historical、finmind。")
+        raise ValueError(
+            "scope 僅支援 all、quote、market、snapshot、historical、finmind、tdcc。"
+        )
 
     target = None if scope == "all" else namespace_map[scope]
     memory_deleted = 0
@@ -1981,6 +2235,11 @@ async def clear_cache(scope: str = "all") -> dict:
         if target is None or namespace.startswith(target):
             _memory_cache.pop(key, None)
             memory_deleted += 1
+
+    tdcc_table_cleared = scope in {"all", "tdcc"}
+    if tdcc_table_cleared:
+        _tdcc_distribution_cache["expiresAt"] = 0.0
+        _tdcc_distribution_cache["bySymbol"] = {}
 
     redis_deleted = 0
     client = await _get_redis_client()
@@ -2000,6 +2259,7 @@ async def clear_cache(scope: str = "all") -> dict:
         "scope": scope,
         "memoryDeleted": memory_deleted,
         "redisDeleted": redis_deleted,
+        "tdccTableCleared": tdcc_table_cleared,
         "timeTaipei": _taipei_now().isoformat(),
     }
 
@@ -2699,5 +2959,3 @@ except Exception as exc:
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
-
-
