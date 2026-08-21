@@ -5,9 +5,14 @@ import server_v10_tools
 from stock_db import radar
 from stock_db.performance import simulate_signal_execution
 from stock_db.v12 import (
+    V12_ACCURACY_ENGINE,
     V12Config,
+    apply_market_context,
     apply_execution_prior,
+    build_market_context,
     build_trading_plan,
+    build_v12_candidate,
+    pullback_v2_score,
     predictive_quality_score,
     strategy_passes,
     validate_v12_candidates,
@@ -150,6 +155,146 @@ def test_fake_breakout_is_rejected_when_it_closes_away_from_day_high():
     assert strategy_passes(row, "breakout", V12Config()) is False
 
 
+def test_breakout_requires_healthier_close_distance_and_volume():
+    healthy = {
+        "open": 101,
+        "high": 106,
+        "low": 100,
+        "close": 104,
+        "prev_close": 102,
+        "prev_high": 103,
+        "ma5": 101,
+        "ma20": 96,
+        "bollinger_upper": 103,
+        "volume_ratio": 2.0,
+    }
+    assert strategy_passes(healthy, "breakout", V12Config()) is True
+    assert strategy_passes(
+        {**healthy, "close": 103.5, "high": 107},
+        "breakout",
+        V12Config(),
+    ) is False
+    assert strategy_passes(
+        {**healthy, "volume_ratio": 3.3},
+        "breakout",
+        V12Config(),
+    ) is False
+
+
+def _pullback_down_day(close=101.0, high=102.0):
+    return {
+        "open": 102.0,
+        "high": high,
+        "low": 100.0,
+        "close": close,
+        "prev_close": 102.0,
+        "prev_high": 103.0,
+        "prev_low": 99.5,
+        "ma5": 100.0,
+        "ma10": 99.0,
+        "ma20": 97.0,
+        "ma60": 90.0,
+        "prev_ma5": 99.9,
+        "prev_ma20": 96.95,
+        "volume_ratio": 0.7,
+        "large_volume_low": 94.0,
+    }
+
+
+def test_down_pullback_needs_real_stabilisation_not_just_a_red_candle():
+    passed, _, reasons, _, _ = pullback_v2_score(
+        _pullback_down_day(),
+        V12Config(),
+    )
+    assert passed is True
+    assert any("量縮、低點未下移" in reason for reason in reasons)
+
+    weak, _, _, warnings, _ = pullback_v2_score(
+        _pullback_down_day(close=100.2),
+        V12Config(),
+    )
+    assert weak is False
+    assert any("不先假設是健康整理" in warning for warning in warnings)
+
+
+def test_extended_early_signal_stays_visible_but_is_not_forward_qualified():
+    row = {
+        "symbol": "1234",
+        "name": "測試股",
+        "market": "TWSE",
+        "industry": "電子",
+        "trade_date": "2026-08-20",
+        "open": 104.0,
+        "high": 106.0,
+        "low": 103.5,
+        "close": 105.0,
+        "prev_close": 103.0,
+        "prev_high": 104.0,
+        "prev_low": 101.0,
+        "ma5": 103.0,
+        "ma10": 101.5,
+        "ma20": 100.0,
+        "ma60": 95.0,
+        "prev_ma5": 102.5,
+        "prev_ma20": 99.9,
+        "volume": 3_000_000,
+        "volume_ma20": 2_000_000,
+        "volume_ratio": 1.5,
+        "turnover": 315_000_000,
+        "technical_score": 80.0,
+        "large_volume_low": 98.0,
+        "close5": 90.0,
+        "high20": 106.0,
+        "low20": 90.0,
+        "atr14": 2.0,
+    }
+    candidate = build_v12_candidate(row, "early_stage", V12Config())
+    assert candidate is not None
+    assert candidate["accuracyEngine"] == V12_ACCURACY_ENGINE
+    assert candidate["forwardQualified"] is False
+    assert any(
+        "五日漲幅" in reason
+        for reason in candidate["forwardQualification"]["failedRules"]
+    )
+    assert candidate["tradingPlan"]["failureCondition"]["confirmation"] == "收盤確認"
+
+
+def test_weak_market_downgrades_only_marginal_breakout_confirmation():
+    rows = [
+        {
+            "symbol": f"10{index:02d}",
+            "industry": "測試產業",
+            "close": 90.0,
+            "ma5": 92.0,
+            "ma20": 100.0,
+            "close5": 91.0,
+        }
+        for index in range(6)
+    ]
+    config = V12Config()
+    context = build_market_context(rows, config)
+    candidate = {
+        "symbol": "1000",
+        "industry": "測試產業",
+        "strategy": "breakout",
+        "bullish_score": 80.0,
+        "execution_score": 80.0,
+        "ranking_score": 80.0,
+        "predictive_quality_score": 72.0,
+        "forwardQualified": True,
+        "forwardQualification": {"qualified": True, "failedRules": []},
+        "warnings": [],
+    }
+    updated = apply_market_context(candidate, context, config)
+    assert context["regime"] == "WEAK"
+    assert updated["bullish_score"] == 76.0
+    assert updated["forwardQualified"] is False
+    assert any(
+        "弱勢市場" in reason
+        for reason in updated["forwardQualification"]["failedRules"]
+    )
+
+
 def test_predictive_quality_penalises_exhausted_five_day_move():
     base = {
         "open": 100,
@@ -284,7 +429,7 @@ def test_release_validation_reuses_full_radar_snapshot(monkeypatch):
         calls["full"] += 1
         return {
             "ok": True,
-            "accuracyEngine": "V12.1_FORWARD_BULLISH",
+            "accuracyEngine": V12_ACCURACY_ENGINE,
             "top10": [],
             "byStrategy": {
                 strategy: {

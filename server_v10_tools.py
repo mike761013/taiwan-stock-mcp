@@ -27,6 +27,7 @@ from stock_db.radar import (
     screen_database_market_v12,
 )
 from stock_db.v12 import (
+    V12_ACCURACY_ENGINE,
     V12_STRATEGIES,
     load_v12_config,
     validate_v12_candidates,
@@ -87,7 +88,7 @@ async def validate_v12_release_core(
         ),
         "fullRadarOk": bool(full.get("ok")),
         "accuracyEngineLoaded": (
-            full.get("accuracyEngine") == "V12.1_FORWARD_BULLISH"
+            full.get("accuracyEngine") == V12_ACCURACY_ENGINE
         ),
         "radarRunsWritten": int(after_stats.get("radar_runs", 0))
             > int(before_stats.get("radar_runs", 0)),
@@ -299,6 +300,7 @@ def register_v10_tools(mcp: Any) -> None:
         return {
             "ok": True,
             "version": "V12",
+            "accuracyEngine": V12_ACCURACY_ENGINE,
             "strategies": list(V12_STRATEGIES),
             "config": config.public_dict(),
         }
@@ -405,9 +407,10 @@ def register_v10_tools(mcp: Any) -> None:
     @mcp.tool()
     async def get_v12_execution_performance_summary(
         strategy: str | None = None,
+        accuracy_engine: str | None = None,
     ) -> dict:
-        """只統計真正觸及V12雙買點的訊號，不把未成交當成虧損。"""
-        return await execution_performance_summary(strategy)
+        """只統計真正觸及V12雙買點的訊號；可指定accuracy_engine隔離新版績效。"""
+        return await execution_performance_summary(strategy, accuracy_engine)
     @mcp.tool()
     async def get_radar_weekly_report(
         start_date: str | None = None,

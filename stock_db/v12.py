@@ -15,6 +15,7 @@ from typing import Any, Mapping, Sequence
 
 
 V12_STRATEGIES = ("early_stage", "breakout", "pullback", "reversal_reclaim")
+V12_ACCURACY_ENGINE = "V12.2_FORWARD_PERSISTENCE"
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "v12_config.json"
 
 V12_STATUS_LABELS = {
@@ -127,18 +128,45 @@ class V12Config:
     consensus_bonus_per_extra_strategy: float = 2.0
     consensus_bonus_cap: float = 4.0
 
-    # Immediate false-breakout / late-entry protection.
-    breakout_min_close_position: float = 0.55
-    breakout_max_distance_ma20_pct: float = 12.0
-    breakout_max_volume_ratio20: float = 4.0
-    predictive_max_5day_change_pct: float = 12.0
-    predictive_max_upper_shadow_pct: float = 3.0
+    # Immediate false-breakout / late-entry protection.  V12.2 deliberately
+    # keeps overheated names in the watch list while requiring a healthier
+    # close and less extension before they can enter the formal top ten.
+    breakout_min_close_position: float = 0.65
+    breakout_max_distance_ma20_pct: float = 9.0
+    breakout_max_volume_ratio20: float = 3.2
+    predictive_max_5day_change_pct: float = 10.0
+    predictive_max_upper_shadow_pct: float = 2.5
 
     # Early-stage candidates must still be close enough to the base.  Missing
     # previous-MA fields remain backward compatible with older snapshots.
-    early_max_distance_ma20_pct: float = 6.0
-    early_max_volume_ratio20: float = 2.5
-    early_min_close_position: float = 0.45
+    early_max_distance_ma20_pct: float = 5.5
+    early_max_volume_ratio20: float = 2.2
+    early_min_close_position: float = 0.52
+
+    # V12.2 forward-persistence qualification.  Candidates that fail these
+    # rules are still returned for observation, but are excluded from the
+    # formal actionable ranking until price structure confirms.
+    forward_min_bullish_score: float = 65.0
+    forward_min_quality_early: float = 64.0
+    forward_min_quality_breakout: float = 68.0
+    forward_min_quality_pullback: float = 66.0
+    forward_min_quality_reversal: float = 68.0
+    forward_ma20_slope_tolerance_pct: float = 0.15
+    forward_ma5_slope_tolerance_pct: float = 0.35
+    pullback_down_day_min_close_position: float = 0.45
+    pullback_down_day_max_volume_ratio20: float = 1.0
+    reversal_actionable_requires_ma20_reclaim: bool = True
+
+    # Breadth and industry context are calculated from the same daily
+    # snapshot, so no additional API quota is consumed.
+    market_weak_breadth_pct: float = 45.0
+    market_strong_breadth_pct: float = 60.0
+    market_weak_score_penalty: float = 4.0
+    market_weak_breakout_min_quality: float = 75.0
+    sector_relative_breadth_threshold_pct: float = 15.0
+    sector_strong_score_bonus: float = 2.0
+    sector_weak_score_penalty: float = 3.0
+    sector_minimum_members: int = 5
 
     # Historical execution performance is only allowed to make a small,
     # confidence-weighted adjustment.  This prevents a short hot streak from
@@ -241,6 +269,17 @@ def _distance_pct(value: float, reference: float, absolute: bool = False) -> flo
         return 0.0
     result = (value - reference) / reference * 100
     return abs(result) if absolute else result
+
+
+def _slope_not_declining(
+    current: float,
+    previous: float,
+    tolerance_pct: float,
+) -> bool:
+    """Treat missing history as unknown, otherwise reject a real downslope."""
+    if current <= 0 or previous <= 0:
+        return True
+    return current >= previous * (1.0 - max(0.0, tolerance_pct) / 100.0)
 
 
 def _bullish_engulfing(row: Mapping[str, Any]) -> bool:
@@ -460,6 +499,8 @@ def pullback_v2_score(
     ma10 = _number(row, "ma10")
     ma20 = _number(row, "ma20")
     ma60 = _number(row, "ma60")
+    prev_ma5 = _number(row, "prev_ma5")
+    prev_ma20 = _number(row, "prev_ma20")
     volume_ratio = _number(row, "volume_ratio")
     large_volume_low = _number(row, "large_volume_low")
     close_position = _close_position(row)
@@ -478,6 +519,27 @@ def pullback_v2_score(
         reasons.append("MA5>MA10>MA20>MA60，完整多頭排列")
     else:
         warnings.append("均線未形成MA5>MA10>MA20>MA60完整多頭排列")
+
+    ma20_persistent = _slope_not_declining(
+        ma20,
+        prev_ma20,
+        config.forward_ma20_slope_tolerance_pct,
+    )
+    ma5_persistent = _slope_not_declining(
+        ma5,
+        prev_ma5,
+        config.forward_ma5_slope_tolerance_pct,
+    )
+    if ma20_persistent:
+        score += 5
+        if prev_ma20 > 0:
+            reasons.append("MA20未轉為明顯下彎")
+    else:
+        score -= 12
+        warnings.append("MA20已下彎，不視為健康多頭回檔")
+    if not ma5_persistent:
+        score -= 6
+        warnings.append("MA5斜率快速轉弱")
 
     dist5 = _distance_pct(close, ma5) if ma5 > 0 else 999.0
     ma5_hold = ma5 > 0 and close >= ma5
@@ -518,12 +580,22 @@ def pullback_v2_score(
         warnings.append("收盤跌破滾動大量低點")
 
     change_pct = _daily_change_pct(row)
+    down_day_quality = (
+        change_pct < 0
+        and 0 < volume_ratio <= config.pullback_down_day_max_volume_ratio20
+        and close_position >= config.pullback_down_day_min_close_position
+        and prev_low > 0
+        and low >= prev_low
+        and ma20_persistent
+        and ma5_persistent
+    )
     if change_pct < 0:
-        score += 15
-        reasons.append("收跌但MA5與大量低點支撐未破")
-        if volume_ratio <= 1.0:
-            score += 5
-            reasons.append("收跌量縮，屬健康整理")
+        if down_day_quality:
+            score += 10
+            reasons.append("收跌但量縮、低點未下移且收盤位置健康")
+        else:
+            score -= 8
+            warnings.append("收跌日缺少量縮、低點墊高或收盤承接，不先假設是健康整理")
     else:
         score += 4
 
@@ -558,10 +630,12 @@ def pullback_v2_score(
 
     core_pass = (
         trend_ok
+        and ma20_persistent
         and near_ma5
         and massive_low_hold
         and 0 < volume_ratio <= config.pullback_max_volume_ratio20
         and stabilization_ok
+        and (change_pct >= 0 or down_day_quality)
     )
     return core_pass, _clamp(score), reasons, warnings, signals
 
@@ -753,6 +827,271 @@ def predictive_quality_score(
     return _clamp(score), positives, risks
 
 
+def evaluate_forward_qualification(
+    row: Mapping[str, Any],
+    strategy: str,
+    bullish_score: float,
+    quality_score: float,
+    config: V12Config,
+) -> dict[str, Any]:
+    """Decide whether a signal is strong enough for the formal top ten.
+
+    Failing this gate does not delete the signal.  It stays visible as a watch
+    candidate so explosive but extended stocks can still be monitored without
+    being presented as an already-confirmed entry.
+    """
+    quality_thresholds = {
+        "early_stage": config.forward_min_quality_early,
+        "breakout": config.forward_min_quality_breakout,
+        "pullback": config.forward_min_quality_pullback,
+        "reversal_reclaim": config.forward_min_quality_reversal,
+    }
+    quality_threshold = quality_thresholds[strategy]
+    passed_rules: list[str] = []
+    failed_rules: list[str] = []
+
+    if bullish_score >= config.forward_min_bullish_score:
+        passed_rules.append("綜合看漲分數達標")
+    else:
+        failed_rules.append(
+            f"綜合看漲分數{bullish_score:.1f}低於"
+            f"{config.forward_min_bullish_score:.1f}"
+        )
+    if quality_score >= quality_threshold:
+        passed_rules.append("後勢品質分數達標")
+    else:
+        failed_rules.append(
+            f"後勢品質分數{quality_score:.1f}低於{quality_threshold:.1f}"
+        )
+
+    close = _number(row, "close")
+    ma5 = _number(row, "ma5")
+    ma20 = _number(row, "ma20")
+    prev_ma5 = _number(row, "prev_ma5")
+    prev_ma20 = _number(row, "prev_ma20")
+    change5 = _five_day_change_pct(row)
+    close_position = _close_position(row)
+    upper_shadow = _upper_shadow_pct(row)
+
+    if strategy in {"early_stage", "breakout", "pullback"}:
+        if _slope_not_declining(
+            ma20,
+            prev_ma20,
+            config.forward_ma20_slope_tolerance_pct,
+        ):
+            passed_rules.append("MA20趨勢未明顯轉弱")
+        else:
+            failed_rules.append("MA20已明顯下彎")
+
+    if strategy in {"early_stage", "pullback"}:
+        if _slope_not_declining(
+            ma5,
+            prev_ma5,
+            config.forward_ma5_slope_tolerance_pct,
+        ):
+            passed_rules.append("MA5斜率未快速轉弱")
+        else:
+            failed_rules.append("MA5斜率快速轉弱")
+
+    if strategy in {"early_stage", "breakout"}:
+        if change5 <= config.predictive_max_5day_change_pct:
+            passed_rules.append("五日漲幅未過度透支")
+        else:
+            failed_rules.append(
+                f"五日漲幅{change5:.1f}%已過度透支，保留觀察但不列正式買點"
+            )
+        if upper_shadow <= config.predictive_max_upper_shadow_pct:
+            passed_rules.append("上影線風險可控")
+        else:
+            failed_rules.append("上影線過長，突破承接不足")
+
+    if strategy == "breakout":
+        if close_position >= config.breakout_min_close_position:
+            passed_rules.append("突破日收盤位置健康")
+        else:
+            failed_rules.append("突破日收盤離日高過遠")
+
+    if strategy == "pullback" and _daily_change_pct(row) < 0:
+        down_day_ok = (
+            0 < _number(row, "volume_ratio")
+            <= config.pullback_down_day_max_volume_ratio20
+            and close_position >= config.pullback_down_day_min_close_position
+            and _number(row, "prev_low") > 0
+            and _number(row, "low") >= _number(row, "prev_low")
+        )
+        if down_day_ok:
+            passed_rules.append("收跌日具備量縮、低點墊高與收盤承接")
+        else:
+            failed_rules.append("收跌日尚未形成可驗證的止穩結構")
+
+    if (
+        strategy == "reversal_reclaim"
+        and config.reversal_actionable_requires_ma20_reclaim
+    ):
+        if close >= ma20 > 0:
+            passed_rules.append("反轉訊號已站回MA20")
+        else:
+            failed_rules.append("反轉訊號尚未站回MA20，只列底部觀察")
+
+    return {
+        "qualified": not failed_rules,
+        "engine": V12_ACCURACY_ENGINE,
+        "minimumBullishScore": config.forward_min_bullish_score,
+        "minimumQualityScore": quality_threshold,
+        "passedRules": passed_rules,
+        "failedRules": failed_rules,
+    }
+
+
+def build_market_context(
+    rows: Sequence[Mapping[str, Any]],
+    config: V12Config,
+) -> dict[str, Any]:
+    """Build broad-market and industry breadth from the existing snapshot."""
+    usable: list[Mapping[str, Any]] = []
+    industries: dict[str, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        close = _number(row, "close")
+        ma20 = _number(row, "ma20")
+        if close <= 0 or ma20 <= 0:
+            continue
+        usable.append(row)
+        industry = str(row.get("industry") or "").strip()
+        if industry:
+            industries.setdefault(industry, []).append(row)
+
+    count = len(usable)
+    above_ma20 = sum(
+        1 for row in usable if _number(row, "close") >= _number(row, "ma20")
+    )
+    aligned = sum(
+        1 for row in usable if _number(row, "ma5") >= _number(row, "ma20") > 0
+    )
+    breadth = above_ma20 / count * 100 if count else 0.0
+    alignment = aligned / count * 100 if count else 0.0
+    if breadth >= config.market_strong_breadth_pct:
+        regime = "STRONG"
+        regime_label = "市場寬度偏強"
+    elif breadth < config.market_weak_breadth_pct:
+        regime = "WEAK"
+        regime_label = "市場寬度偏弱"
+    else:
+        regime = "NEUTRAL"
+        regime_label = "市場寬度中性"
+
+    industry_context: dict[str, dict[str, Any]] = {}
+    for industry, members in industries.items():
+        member_count = len(members)
+        if member_count < config.sector_minimum_members:
+            continue
+        sector_above = sum(
+            1
+            for row in members
+            if _number(row, "close") >= _number(row, "ma20")
+        )
+        changes = sorted(_five_day_change_pct(row) for row in members)
+        middle = member_count // 2
+        median_change = (
+            changes[middle]
+            if member_count % 2
+            else (changes[middle - 1] + changes[middle]) / 2
+        )
+        sector_breadth = sector_above / member_count * 100
+        industry_context[industry] = {
+            "memberCount": member_count,
+            "aboveMA20Percent": round(sector_breadth, 2),
+            "relativeBreadthPercent": round(sector_breadth - breadth, 2),
+            "medianFiveDayChangePercent": round(median_change, 2),
+        }
+
+    return {
+        "sampleCount": count,
+        "aboveMA20Percent": round(breadth, 2),
+        "ma5AboveMA20Percent": round(alignment, 2),
+        "regime": regime,
+        "regimeLabel": regime_label,
+        "industries": industry_context,
+    }
+
+
+def apply_market_context(
+    candidate: Mapping[str, Any],
+    context: Mapping[str, Any],
+    config: V12Config,
+) -> dict[str, Any]:
+    """Apply a small, transparent breadth adjustment without hiding signals."""
+    item = dict(candidate)
+    adjustment = 0.0
+    reasons: list[str] = []
+    warnings = list(item.get("warnings") or [])
+    regime = str(context.get("regime") or "NEUTRAL")
+    industry = str(item.get("industry") or "").strip()
+    industries = context.get("industries")
+    sector = (
+        industries.get(industry)
+        if isinstance(industries, Mapping) and industry
+        else None
+    )
+
+    if regime == "WEAK":
+        adjustment -= config.market_weak_score_penalty
+        warnings.append("整體市場寬度偏弱，後勢分數保守扣分")
+
+    if isinstance(sector, Mapping):
+        relative = _number(sector, "relativeBreadthPercent")
+        median_change = _number(sector, "medianFiveDayChangePercent")
+        threshold = config.sector_relative_breadth_threshold_pct
+        if relative >= threshold and median_change > 0:
+            adjustment += config.sector_strong_score_bonus
+            reasons.append("所屬產業相對市場強勢")
+        elif relative <= -threshold and median_change < 0:
+            adjustment -= config.sector_weak_score_penalty
+            warnings.append("所屬產業廣度明顯落後市場")
+
+    qualification = dict(item.get("forwardQualification") or {})
+    if (
+        regime == "WEAK"
+        and str(item.get("strategy") or "") == "breakout"
+        and _number(item, "predictive_quality_score")
+        < config.market_weak_breakout_min_quality
+    ):
+        qualification["qualified"] = False
+        failed = list(qualification.get("failedRules") or [])
+        failed.append("弱勢市場中的突破品質不足，只列觀察")
+        qualification["failedRules"] = failed
+
+    bullish_score = _clamp(_number(item, "bullish_score") + adjustment)
+    execution_score = _clamp(_number(item, "execution_score") + adjustment)
+    ranking_score = _clamp(
+        bullish_score * config.ranking_bullish_weight
+        + execution_score * config.ranking_execution_weight
+    )
+    compact_context = {
+        "regime": regime,
+        "regimeLabel": context.get("regimeLabel"),
+        "aboveMA20Percent": context.get("aboveMA20Percent"),
+        "ma5AboveMA20Percent": context.get("ma5AboveMA20Percent"),
+        "industry": industry or None,
+        "industryContext": dict(sector) if isinstance(sector, Mapping) else None,
+        "scoreAdjustment": round(adjustment, 2),
+    }
+    item.update(
+        {
+            "bullish_score": round(bullish_score, 2),
+            "total_score": round(bullish_score, 2),
+            "finalScore": round(bullish_score, 2),
+            "execution_score": round(execution_score, 2),
+            "ranking_score": round(ranking_score, 2),
+            "marketContext": compact_context,
+            "marketContextReasons": reasons,
+            "forwardQualification": qualification,
+            "forwardQualified": bool(qualification.get("qualified")),
+            "warnings": warnings,
+        }
+    )
+    return item
+
+
 def actionability_adjustment(
     action_code: str, maximum_risk_percent: float
 ) -> tuple[float, list[str]]:
@@ -793,6 +1132,15 @@ def apply_execution_prior(
         bullish_score * config.ranking_bullish_weight
         + execution_score * config.ranking_execution_weight
     )
+    qualification = dict(item.get("forwardQualification") or {})
+    if (
+        bool(qualification.get("qualified", item.get("forwardQualified", True)))
+        and bullish_score < config.forward_min_bullish_score
+    ):
+        qualification["qualified"] = False
+        failed = list(qualification.get("failedRules") or [])
+        failed.append("同版實際成交績效調整後，看漲分數低於正式門檻")
+        qualification["failedRules"] = failed
     item.update(
         {
             "historical_execution_adjustment": round(adjustment, 2),
@@ -802,6 +1150,13 @@ def apply_execution_prior(
             "finalScore": round(bullish_score, 2),
             "execution_score": round(execution_score, 2),
             "ranking_score": round(ranking_score, 2),
+            "forwardQualification": qualification,
+            "forwardQualified": bool(
+                qualification.get(
+                    "qualified",
+                    item.get("forwardQualified", True),
+                )
+            ),
         }
     )
     return item
@@ -1213,6 +1568,13 @@ def build_v12_candidate(
         + quality_score * config.bullish_quality_score_weight
         + adjustment
     )
+    forward_qualification = evaluate_forward_qualification(
+        row,
+        strategy,
+        bullish_score,
+        quality_score,
+        config,
+    )
     plan = build_trading_plan(row, strategy, config)
 
     # A heavily penalised setup is observable but should not be presented as a buy.
@@ -1257,7 +1619,7 @@ def build_v12_candidate(
             "change_percent": daily_change_percent,
             "strategy": strategy,
             "strategies": [strategy],
-            "accuracyEngine": "V12.1_FORWARD_BULLISH",
+            "accuracyEngine": V12_ACCURACY_ENGINE,
             "raw_score": round(raw_score, 2),
             "predictive_quality_score": round(quality_score, 2),
             "trading_adjustment": round(adjustment, 2),
@@ -1269,11 +1631,18 @@ def build_v12_candidate(
             "finalScore": round(bullish_score, 2),
             "action": v12_status_label(action_code),
             "actionCode": action_code,
+            "forwardQualified": bool(forward_qualification["qualified"]),
+            "forwardQualification": forward_qualification,
             "reasons": reasons + [
                 f"後勢品質：{reason}" for reason in quality_reasons
             ],
             "warnings": (
                 pattern_warnings + quality_warnings + trading_warnings
+                + (
+                    []
+                    if forward_qualification["qualified"]
+                    else ["尚未通過V12.2後勢持續性門檻，保留觀察但不列正式前十"]
+                )
             ),
             "executionScoreDetails": execution_reasons,
             "liquidity": liquidity,
@@ -1344,6 +1713,8 @@ def split_v12_price_tiers(
             )
         if action_code not in V12_HIGH_PRICE_ELIGIBLE_STATUS_CODES:
             failures.append("目前操作狀態不適合列入高價強勢股")
+        if not bool(item.get("forwardQualified", True)):
+            failures.append("尚未通過後勢持續性門檻")
         if maximum_risk > config.high_price_max_risk_pct:
             failures.append(
                 f"最大風險{maximum_risk:.1f}%高於"
@@ -1377,6 +1748,7 @@ def split_v12_price_tiers(
                 "highPriceQualification": [
                     f"總分{score:.1f}",
                     "操作狀態可執行",
+                    "後勢持續性門檻已通過",
                     f"最大風險{maximum_risk:.1f}%",
                     "無過熱、乖離或走弱警示",
                 ],

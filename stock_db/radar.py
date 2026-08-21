@@ -9,9 +9,12 @@ from .connection import stock_database
 from .performance import execution_strategy_priors
 from .service import stock_database_service
 from .v12 import (
+    V12_ACCURACY_ENGINE,
     V12_ACTIONABLE_STATUS_CODES,
     V12_STRATEGIES,
     apply_execution_prior,
+    apply_market_context,
+    build_market_context,
     load_v12_config,
     screen_v12_rows,
     split_v12_price_tiers,
@@ -289,7 +292,7 @@ _V12_SNAPSHOT_QUERY = f"""
         WHERE reverse_rank <= 60
         GROUP BY symbol
     )
-    SELECT b.symbol, s.name, s.market, b.trade_date,
+    SELECT b.symbol, s.name, s.market, s.industry, b.trade_date,
            b.open, b.high, b.low, b.close, b.volume, b.turnover,
            b.change_percent,
            i.ma5, i.ma10, i.ma20, i.ma60,
@@ -381,6 +384,7 @@ async def _save_v12_strategy(
     minimum_score: float,
     limit: int,
     config: Any,
+    market_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return await stock_database_service.save_radar_result(
         strategy=f"v12_{strategy}",
@@ -391,8 +395,10 @@ async def _save_v12_strategy(
             "minimumScore": minimum_score,
             "limit": limit,
             "engine": "postgres-v12",
+            "accuracyEngine": V12_ACCURACY_ENGINE,
             "latestTradeDate": str(latest_trade_date) if latest_trade_date else None,
             "v12": config.public_dict(),
+            "marketContext": market_context or {},
         },
     )
 
@@ -411,11 +417,13 @@ async def screen_database_market_v12(
     minimum_score = max(0.0, min(float(minimum_score), 100.0))
     config = load_v12_config()
     rows, universe_count, latest_trade_date = await _fetch_v12_snapshot()
+    market_context = build_market_context(rows, config)
     priors = (
         await execution_strategy_priors(
             minimum_samples=config.execution_prior_min_samples,
             full_confidence_samples=config.execution_prior_full_confidence_samples,
             maximum_adjustment=config.execution_prior_max_adjustment,
+            accuracy_engine=V12_ACCURACY_ENGINE,
         )
         if rows else {}
     )
@@ -427,7 +435,11 @@ async def screen_database_market_v12(
         config=config,
     )
     raw_candidates = [
-        apply_execution_prior(candidate, priors.get(strategy), config)
+        apply_execution_prior(
+            apply_market_context(candidate, market_context, config),
+            priors.get(strategy),
+            config,
+        )
         for candidate in raw_candidates
     ]
     raw_candidates.sort(
@@ -447,11 +459,13 @@ async def screen_database_market_v12(
         candidate for candidate in candidates
         if str(candidate.get("actionCode") or "")
         in V12_ACTIONABLE_STATUS_CODES
+        and bool(candidate.get("forwardQualified", True))
     ]
     watch_results = [
         candidate for candidate in candidates
         if str(candidate.get("actionCode") or "")
         not in V12_ACTIONABLE_STATUS_CODES
+        or not bool(candidate.get("forwardQualified", True))
     ]
     for rank, candidate in enumerate(primary_results, start=1):
         candidate["rank"] = rank
@@ -468,12 +482,13 @@ async def screen_database_market_v12(
             minimum_score,
             limit,
             config,
+            market_context,
         )
 
     return {
         "ok": True,
         "version": "V12",
-        "accuracyEngine": "V12.1_FORWARD_BULLISH",
+        "accuracyEngine": V12_ACCURACY_ENGINE,
         "strategy": strategy,
         "candidateCount": len(candidates),
         "rawCandidateCount": len(raw_candidates),
@@ -485,6 +500,7 @@ async def screen_database_market_v12(
         "universeCount": universe_count,
         "snapshotCount": len(rows),
         "latestTradeDate": latest_trade_date,
+        "marketContext": market_context,
         "minimumScore": minimum_score,
         "liquidityRules": {
             "minDailyVolumeLots": config.min_daily_volume_lots,
@@ -520,11 +536,13 @@ async def run_full_bullish_radar_v12(
     minimum_score = max(0.0, min(float(minimum_score), 100.0))
     config = load_v12_config()
     rows, universe_count, latest_trade_date = await _fetch_v12_snapshot()
+    market_context = build_market_context(rows, config)
     priors = (
         await execution_strategy_priors(
             minimum_samples=config.execution_prior_min_samples,
             full_confidence_samples=config.execution_prior_full_confidence_samples,
             maximum_adjustment=config.execution_prior_max_adjustment,
+            accuracy_engine=V12_ACCURACY_ENGINE,
         )
         if rows else {}
     )
@@ -542,7 +560,11 @@ async def run_full_bullish_radar_v12(
             config=config,
         )
         raw_candidates = [
-            apply_execution_prior(candidate, priors.get(strategy), config)
+            apply_execution_prior(
+                apply_market_context(candidate, market_context, config),
+                priors.get(strategy),
+                config,
+            )
             for candidate in raw_candidates
         ]
         raw_candidates.sort(
@@ -577,6 +599,7 @@ async def run_full_bullish_radar_v12(
                 minimum_score,
                 limit_each,
                 config,
+                market_context,
             )
         grouped[strategy] = {
             "ok": True,
@@ -666,11 +689,13 @@ async def run_full_bullish_radar_v12(
         item for item in primary_ranked
         if str(item.get("actionCode") or "")
         in V12_ACTIONABLE_STATUS_CODES
+        and bool(item.get("forwardQualified", True))
     ]
     watch_primary = [
         item for item in primary_ranked
         if str(item.get("actionCode") or "")
         not in V12_ACTIONABLE_STATUS_CODES
+        or not bool(item.get("forwardQualified", True))
     ]
     for index, item in enumerate(actionable_primary, start=1):
         item["actionableRank"] = index
@@ -705,15 +730,17 @@ async def run_full_bullish_radar_v12(
                 "minimumScore": minimum_score,
                 "limitEach": limit_each,
                 "engine": "postgres-v12",
+                "accuracyEngine": V12_ACCURACY_ENGINE,
                 "latestTradeDate": str(latest_trade_date) if latest_trade_date else None,
                 "v12": config.public_dict(),
+                "marketContext": market_context,
             },
         )
 
     return {
         "ok": True,
         "version": "V12",
-        "accuracyEngine": "V12.1_FORWARD_BULLISH",
+        "accuracyEngine": V12_ACCURACY_ENGINE,
         "strategies": list(V12_STRATEGIES),
         "candidateCount": len(displayed_candidates),
         "rawCandidateCount": len(ranked),
@@ -727,6 +754,7 @@ async def run_full_bullish_radar_v12(
         "universeCount": universe_count,
         "snapshotCount": len(rows),
         "latestTradeDate": latest_trade_date,
+        "marketContext": market_context,
         "liquidityRules": {
             "minDailyVolumeLots": config.min_daily_volume_lots,
             "minAverageVolume20Lots": config.min_average_volume20_lots,
@@ -758,6 +786,8 @@ async def run_full_bullish_radar_v12(
                 "SMALL_POSITION_OR_SKIP",
             ],
             "historicalAdjustmentUsesExecutionOnly": True,
+            "formalTop10RequiresForwardQualification": True,
+            "watchlistRetainsUnconfirmedAndOverheatedSignals": True,
         },
         "source": "PostgreSQL V12",
     }

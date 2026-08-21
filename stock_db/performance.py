@@ -841,6 +841,7 @@ async def update_signal_execution_performance(
 
 async def execution_performance_summary(
     strategy: str | None = None,
+    accuracy_engine: str | None = None,
 ) -> dict[str, Any]:
     """Return performance only for plans that would really have filled."""
     requested = str(strategy or "").strip().lower()
@@ -849,8 +850,18 @@ async def execution_performance_summary(
         resolved = f"v12_{resolved}"
     async with stock_database.acquire() as connection:
         await _ensure_execution_schema(connection)
-        where = "WHERE LOWER(e.strategy)=$1" if resolved else ""
-        args = [resolved] if resolved else []
+        conditions: list[str] = []
+        args: list[Any] = []
+        if resolved:
+            args.append(resolved)
+            conditions.append(f"LOWER(e.strategy)=${len(args)}")
+        requested_engine = str(accuracy_engine or "").strip()
+        if requested_engine:
+            args.append(requested_engine)
+            conditions.append(
+                f"COALESCE(c.snapshot->>'accuracyEngine', '')=${len(args)}"
+            )
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         distinct_keys = (
             "e.signal_date, e.symbol, e.strategy"
             if resolved else "e.signal_date, e.symbol"
@@ -914,6 +925,7 @@ async def execution_performance_summary(
         "ok": True,
         "strategy": requested or None,
         "resolvedStrategy": resolved or None,
+        "accuracyEngine": requested_engine or None,
         "summary": summary,
         "method": "V12.1_DUAL_ENTRY_EXECUTION",
         "notes": [
@@ -928,20 +940,28 @@ async def execution_strategy_priors(
     minimum_samples: int = 30,
     full_confidence_samples: int = 120,
     maximum_adjustment: float = 8.0,
+    accuracy_engine: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Build small confidence-weighted priors from matured executable trades."""
     minimum_samples = max(10, int(minimum_samples))
     full_confidence_samples = max(minimum_samples, int(full_confidence_samples))
     maximum_adjustment = max(0.0, min(float(maximum_adjustment), 15.0))
+    requested_engine = str(accuracy_engine or "").strip()
+    engine_where = (
+        "WHERE COALESCE(c.snapshot->>'accuracyEngine', '')=$1"
+        if requested_engine
+        else ""
+    )
     async with stock_database.acquire() as connection:
         await _ensure_execution_schema(connection)
         rows = await connection.fetch(
-            """
+            f"""
             WITH dedup AS (
               SELECT DISTINCT ON (e.signal_date, e.symbol, e.strategy) e.*
               FROM signal_execution_performance e
               JOIN radar_candidates c
                 ON c.radar_run_id=e.radar_run_id AND c.symbol=e.symbol
+              {engine_where}
               ORDER BY e.signal_date, e.symbol, e.strategy,
                        c.total_score DESC NULLS LAST,
                        e.radar_run_id DESC
@@ -957,7 +977,8 @@ async def execution_strategy_priors(
             FROM dedup
             WHERE execution_status IN ('FILLED','EXITED')
             GROUP BY LOWER(strategy)
-            """
+            """,
+            *([requested_engine] if requested_engine else []),
         )
 
     priors: dict[str, dict[str, Any]] = {}
@@ -997,6 +1018,7 @@ async def execution_strategy_priors(
             "confidence": round(confidence, 4),
             "adjustment": round(adjustment, 4),
             "active": confidence > 0,
+            "accuracyEngine": requested_engine or None,
         }
     return priors
 
