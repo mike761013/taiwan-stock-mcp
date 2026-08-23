@@ -52,7 +52,7 @@ class StockRepository:
         ON CONFLICT(symbol) DO UPDATE SET
             name=EXCLUDED.name,
             market=EXCLUDED.market,
-            industry=EXCLUDED.industry,
+            industry=COALESCE(EXCLUDED.industry, securities.industry),
             is_active=EXCLUDED.is_active,
             updated_at=NOW()
         """
@@ -303,7 +303,7 @@ class StockRepository:
 
     async def cleanup_old_data(
         self,
-        retention_years: int = 3,
+        retention_years: int = 5,
         radar_retention_days: int = 180,
         job_retention_days: int = 90,
         vacuum: bool = True,

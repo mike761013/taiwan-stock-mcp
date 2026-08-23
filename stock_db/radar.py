@@ -6,6 +6,7 @@ from datetime import date
 from typing import Any
 
 from .connection import stock_database
+from .factors import enrich_candidates_v12_3
 from .performance import execution_strategy_priors
 from .service import stock_database_service
 from .v12 import (
@@ -449,6 +450,21 @@ async def screen_database_market_v12(
         ),
         reverse=True,
     )
+    raw_candidates = raw_candidates[: max(limit * 2, int(config.factor_prefilter_limit))]
+    factor_date = latest_trade_date or date.today()
+    raw_candidates = await enrich_candidates_v12_3(
+        raw_candidates,
+        factor_date,
+        market_context,
+        config,
+    )
+    raw_candidates.sort(
+        key=lambda item: (
+            float(item.get("ranking_score") or 0),
+            float(item.get("bullish_score") or 0),
+        ),
+        reverse=True,
+    )
     tiers = split_v12_price_tiers(raw_candidates, config)
     primary_results = tiers["main"][:limit]
     high_price_results = tiers["highPrice"][
@@ -647,8 +663,23 @@ async def run_full_bullish_radar_v12(
             else:
                 existing["strategies"] = sorted(strategies)
 
-    ranked = sorted(
+    preliminary = sorted(
         merged.values(),
+        key=lambda item: (
+            float(item.get("ranking_score") or item.get("total_score") or 0),
+            float(item.get("bullish_score") or item.get("total_score") or 0),
+        ),
+        reverse=True,
+    )[: max(10, int(config.factor_prefilter_limit))]
+    factor_date = latest_trade_date or date.today()
+    enriched_merged = await enrich_candidates_v12_3(
+        preliminary,
+        factor_date,
+        market_context,
+        config,
+    )
+    ranked = sorted(
+        enriched_merged,
         key=lambda item: (
             float(item.get("ranking_score") or item.get("total_score") or 0)
             + min(

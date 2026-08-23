@@ -275,3 +275,4 @@ def test_full_v12_radar_initialises_high_price_rejection_tracking(
     assert result["ok"] is True
     assert result["candidateCount"] == 0
     assert result["excludedHighPriceCount"] == 0
+

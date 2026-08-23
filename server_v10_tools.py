@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from stock_db.maintenance import run_daily_maintenance
+from stock_db.factors import refresh_monthly_revenue, update_theme_tags
 from stock_db.performance import (
     DEFAULT_PERFORMANCE_UPDATE_LIMIT,
     execution_performance_summary,
@@ -143,9 +144,20 @@ def register_v10_tools(mcp: Any) -> None:
         return await sync_security_master()
 
     @mcp.tool()
+    async def refresh_v12_fundamentals() -> dict:
+        """更新上市櫃官方月營收、年增率與基本面加速度。"""
+        return await refresh_monthly_revenue()
+
+    @mcp.tool()
+    async def set_v12_theme_tags(symbol: str, themes: str) -> dict:
+        """設定個股主要題材；themes 使用逗號分隔，例如 AI伺服器,散熱。"""
+        parsed = [item.strip() for item in themes.replace("，", ",").split(",") if item.strip()]
+        return await update_theme_tags(symbol, parsed)
+
+    @mcp.tool()
     async def backfill_stock_history(
         symbols: str | None = None,
-        years: int = 3,
+        years: int = 5,
         concurrency: int = 3,
         batch_size: int = 20,
         start_after: str | None = None,
@@ -163,7 +175,7 @@ def register_v10_tools(mcp: Any) -> None:
 
     @mcp.tool()
     async def backfill_all_stock_history(
-        years: int = 3,
+        years: int = 5,
         batch_size: int = 20,
         start_after: str | None = None,
         concurrency: int = 3,
@@ -206,7 +218,7 @@ def register_v10_tools(mcp: Any) -> None:
 
     @mcp.tool()
     async def cleanup_stock_database(
-        retention_years: int = 3,
+        retention_years: int = 5,
         radar_retention_days: int = 180,
         job_retention_days: int = 90,
         vacuum: bool = True,

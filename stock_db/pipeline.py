@@ -158,7 +158,7 @@ async def backfill_symbols(
 
 
 async def backfill_all_market(
-    years: int = 3,
+    years: int = 5,
     batch_size: int = 20,
     start_after: str | None = None,
     concurrency: int = 3,
@@ -414,11 +414,29 @@ async def update_official_daily(
                 indicator_result.get("failures") or []
             )
         except Exception as exc:
-            failed = len(target_symbols)
-            indicator_failures = [{
-                "symbol": "__BATCH__",
-                "error": f"{type(exc).__name__}: {exc}",
-            }]
+            # Compatibility/resilience fallback: a transient bulk query error
+            # must not discard the whole close batch. Recalculate each symbol
+            # with the already committed bars.
+            bulk_error = f"{type(exc).__name__}: {exc}"
+            for symbol in target_symbols:
+                try:
+                    one = await stock_database_service.calculate_symbol_indicators(
+                        symbol,
+                        latest_only=True,
+                    )
+                    processed += 1
+                    indicator_rows_written += int(one.get("processed", 0))
+                except Exception as one_exc:
+                    failed += 1
+                    indicator_failures.append({
+                        "symbol": symbol,
+                        "error": f"{type(one_exc).__name__}: {one_exc}",
+                    })
+            if failed:
+                indicator_failures.insert(0, {
+                    "symbol": "__BATCH__",
+                    "error": bulk_error,
+                })
 
     remaining_after = max(0, len(remaining) - len(target_symbols))
     has_more = remaining_after > 0

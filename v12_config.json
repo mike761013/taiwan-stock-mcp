@@ -77,5 +77,16 @@
   "execution_prior_min_samples": 30,
   "execution_prior_full_confidence_samples": 120,
   "execution_prior_max_adjustment": 8.0,
-  "execution_entry_window_sessions": 3
+  "execution_entry_window_sessions": 3,
+  "factor_weight_technical": 30,
+  "factor_weight_chip": 20,
+  "factor_weight_fundamental": 15,
+  "factor_weight_theme": 15,
+  "factor_weight_intraday": 10,
+  "factor_weight_market": 5,
+  "factor_weight_history": 5,
+  "factor_minimum_confidence": 60,
+  "factor_api_concurrency": 3,
+  "factor_prefilter_limit": 40,
+  "historical_retention_years": 5
 }

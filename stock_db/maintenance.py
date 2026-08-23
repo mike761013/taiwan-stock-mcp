@@ -9,8 +9,12 @@ from .performance import (
     update_signal_execution_performance,
     update_signal_performance,
 )
-from .pipeline import update_official_daily
-from .radar import run_full_bullish_radar
+from .pipeline import sync_security_master, update_official_daily
+from .factors import ensure_factor_schema, refresh_monthly_revenue
+from .radar import run_full_bullish_radar_v12
+
+# Compatibility name kept for older tests/imports and third-party callers.
+run_full_bullish_radar = run_full_bullish_radar_v12
 
 
 async def run_daily_maintenance(
@@ -29,6 +33,12 @@ async def run_daily_maintenance(
     not consume Fugle quota or open one database transaction per symbol.
     Radar and performance are executed only after all daily indicators finish.
     """
+    master_update = None
+    if not start_after:
+        try:
+            master_update = await sync_security_master()
+        except Exception as exc:
+            master_update = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     try:
         market_update = await update_official_daily(
             batch_size=batch_size,
@@ -48,6 +58,7 @@ async def run_daily_maintenance(
         "completed": False,
         "stage": "market_update",
         "marketUpdate": market_update,
+        "securityMasterUpdate": master_update,
         "hasMore": bool(market_update.get("hasMore")),
         "nextStartAfter": market_update.get("nextStartAfter"),
         "remainingSymbols": int(market_update.get("remainingSymbols", 0)),
@@ -63,6 +74,15 @@ async def run_daily_maintenance(
         return result
 
     result["stage"] = "finalize"
+    try:
+        await ensure_factor_schema()
+        result["fundamentalUpdate"] = await refresh_monthly_revenue()
+    except Exception as exc:
+        # The radar can still run with transparent missing-factor confidence.
+        result["fundamentalUpdate"] = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
     if run_radar:
         try:
             result["radar"] = await run_full_bullish_radar(

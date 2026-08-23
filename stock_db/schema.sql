@@ -138,6 +138,13 @@ CREATE TABLE IF NOT EXISTS signal_execution_performance (
     FOREIGN KEY (radar_run_id, symbol)
         REFERENCES radar_candidates(radar_run_id, symbol) ON DELETE CASCADE
 );
+ALTER TABLE signal_execution_performance
+    ADD COLUMN IF NOT EXISTS label_version VARCHAR(32),
+    ADD COLUMN IF NOT EXISTS accuracy_engine VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS action_code VARCHAR(40),
+    ADD COLUMN IF NOT EXISTS market_regime VARCHAR(24),
+    ADD COLUMN IF NOT EXISTS industry VARCHAR(80),
+    ADD COLUMN IF NOT EXISTS factor_confidence NUMERIC(10,4);
 
 CREATE TABLE IF NOT EXISTS database_jobs (
     id BIGSERIAL PRIMARY KEY,
@@ -167,6 +174,63 @@ CREATE INDEX IF NOT EXISTS idx_signal_execution_strategy
 CREATE INDEX IF NOT EXISTS idx_database_jobs_status
     ON database_jobs(status, created_at DESC);
 
+-- V12.3 compact seven-factor storage. Raw intraday ticks are intentionally
+-- not retained so a 1 GB Render database remains practical.
+CREATE TABLE IF NOT EXISTS monthly_revenue (
+    symbol VARCHAR(16) NOT NULL,
+    revenue_month DATE NOT NULL,
+    revenue NUMERIC(22,2),
+    monthly_change_percent NUMERIC(10,4),
+    yearly_change_percent NUMERIC(10,4),
+    yearly_acceleration_percent NUMERIC(10,4),
+    source VARCHAR(80),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(symbol, revenue_month)
+);
+CREATE TABLE IF NOT EXISTS security_theme_tags (
+    symbol VARCHAR(16) NOT NULL,
+    theme VARCHAR(80) NOT NULL,
+    source VARCHAR(40) NOT NULL DEFAULT 'manual',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(symbol, theme)
+);
+CREATE TABLE IF NOT EXISTS intraday_daily_features (
+    symbol VARCHAR(16) NOT NULL,
+    trade_date DATE NOT NULL,
+    last_price NUMERIC(14,4),
+    day_change_percent NUMERIC(10,4),
+    close_position NUMERIC(10,4),
+    volume_ratio NUMERIC(10,4),
+    bid_ask_imbalance NUMERIC(10,4),
+    score NUMERIC(10,4),
+    source VARCHAR(80),
+    snapshot JSONB NOT NULL DEFAULT '{}'::JSONB,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(symbol, trade_date)
+);
+CREATE TABLE IF NOT EXISTS daily_factor_snapshots (
+    symbol VARCHAR(16) NOT NULL,
+    trade_date DATE NOT NULL,
+    chip_score NUMERIC(10,4),
+    fundamental_score NUMERIC(10,4),
+    theme_score NUMERIC(10,4),
+    sector_score NUMERIC(10,4),
+    intraday_score NUMERIC(10,4),
+    data_confidence NUMERIC(10,4) NOT NULL DEFAULT 0,
+    missing_factors JSONB NOT NULL DEFAULT '[]'::JSONB,
+    features JSONB NOT NULL DEFAULT '{}'::JSONB,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(symbol, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_monthly_revenue_month
+    ON monthly_revenue(revenue_month DESC, symbol);
+CREATE INDEX IF NOT EXISTS idx_factor_snapshot_date
+    ON daily_factor_snapshots(trade_date DESC, data_confidence DESC);
+
 INSERT INTO schema_versions(version, description)
 VALUES (1, 'V10 complete PostgreSQL schema')
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO schema_versions(version, description)
+VALUES (123, 'V12.3 seven-factor radar and compact feature store')
 ON CONFLICT (version) DO NOTHING;

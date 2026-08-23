@@ -122,6 +122,31 @@ def test_official_date_normalisation_supports_roc_and_gregorian() -> None:
     ) == "2026-07-23"
 
 
+def test_primary_tpex_source_fits_database_column(monkeypatch) -> None:
+    async def fake_get_json(url, **kwargs):
+        assert "tpex_mainboard_daily_close_quotes" in url
+        return [{
+            "Date": "20260723",
+            "Code": "5001",
+            "Name": "測試上櫃",
+            "OpeningPrice": "39.5",
+            "HighestPrice": "41.0",
+            "LowestPrice": "39.0",
+            "ClosingPrice": "40.0",
+            "TradeVolume": "800000",
+            "TradeValue": "32000000",
+        }]
+
+    monkeypatch.setattr(data_sources, "_get_json", fake_get_json)
+
+    snapshot = asyncio.run(
+        data_sources._fetch_primary_market_snapshot("TPEx")
+    )
+
+    assert len(snapshot["source"]) <= 32
+    assert len(snapshot["rows"][0]["source"]) <= 32
+
+
 def test_twse_and_tpex_fallback_payloads_are_parsed_and_validated(
     monkeypatch,
 ) -> None:

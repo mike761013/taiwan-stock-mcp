@@ -135,7 +135,7 @@ class StockDatabaseService:
 
     async def cleanup(
         self,
-        retention_years: int = 3,
+        retention_years: int = 5,
         radar_retention_days: int = 180,
         job_retention_days: int = 90,
         vacuum: bool = True,

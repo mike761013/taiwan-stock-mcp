@@ -68,6 +68,13 @@ CREATE TABLE IF NOT EXISTS signal_execution_performance (
 );
 CREATE INDEX IF NOT EXISTS idx_signal_execution_strategy
     ON signal_execution_performance(strategy, execution_status, signal_date);
+ALTER TABLE signal_execution_performance
+    ADD COLUMN IF NOT EXISTS label_version VARCHAR(32),
+    ADD COLUMN IF NOT EXISTS accuracy_engine VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS action_code VARCHAR(40),
+    ADD COLUMN IF NOT EXISTS market_regime VARCHAR(24),
+    ADD COLUMN IF NOT EXISTS industry VARCHAR(80),
+    ADD COLUMN IF NOT EXISTS factor_confidence NUMERIC(10,4);
 """
 
 
@@ -687,13 +694,18 @@ async def update_signal_execution_performance(
         signals = await connection.fetch(
             """
             SELECT c.radar_run_id, c.symbol, c.snapshot,
-                   r.strategy, r.run_date
+                   COALESCE(NULLIF(c.snapshot->>'strategy',''), r.strategy)
+                       AS strategy,
+                   r.run_date
             FROM radar_candidates c
             JOIN radar_runs r ON r.id=c.radar_run_id
             LEFT JOIN signal_execution_performance e
               ON e.radar_run_id=c.radar_run_id AND e.symbol=c.symbol
             WHERE LOWER(r.strategy) LIKE 'v12_%'
-              AND LOWER(r.strategy) <> 'v12_combined'
+              AND (
+                COALESCE(c.snapshot->>'accuracyEngine','') <> 'V12.3_SEVEN_FACTOR'
+                OR LOWER(r.strategy) = 'v12_combined'
+              )
               AND (
                 e.radar_run_id IS NULL
                 OR e.execution_status IN (
@@ -739,6 +751,7 @@ async def update_signal_execution_performance(
         records: list[tuple[Any, ...]] = []
         status_counts: dict[str, int] = defaultdict(int)
         for signal in signals:
+            snapshot = _mapping(signal["snapshot"])
             signal_date = signal["run_date"]
             relevant_bars = [
                 bar
@@ -747,7 +760,7 @@ async def update_signal_execution_performance(
                 and bar["trade_date"] > signal_date
             ][:25]
             simulation = simulate_signal_execution(
-                _mapping(signal["snapshot"]),
+                snapshot,
                 relevant_bars,
                 entry_window_sessions=entry_window_sessions,
             )
@@ -780,6 +793,12 @@ async def update_signal_execution_performance(
                     simulation["max_favorable_percent"],
                     simulation["max_adverse_percent"],
                     simulation["evaluated_through"],
+                    "V12.3_DUAL_ENTRY_20D",
+                    str(snapshot.get("accuracyEngine") or ""),
+                    str(snapshot.get("actionCode") or ""),
+                    str(_mapping(snapshot.get("marketContext")).get("regime") or ""),
+                    str(snapshot.get("industry") or ""),
+                    _as_float(snapshot.get("dataConfidence")),
                 )
             )
 
@@ -796,10 +815,13 @@ async def update_signal_execution_performance(
                 exit_date, exit_price, exit_reason,
                 return_d1, return_d3, return_d5, return_d10, return_d20,
                 max_favorable_percent, max_adverse_percent,
-                evaluated_through, calculated_at
+                evaluated_through, label_version, accuracy_engine,
+                action_code, market_regime, industry, factor_confidence,
+                calculated_at
             ) VALUES(
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-                $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,NOW()
+                $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
+                $29,$30,$31,$32,NOW()
             )
             ON CONFLICT(radar_run_id, symbol) DO UPDATE SET
                 execution_status=EXCLUDED.execution_status,
@@ -824,6 +846,12 @@ async def update_signal_execution_performance(
                 max_favorable_percent=EXCLUDED.max_favorable_percent,
                 max_adverse_percent=EXCLUDED.max_adverse_percent,
                 evaluated_through=EXCLUDED.evaluated_through,
+                label_version=EXCLUDED.label_version,
+                accuracy_engine=EXCLUDED.accuracy_engine,
+                action_code=EXCLUDED.action_code,
+                market_regime=EXCLUDED.market_regime,
+                industry=EXCLUDED.industry,
+                factor_confidence=EXCLUDED.factor_confidence,
                 calculated_at=NOW()
             """,
             records,
