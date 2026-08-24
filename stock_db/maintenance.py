@@ -10,7 +10,10 @@ from .performance import (
     update_signal_performance,
 )
 from .pipeline import sync_security_master, update_official_daily
-from .factors import ensure_factor_schema, refresh_monthly_revenue
+from .factors import (
+    DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS,
+    refresh_monthly_revenue_if_due,
+)
 from .radar import run_full_bullish_radar_v12
 
 # Compatibility name kept for older tests/imports and third-party callers.
@@ -25,6 +28,10 @@ async def run_daily_maintenance(
     concurrency: int = 6,
     radar_limit_each: int = 20,
     radar_minimum_score: float = 45,
+    fundamental_refresh_interval_days: int = (
+        DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS
+    ),
+    force_fundamental_refresh: bool = False,
 ) -> dict[str, Any]:
     """Run one resumable daily-maintenance step.
 
@@ -32,6 +39,8 @@ async def run_daily_maintenance(
     Daily indicators use a bulk latest-61-bars path, so 500-symbol batches do
     not consume Fugle quota or open one database transaction per symbol.
     Radar and performance are executed only after all daily indicators finish.
+    Fundamentals and automatic industry-theme tags are refreshed only when
+    their interval is due; the default is once every seven days.
     """
     master_update = None
     if not start_after:
@@ -75,8 +84,10 @@ async def run_daily_maintenance(
 
     result["stage"] = "finalize"
     try:
-        await ensure_factor_schema()
-        result["fundamentalUpdate"] = await refresh_monthly_revenue()
+        result["fundamentalUpdate"] = await refresh_monthly_revenue_if_due(
+            interval_days=fundamental_refresh_interval_days,
+            force=force_fundamental_refresh,
+        )
     except Exception as exc:
         # The radar can still run with transparent missing-factor confidence.
         result["fundamentalUpdate"] = {

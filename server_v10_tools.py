@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from stock_db.maintenance import run_daily_maintenance
-from stock_db.factors import refresh_monthly_revenue, update_theme_tags
+from stock_db.factors import (
+    DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS,
+    get_fundamental_refresh_status,
+    refresh_monthly_revenue,
+    update_theme_tags,
+)
 from stock_db.performance import (
     DEFAULT_PERFORMANCE_UPDATE_LIMIT,
     execution_performance_summary,
@@ -147,6 +152,13 @@ def register_v10_tools(mcp: Any) -> None:
     async def refresh_v12_fundamentals() -> dict:
         """更新官方月營收、年增率、加速度，並自動建立產業題材標籤。"""
         return await refresh_monthly_revenue()
+
+    @mcp.tool()
+    async def get_v12_fundamental_refresh_status(
+        interval_days: int = DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS,
+    ) -> dict:
+        """查看基本面與官方題材標籤是否已到自動更新時間。"""
+        return await get_fundamental_refresh_status(interval_days)
 
     @mcp.tool()
     async def set_v12_theme_tags(symbol: str, themes: str) -> dict:
@@ -356,6 +368,8 @@ def register_v10_tools(mcp: Any) -> None:
         concurrency: int,
         radar_limit_each: int,
         radar_minimum_score: float,
+        fundamental_refresh_interval_days: int,
+        force_fundamental_refresh: bool,
     ) -> dict:
         return await run_daily_maintenance(
             run_radar=run_radar,
@@ -365,6 +379,10 @@ def register_v10_tools(mcp: Any) -> None:
             concurrency=concurrency,
             radar_limit_each=radar_limit_each,
             radar_minimum_score=radar_minimum_score,
+            fundamental_refresh_interval_days=(
+                fundamental_refresh_interval_days
+            ),
+            force_fundamental_refresh=force_fundamental_refresh,
         )
 
     @mcp.tool()
@@ -376,8 +394,12 @@ def register_v10_tools(mcp: Any) -> None:
         concurrency: int = 6,
         radar_limit_each: int = 20,
         radar_minimum_score: float = 45,
+        fundamental_refresh_interval_days: int = (
+            DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS
+        ),
+        force_fundamental_refresh: bool = False,
     ) -> dict:
-        """500檔批次每日更新；重複傳入 nextStartAfter 直到 completed。"""
+        """每日收盤更新；基本面與官方題材標籤預設每7天才更新。"""
         return await _maintenance(
             run_radar,
             update_performance,
@@ -386,6 +408,8 @@ def register_v10_tools(mcp: Any) -> None:
             concurrency,
             radar_limit_each,
             radar_minimum_score,
+            fundamental_refresh_interval_days,
+            force_fundamental_refresh,
         )
 
     @mcp.tool()
@@ -397,6 +421,10 @@ def register_v10_tools(mcp: Any) -> None:
         concurrency: int = 6,
         radar_limit_each: int = 20,
         radar_minimum_score: float = 45,
+        fundamental_refresh_interval_days: int = (
+            DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS
+        ),
+        force_fundamental_refresh: bool = False,
     ) -> dict:
         """舊名稱相容入口；功能與 V11 每日維護相同。"""
         return await _maintenance(
@@ -407,6 +435,8 @@ def register_v10_tools(mcp: Any) -> None:
             concurrency,
             radar_limit_each,
             radar_minimum_score,
+            fundamental_refresh_interval_days,
+            force_fundamental_refresh,
         )
 
     @mcp.tool()

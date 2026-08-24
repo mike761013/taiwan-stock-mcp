@@ -27,6 +27,7 @@ TPEX_REVENUE_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O"
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 _REMOTE_CACHE: dict[tuple[str, str], tuple[Any, Any]] = {}
 V12_3_ACCURACY_ENGINE = "V12.3.1_SEVEN_FACTOR_FIX"
+DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS = 7
 
 FACTOR_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS monthly_revenue (
@@ -127,6 +128,102 @@ def _pick(row: Mapping[str, Any], *names: str) -> Any:
 async def ensure_factor_schema() -> None:
     async with stock_database.acquire() as connection:
         await connection.execute(FACTOR_SCHEMA_SQL)
+
+
+def _normalise_refresh_datetime(value: datetime | None) -> datetime | None:
+    """Return a database timestamp in the maintenance timezone."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=TAIPEI_TZ)
+    return value.astimezone(TAIPEI_TZ)
+
+
+def _build_fundamental_refresh_status(
+    *,
+    now: datetime,
+    interval_days: int,
+    twse_last_updated_at: datetime | None,
+    tpex_last_updated_at: datetime | None,
+    revenue_rows: int,
+    official_theme_tags: int,
+) -> dict[str, Any]:
+    """Build the automatic weekly refresh decision without touching the DB."""
+    interval_days = max(1, int(interval_days))
+    current = _normalise_refresh_datetime(now) or datetime.now(TAIPEI_TZ)
+    twse_last = _normalise_refresh_datetime(twse_last_updated_at)
+    tpex_last = _normalise_refresh_datetime(tpex_last_updated_at)
+
+    complete_last = min(twse_last, tpex_last) if twse_last and tpex_last else None
+    next_due = (
+        complete_last + timedelta(days=interval_days)
+        if complete_last is not None
+        else None
+    )
+    if int(revenue_rows or 0) <= 0:
+        due, reason = True, "基本面資料尚未初始化"
+    elif twse_last is None or tpex_last is None:
+        due, reason = True, "上市或上櫃基本面資料缺漏"
+    elif int(official_theme_tags or 0) <= 0:
+        due, reason = True, "官方產業題材標籤尚未初始化"
+    elif next_due is not None and current >= next_due:
+        due, reason = True, f"已達{interval_days}天更新週期"
+    else:
+        due, reason = False, f"距上次完整更新未滿{interval_days}天"
+
+    return {
+        "ok": True,
+        "schedule": "AUTO_INTERVAL",
+        "intervalDays": interval_days,
+        "due": due,
+        "reason": reason,
+        "checkedAt": current.isoformat(),
+        "lastCompleteUpdateAt": (
+            complete_last.isoformat() if complete_last is not None else None
+        ),
+        "nextDueAt": next_due.isoformat() if next_due is not None else None,
+        "perMarketLastUpdatedAt": {
+            "TWSE": twse_last.isoformat() if twse_last is not None else None,
+            "TPEx": tpex_last.isoformat() if tpex_last is not None else None,
+        },
+        "revenueRows": int(revenue_rows or 0),
+        "officialThemeTags": int(official_theme_tags or 0),
+    }
+
+
+async def get_fundamental_refresh_status(
+    interval_days: int = DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Check whether official fundamentals and automatic tags are due."""
+    await ensure_factor_schema()
+    async with stock_database.acquire() as connection:
+        row = await connection.fetchrow("""
+            SELECT
+                MAX(updated_at) FILTER(
+                    WHERE source LIKE 'TWSE %'
+                ) AS twse_last_updated_at,
+                MAX(updated_at) FILTER(
+                    WHERE source LIKE 'TPEx %'
+                ) AS tpex_last_updated_at,
+                COUNT(*) AS revenue_rows,
+                (
+                    SELECT COUNT(*)
+                    FROM security_theme_tags
+                    WHERE source='official_industry'
+                ) AS official_theme_tags
+            FROM monthly_revenue
+        """)
+    values = dict(row or {})
+    return _build_fundamental_refresh_status(
+        now=now or datetime.now(TAIPEI_TZ),
+        interval_days=interval_days,
+        twse_last_updated_at=values.get("twse_last_updated_at"),
+        tpex_last_updated_at=values.get("tpex_last_updated_at"),
+        revenue_rows=int(values.get("revenue_rows") or 0),
+        official_theme_tags=int(values.get("official_theme_tags") or 0),
+    )
 
 
 async def _json_get(url: str, **kwargs: Any) -> Any:
@@ -269,6 +366,56 @@ async def refresh_monthly_revenue() -> dict[str, Any]:
         "autoThemeTags": sum(1 for x in parsed if x["industry"]),
         "errors": errors,
     }
+
+
+async def refresh_monthly_revenue_if_due(
+    interval_days: int = DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS,
+    *,
+    force: bool = False,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Refresh fundamentals only when the automatic interval has elapsed.
+
+    The regular close job calls this helper every day.  The lightweight status
+    query is always allowed, while the remote download and roughly two thousand
+    database upserts run only once per interval.  Missing TWSE/TPEx data or
+    missing official theme tags bypass the interval so an incomplete database
+    repairs itself on the next close job.
+    """
+    status = await get_fundamental_refresh_status(
+        interval_days=interval_days,
+        now=now,
+    )
+    if not force and not status["due"]:
+        return {
+            **status,
+            "skipped": True,
+            "updated": 0,
+            "autoThemeTags": 0,
+        }
+
+    before = dict(status)
+    refreshed = await refresh_monthly_revenue()
+    output: dict[str, Any] = {
+        **refreshed,
+        "schedule": "AUTO_INTERVAL",
+        "intervalDays": max(1, int(interval_days)),
+        "skipped": False,
+        "forced": bool(force),
+        "dueReason": "手動強制更新" if force else before["reason"],
+        "lastCompleteUpdateAtBefore": before["lastCompleteUpdateAt"],
+    }
+    if refreshed.get("ok"):
+        after = await get_fundamental_refresh_status(
+            interval_days=interval_days,
+            now=now,
+        )
+        output.update({
+            "lastCompleteUpdateAt": after["lastCompleteUpdateAt"],
+            "nextDueAt": after["nextDueAt"],
+            "retryNextClose": bool(after["due"]),
+        })
+    return output
 
 
 async def update_theme_tags(symbol: str, themes: Sequence[str], source: str = "manual") -> dict[str, Any]:
