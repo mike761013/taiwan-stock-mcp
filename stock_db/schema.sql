@@ -234,3 +234,7 @@ ON CONFLICT (version) DO NOTHING;
 INSERT INTO schema_versions(version, description)
 VALUES (123, 'V12.3 seven-factor radar and compact feature store')
 ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO schema_versions(version, description)
+VALUES (1231, 'V12.3.1 revenue, theme, intraday and final-threshold fixes')
+ON CONFLICT (version) DO NOTHING;

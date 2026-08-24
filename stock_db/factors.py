@@ -1,4 +1,4 @@
-"""V12.3 multi-factor enrichment for the formal bullish radar.
+"""V12.3.1 multi-factor enrichment for the formal bullish radar.
 
 The module deliberately stores compact daily/monthly features instead of raw
 ticks.  A missing provider is reported as missing data and is never converted
@@ -26,6 +26,7 @@ TWSE_REVENUE_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap05_L"
 TPEX_REVENUE_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O"
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 _REMOTE_CACHE: dict[tuple[str, str], tuple[Any, Any]] = {}
+V12_3_ACCURACY_ENGINE = "V12.3.1_SEVEN_FACTOR_FIX"
 
 FACTOR_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS monthly_revenue (
@@ -132,6 +133,49 @@ def _roc_month_to_date(value: Any) -> date | None:
         return None
 
 
+def _parse_official_revenue_row(
+    row: Mapping[str, Any],
+    market: str,
+) -> dict[str, Any] | None:
+    """Parse the exact TWSE/TPEx monthly-revenue OpenAPI column names."""
+    symbol = str(
+        _pick(row, "公司代號", "公司代碼", "SecuritiesCompanyCode", "Code")
+        or ""
+    ).strip()
+    month = _roc_month_to_date(
+        _pick(row, "資料年月", "出表日期", "YearMonth", "年月")
+    )
+    if not symbol or month is None:
+        return None
+    return {
+        "symbol": symbol,
+        "month": month,
+        "revenue": _float(
+            _pick(row, "營業收入-當月營收", "當月營收", "MonthlyRevenue")
+        ),
+        "mom": _float(
+            _pick(
+                row,
+                "營業收入-上月比較增減(%)",
+                "上月比較增減(%)",
+                "上月比較增減％",
+                "MoM",
+            )
+        ),
+        "yoy": _float(
+            _pick(
+                row,
+                "營業收入-去年同月增減(%)",
+                "去年同月增減(%)",
+                "去年同月增減％",
+                "YoY",
+            )
+        ),
+        "industry": str(_pick(row, "產業別", "Industry") or "").strip(),
+        "source": f"{market} monthly revenue",
+    }
+
+
 async def refresh_monthly_revenue() -> dict[str, Any]:
     """Refresh official TWSE/TPEx monthly revenue and YoY acceleration."""
     await ensure_factor_schema()
@@ -144,18 +188,11 @@ async def refresh_monthly_revenue() -> dict[str, Any]:
             errors.append(f"{market}: {type(exc).__name__}: {exc}")
             continue
         for row in body if isinstance(body, list) else []:
-            symbol = str(_pick(row, "公司代號", "公司代碼", "SecuritiesCompanyCode", "Code") or "").strip()
-            month = _roc_month_to_date(_pick(row, "資料年月", "出表日期", "YearMonth", "年月"))
-            if not symbol or month is None:
+            if not isinstance(row, Mapping):
                 continue
-            parsed.append({
-                "symbol": symbol,
-                "month": month,
-                "revenue": _float(_pick(row, "當月營收", "營業收入-當月營收", "MonthlyRevenue")),
-                "mom": _float(_pick(row, "上月比較增減(%)", "上月比較增減％", "MoM")),
-                "yoy": _float(_pick(row, "去年同月增減(%)", "去年同月增減％", "YoY")),
-                "source": f"{market} monthly revenue",
-            })
+            value = _parse_official_revenue_row(row, market)
+            if value is not None:
+                parsed.append(value)
     if not parsed:
         return {"ok": False, "updated": 0, "errors": errors or ["官方月營收沒有可解析資料"]}
     async with stock_database.acquire() as connection:
@@ -171,6 +208,28 @@ async def refresh_monthly_revenue() -> dict[str, Any]:
                     yearly_change_percent=EXCLUDED.yearly_change_percent,
                     source=EXCLUDED.source,updated_at=NOW()
             """, [(x["symbol"], x["month"], x["revenue"], x["mom"], x["yoy"], x["source"]) for x in parsed])
+            symbols = sorted({x["symbol"] for x in parsed})
+            await connection.execute(
+                "DELETE FROM security_theme_tags "
+                "WHERE source='official_industry' AND symbol=ANY($1::varchar[])",
+                symbols,
+            )
+            official_tags = sorted({
+                (x["symbol"], x["industry"], "official_industry")
+                for x in parsed if x["industry"]
+            })
+            if official_tags:
+                await connection.executemany("""
+                    INSERT INTO security_theme_tags(symbol,theme,source,updated_at)
+                    VALUES($1,$2,$3,NOW())
+                    ON CONFLICT(symbol,theme) DO UPDATE SET
+                        source=CASE
+                            WHEN security_theme_tags.source='manual'
+                            THEN security_theme_tags.source
+                            ELSE EXCLUDED.source
+                        END,
+                        updated_at=NOW()
+                """, official_tags)
             await connection.execute("""
                 WITH ranked AS (
                     SELECT symbol,revenue_month,yearly_change_percent,
@@ -184,7 +243,12 @@ async def refresh_monthly_revenue() -> dict[str, Any]:
                 FROM ranked r
                 WHERE m.symbol=r.symbol AND m.revenue_month=r.revenue_month
             """)
-    return {"ok": True, "updated": len(parsed), "errors": errors}
+    return {
+        "ok": True,
+        "updated": len(parsed),
+        "autoThemeTags": sum(1 for x in parsed if x["industry"]),
+        "errors": errors,
+    }
 
 
 async def update_theme_tags(symbol: str, themes: Sequence[str], source: str = "manual") -> dict[str, Any]:
@@ -195,7 +259,13 @@ async def update_theme_tags(symbol: str, themes: Sequence[str], source: str = "m
     await ensure_factor_schema()
     async with stock_database.acquire() as connection:
         async with connection.transaction():
-            await connection.execute("DELETE FROM security_theme_tags WHERE symbol=$1", symbol)
+            # A manual topic update must not erase the official industry tag
+            # created by ``refresh_monthly_revenue``.
+            await connection.execute(
+                "DELETE FROM security_theme_tags WHERE symbol=$1 AND source=$2",
+                symbol,
+                source,
+            )
             if clean:
                 await connection.executemany(
                     "INSERT INTO security_theme_tags(symbol,theme,source) VALUES($1,$2,$3)",
@@ -242,7 +312,10 @@ async def _chip_factor(symbol: str, trade_date: date) -> tuple[float | None, dic
     return round(score, 2), {"institutionalNetShares": round(institutional_net), "marginBalanceChangeShares": round(margin_delta)}
 
 
-async def _intraday_factor(symbol: str) -> tuple[float | None, dict[str, Any]]:
+async def _intraday_factor(
+    symbol: str,
+    expected_trade_date: date | None = None,
+) -> tuple[float | None, dict[str, Any]]:
     key = (os.getenv("FUGLE_API_KEY") or "").strip()
     if not key:
         return None, {"reason": "FUGLE_API_KEY缺少"}
@@ -250,20 +323,65 @@ async def _intraday_factor(symbol: str) -> tuple[float | None, dict[str, Any]]:
         quote = await _json_get(FUGLE_QUOTE_URL.format(symbol=symbol), headers={"X-API-KEY": key}, timeout=20)
     except Exception as exc:
         return None, {"error": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(quote, Mapping):
+        return None, {"reason": "Fugle即時報價格式不正確，盤中結構不計分"}
+    quote_date = str(quote.get("date") or "").strip()
+    if expected_trade_date is not None and quote_date:
+        if quote_date != expected_trade_date.isoformat():
+            return None, {
+                "reason": "Fugle報價日期與雷達交易日不同，盤中結構不計分",
+                "quoteDate": quote_date,
+                "expectedTradeDate": expected_trade_date.isoformat(),
+            }
+    last_trade = quote.get("lastTrade") if isinstance(quote, Mapping) else None
+    last_trade = last_trade if isinstance(last_trade, Mapping) else {}
     last = _float(_pick(quote, "lastPrice", "closePrice", "price"))
+    if last is None:
+        last = _float(_pick(last_trade, "price", "lastPrice"))
     open_price = _float(_pick(quote, "openPrice", "open"))
     high = _float(_pick(quote, "highPrice", "high"))
     low = _float(_pick(quote, "lowPrice", "low"))
-    change = _float(_pick(quote, "changePercent", "change"), 0.0) or 0.0
-    position = 0.5 if high is None or low is None or high <= low or last is None else (last-low)/(high-low)
+    if any(value is None or value <= 0 for value in (last, open_price, high, low)):
+        return None, {
+            "reason": "Fugle未回傳完整的現價與開高低，盤中結構不計分",
+            "lastPrice": last,
+            "openPrice": open_price,
+            "highPrice": high,
+            "lowPrice": low,
+        }
+    change = _float(_pick(quote, "changePercent"))
+    reference = _float(_pick(quote, "referencePrice", "previousClose"))
+    if change is None:
+        change = ((last / reference - 1) * 100) if reference and reference > 0 else 0.0
+    position = 0.5 if high <= low else (last-low)/(high-low)
     bids = quote.get("bids") if isinstance(quote, Mapping) else None
     asks = quote.get("asks") if isinstance(quote, Mapping) else None
-    bid_volume = sum(_float(_pick(x, "volume", "size"), 0.0) or 0.0 for x in bids or [] if isinstance(x, Mapping))
-    ask_volume = sum(_float(_pick(x, "volume", "size"), 0.0) or 0.0 for x in asks or [] if isinstance(x, Mapping))
-    imbalance = 0.0 if bid_volume + ask_volume <= 0 else (bid_volume-ask_volume)/(bid_volume+ask_volume)
+    total = quote.get("total") if isinstance(quote, Mapping) else None
+    total = total if isinstance(total, Mapping) else {}
+    bid_volume = _float(_pick(total, "tradeVolumeAtBid"))
+    ask_volume = _float(_pick(total, "tradeVolumeAtAsk"))
+    if bid_volume is None:
+        bid_volume = sum(_float(_pick(x, "volume", "size"), 0.0) or 0.0 for x in bids or [] if isinstance(x, Mapping))
+    if ask_volume is None:
+        ask_volume = sum(_float(_pick(x, "volume", "size"), 0.0) or 0.0 for x in asks or [] if isinstance(x, Mapping))
+    # Fugle defines tradeVolumeAtBid as inner-volume (seller initiated) and
+    # tradeVolumeAtAsk as outer-volume (buyer initiated).  More outer volume
+    # is bullish, so the sign must be ask minus bid.
+    imbalance = 0.0 if bid_volume + ask_volume <= 0 else (ask_volume-bid_volume)/(bid_volume+ask_volume)
     open_strength = 0.0 if not last or not open_price else (last/open_price-1)*100
     score = _clamp(50 + (position-.5)*40 + max(-10, min(10, change))*1.5 + max(-5, min(5, open_strength))*2 + imbalance*10)
-    return round(score, 2), {"lastPrice": last, "openPrice": open_price, "highPrice": high, "lowPrice": low, "dayChangePercent": change, "closePosition": round(position, 4), "bidAskImbalance": round(imbalance, 4)}
+    return round(score, 2), {
+        "quoteDate": quote_date or None,
+        "lastPrice": last,
+        "openPrice": open_price,
+        "highPrice": high,
+        "lowPrice": low,
+        "dayChangePercent": change,
+        "closePosition": round(position, 4),
+        "innerVolume": round(bid_volume, 2),
+        "outerVolume": round(ask_volume, 2),
+        "bidAskImbalance": round(imbalance, 4),
+    }
 
 
 async def _stored_factors(symbols: Sequence[str]) -> tuple[dict[str, dict[str, Any]], dict[str, list[str]]]:
@@ -290,14 +408,78 @@ async def _stored_factors(symbols: Sequence[str]) -> tuple[dict[str, dict[str, A
     return revenues, themes
 
 
+async def _theme_market_context() -> dict[str, dict[str, Any]]:
+    """Calculate real daily price/volume breadth for every stored theme."""
+    try:
+        await ensure_factor_schema()
+        async with stock_database.acquire() as connection:
+            rows = await connection.fetch("""
+                WITH latest AS (
+                    SELECT MAX(trade_date) AS trade_date FROM daily_indicators
+                )
+                SELECT t.theme, COUNT(*) AS member_count,
+                       AVG(CASE WHEN b.close >= i.ma20 THEN 100.0 ELSE 0.0 END)
+                           AS above_ma20_percent,
+                       AVG(CASE WHEN COALESCE(b.change_percent,0) > 0
+                                THEN 100.0 ELSE 0.0 END)
+                           AS advancing_percent,
+                       AVG(CASE WHEN COALESCE(i.volume_ratio,0) >= 1
+                                THEN 100.0 ELSE 0.0 END)
+                           AS active_volume_percent,
+                       AVG(COALESCE(i.technical_score,0)) AS average_technical_score
+                FROM latest
+                JOIN daily_indicators i ON i.trade_date=latest.trade_date
+                JOIN daily_bars b ON b.symbol=i.symbol AND b.trade_date=i.trade_date
+                JOIN security_theme_tags t ON t.symbol=i.symbol
+                GROUP BY t.theme
+            """)
+    except RuntimeError:
+        return {}
+    context: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        members = int(row["member_count"] or 0)
+        if members < 3:
+            continue
+        above = _float(row["above_ma20_percent"], 0.0) or 0.0
+        advancing = _float(row["advancing_percent"], 0.0) or 0.0
+        active = _float(row["active_volume_percent"], 0.0) or 0.0
+        technical = _float(row["average_technical_score"], 0.0) or 0.0
+        score = _clamp(above*.45 + advancing*.25 + active*.15 + technical*.15)
+        context[str(row["theme"])] = {
+            "memberCount": members,
+            "aboveMA20Percent": round(above, 2),
+            "advancingPercent": round(advancing, 2),
+            "activeVolumePercent": round(active, 2),
+            "averageTechnicalScore": round(technical, 2),
+            "heatScore": round(score, 2),
+        }
+    return context
+
+
 def _fundamental_factor(row: Mapping[str, Any] | None) -> tuple[float | None, dict[str, Any]]:
     if not row:
         return None, {"reason": "尚無官方月營收"}
-    yoy = _float(row.get("yearly_change_percent"), 0.0) or 0.0
-    mom = _float(row.get("monthly_change_percent"), 0.0) or 0.0
-    acceleration = _float(row.get("yearly_acceleration_percent"), 0.0) or 0.0
-    score = _clamp(50 + max(-30, min(30, yoy))*0.8 + max(-20, min(20, acceleration))*0.7 + max(-15, min(15, mom))*0.25)
-    return round(score, 2), {"revenueMonth": str(row.get("revenue_month")), "revenueYoYPercent": yoy, "revenueMoMPercent": mom, "yoyAccelerationPercent": acceleration}
+    yoy = _float(row.get("yearly_change_percent"))
+    mom = _float(row.get("monthly_change_percent"))
+    acceleration = _float(row.get("yearly_acceleration_percent"))
+    components: list[tuple[float, float]] = []
+    if yoy is not None:
+        components.append((_clamp(50 + max(-40, min(40, yoy))*1.2), .55))
+    if mom is not None:
+        components.append((_clamp(50 + max(-30, min(30, mom))*.8), .20))
+    if acceleration is not None:
+        components.append((_clamp(50 + max(-30, min(30, acceleration))), .25))
+    if not components:
+        return None, {"reason": "官方月營收存在，但成長率欄位缺失"}
+    total_weight = sum(weight for _, weight in components)
+    score = sum(value*weight for value, weight in components) / total_weight
+    return round(score, 2), {
+        "revenueMonth": str(row.get("revenue_month")),
+        "revenueYoYPercent": yoy,
+        "revenueMoMPercent": mom,
+        "yoyAccelerationPercent": acceleration,
+        "accelerationAvailable": acceleration is not None,
+    }
 
 
 def _sector_factor(candidate: Mapping[str, Any], market_context: Mapping[str, Any]) -> tuple[float | None, dict[str, Any]]:
@@ -321,6 +503,7 @@ async def enrich_candidates_v12_3(
     items = [dict(item) for item in candidates]
     symbols = [str(item.get("symbol") or "").strip() for item in items]
     revenues, themes = await _stored_factors(symbols)
+    theme_market = await _theme_market_context()
     semaphore = asyncio.Semaphore(max(1, int(getattr(config, "factor_api_concurrency", 3))))
 
     async def remote(symbol: str) -> tuple[Any, Any]:
@@ -328,16 +511,14 @@ async def enrich_candidates_v12_3(
         if cache_key in _REMOTE_CACHE:
             return _REMOTE_CACHE[cache_key]
         async with semaphore:
-            value = await asyncio.gather(_chip_factor(symbol, trade_date), _intraday_factor(symbol))
+            value = await asyncio.gather(
+                _chip_factor(symbol, trade_date),
+                _intraday_factor(symbol, trade_date),
+            )
             _REMOTE_CACHE[cache_key] = value
             return value
 
     remote_rows = await asyncio.gather(*(remote(symbol) for symbol in symbols))
-    theme_counts: dict[str, int] = {}
-    for symbol in symbols:
-        for theme in themes.get(symbol, []):
-            theme_counts[theme] = theme_counts.get(theme, 0) + 1
-
     weights = {
         "technical": float(getattr(config, "factor_weight_technical", 30.0)),
         "chip": float(getattr(config, "factor_weight_chip", 20.0)),
@@ -354,10 +535,29 @@ async def enrich_candidates_v12_3(
         fundamental_score, fundamental_features = _fundamental_factor(revenues.get(symbol))
         sector_score, sector_features = _sector_factor(item, market_context)
         tags = themes.get(symbol, [])
-        if tags:
-            heat = sum(theme_counts.get(theme, 1) for theme in tags) / len(tags)
-            theme_score: float | None = round(_clamp(50 + min(25, (heat-1)*8) + (sector_score-50 if sector_score is not None else 0)*.35), 2)
-            theme_features = {"themes": tags, "candidateThemeHeat": round(heat, 2)}
+        available_themes = [theme_market[tag] for tag in tags if tag in theme_market]
+        if available_themes:
+            strongest = sorted(
+                available_themes,
+                key=lambda value: float(value.get("heatScore") or 0),
+                reverse=True,
+            )[:2]
+            theme_score = round(
+                sum(float(value["heatScore"]) for value in strongest) / len(strongest),
+                2,
+            )
+            theme_features = {
+                "themes": tags,
+                "marketHeat": {
+                    tag: theme_market[tag] for tag in tags if tag in theme_market
+                },
+            }
+        elif tags:
+            theme_score = None
+            theme_features = {
+                "themes": tags,
+                "reason": "題材已有標籤，但全市場有效樣本少於3檔",
+            }
         else:
             theme_score = None
             theme_features = {"reason": "尚未建立題材標籤"}
@@ -381,13 +581,25 @@ async def enrich_candidates_v12_3(
         enforce_confidence = bool(stock_database.config.enabled)
         qualified = bool(item.get("forwardQualified", True)) and (
             confidence >= minimum_confidence or not enforce_confidence
-        )
+        ) and final_score >= float(getattr(config, "forward_min_bullish_score", 65.0))
         warnings = list(item.get("warnings") or [])
         if confidence < minimum_confidence and enforce_confidence:
             warnings.append(f"多因子資料完整度{confidence:.0f}%低於{minimum_confidence:.0f}%，只列觀察")
+        qualification = dict(item.get("forwardQualification") or {})
+        failed_rules = list(qualification.get("failedRules") or [])
+        if final_score < float(getattr(config, "forward_min_bullish_score", 65.0)):
+            failed_rules.append(
+                f"七因子最終分數{final_score:.1f}低於正式門檻"
+            )
+            warnings.append("七因子最終分數不足，只列觀察")
+        qualification.update({
+            "qualified": qualified,
+            "engine": V12_3_ACCURACY_ENGINE,
+            "failedRules": failed_rules,
+        })
         features = {"chip": chip_features, "fundamental": fundamental_features, "theme": theme_features, "sector": sector_features, "intraday": intraday_features}
         item.update({
-            "accuracyEngine": "V12.3_SEVEN_FACTOR", "technical_score": round(values["technical"] or 0, 2),
+            "accuracyEngine": V12_3_ACCURACY_ENGINE, "technical_score": round(values["technical"] or 0, 2),
             "chip_score": chip_score, "chipScore": chip_score,
             "fundamental_score": fundamental_score, "fundamentalScore": fundamental_score,
             "theme_score": theme_score, "themeScore": theme_score,
@@ -398,7 +610,9 @@ async def enrich_candidates_v12_3(
             "dataConfidence": round(confidence, 2), "missingFactors": missing,
             "bullish_score": round(final_score, 2), "total_score": round(final_score, 2),
             "finalScore": round(final_score, 2), "ranking_score": round(final_score, 2),
-            "forwardQualified": qualified, "warnings": warnings,
+            "forwardQualified": qualified,
+            "forwardQualification": qualification,
+            "warnings": warnings,
         })
         output.append(item)
         snapshot_rows.append((symbol, trade_date, chip_score, fundamental_score, theme_score, sector_score, intraday_score, confidence, json.dumps(missing, ensure_ascii=False), json.dumps(features, ensure_ascii=False, default=str)))

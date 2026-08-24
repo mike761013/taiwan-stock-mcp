@@ -15,7 +15,7 @@ from typing import Any, Mapping, Sequence
 
 
 V12_STRATEGIES = ("early_stage", "breakout", "pullback", "reversal_reclaim")
-V12_ACCURACY_ENGINE = "V12.3_SEVEN_FACTOR"
+V12_ACCURACY_ENGINE = "V12.3.1_SEVEN_FACTOR_FIX"
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "v12_config.json"
 
 V12_STATUS_LABELS = {
@@ -176,7 +176,7 @@ class V12Config:
     execution_prior_max_adjustment: float = 8.0
     execution_entry_window_sessions: int = 3
 
-    # V12.3 seven-factor formal ranking. Missing provider data is omitted and
+    # V12.3.1 seven-factor formal ranking. Missing provider data is omitted and
     # the remaining weights are normalised; it is never silently scored zero.
     factor_weight_technical: float = 30.0
     factor_weight_chip: float = 20.0

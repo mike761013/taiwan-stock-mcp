@@ -145,12 +145,12 @@ def register_v10_tools(mcp: Any) -> None:
 
     @mcp.tool()
     async def refresh_v12_fundamentals() -> dict:
-        """更新上市櫃官方月營收、年增率與基本面加速度。"""
+        """更新官方月營收、年增率、加速度，並自動建立產業題材標籤。"""
         return await refresh_monthly_revenue()
 
     @mcp.tool()
     async def set_v12_theme_tags(symbol: str, themes: str) -> dict:
-        """設定個股主要題材；themes 使用逗號分隔，例如 AI伺服器,散熱。"""
+        """設定個股額外題材；不會刪除系統自動建立的官方產業標籤。"""
         parsed = [item.strip() for item in themes.replace("，", ",").split(",") if item.strip()]
         return await update_theme_tags(symbol, parsed)
 
