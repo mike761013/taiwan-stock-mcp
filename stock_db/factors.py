@@ -33,9 +33,9 @@ CREATE TABLE IF NOT EXISTS monthly_revenue (
     symbol VARCHAR(16) NOT NULL,
     revenue_month DATE NOT NULL,
     revenue NUMERIC(22,2),
-    monthly_change_percent NUMERIC(10,4),
-    yearly_change_percent NUMERIC(10,4),
-    yearly_acceleration_percent NUMERIC(10,4),
+    monthly_change_percent NUMERIC(22,4),
+    yearly_change_percent NUMERIC(22,4),
+    yearly_acceleration_percent NUMERIC(22,4),
     source VARCHAR(80),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY(symbol, revenue_month)
@@ -79,6 +79,26 @@ CREATE INDEX IF NOT EXISTS idx_monthly_revenue_month
     ON monthly_revenue(revenue_month DESC, symbol);
 CREATE INDEX IF NOT EXISTS idx_factor_snapshot_date
     ON daily_factor_snapshots(trade_date DESC, data_confidence DESC);
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema=current_schema()
+          AND table_name='monthly_revenue'
+          AND column_name IN (
+              'monthly_change_percent',
+              'yearly_change_percent',
+              'yearly_acceleration_percent'
+          )
+          AND COALESCE(numeric_precision, 0) < 22
+    ) THEN
+        ALTER TABLE monthly_revenue
+            ALTER COLUMN monthly_change_percent TYPE NUMERIC(22,4),
+            ALTER COLUMN yearly_change_percent TYPE NUMERIC(22,4),
+            ALTER COLUMN yearly_acceleration_percent TYPE NUMERIC(22,4);
+    END IF;
+END $$;
 """
 
 

@@ -27,6 +27,26 @@ def test_official_monthly_revenue_exact_columns_are_parsed():
     assert row["industry"] == "水泥工業"
 
 
+def test_official_extreme_yoy_is_preserved_for_wide_database_column():
+    row = factors._parse_official_revenue_row({
+        "資料年月": "11507",
+        "公司代號": "4113",
+        "產業別": "生技醫療業",
+        "營業收入-當月營收": "116,017",
+        "營業收入-上月比較增減(%)": "250.11808367071524",
+        "營業收入-去年同月增減(%)": "1096390.566037736",
+    }, "TPEx")
+
+    assert row is not None
+    assert row["yoy"] == pytest.approx(1_096_390.566037736)
+
+
+def test_factor_schema_supports_extreme_official_growth_rates():
+    assert "monthly_change_percent NUMERIC(22,4)" in factors.FACTOR_SCHEMA_SQL
+    assert "yearly_change_percent NUMERIC(22,4)" in factors.FACTOR_SCHEMA_SQL
+    assert "yearly_acceleration_percent NUMERIC(22,4)" in factors.FACTOR_SCHEMA_SQL
+
+
 def test_fundamental_acceleration_increases_score():
     fast, _ = factors._fundamental_factor({
         "revenue_month": date(2026, 7, 1),
