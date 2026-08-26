@@ -27,6 +27,7 @@ from stock_db.pipeline import (
     update_official_daily,
 )
 from stock_db.radar import (
+    explain_database_stock_v12,
     run_full_bullish_radar,
     run_full_bullish_radar_v12 as run_full_bullish_radar_v12_core,
     screen_database_market,
@@ -35,6 +36,7 @@ from stock_db.radar import (
 from stock_db.v12 import (
     V12_ACCURACY_ENGINE,
     V12_STRATEGIES,
+    V12_VERSION,
     load_v12_config,
     validate_v12_candidates,
 )
@@ -108,7 +110,7 @@ async def validate_v12_release_core(
     return {
         "ok": all(checks.values()),
         "releaseReady": all(checks.values()),
-        "version": "V12",
+        "version": V12_VERSION,
         "accuracyEngine": full.get("accuracyEngine"),
         "snapshotScanCount": 1,
         "checks": checks,
@@ -310,7 +312,7 @@ def register_v10_tools(mcp: Any) -> None:
         minimum_score: float = 45,
         save_result: bool = True,
     ) -> dict:
-        """執行V12四種看漲策略，輸出激進低接、確認買點、分批比例與失敗條件。"""
+        """執行V12.4五種看漲策略，輸出買點、觀察區、分批比例與失敗條件。"""
         return await run_full_bullish_radar_v12_core(
             limit_each=limit_each,
             minimum_score=minimum_score,
@@ -323,11 +325,16 @@ def register_v10_tools(mcp: Any) -> None:
         config = load_v12_config()
         return {
             "ok": True,
-            "version": "V12",
+            "version": V12_VERSION,
             "accuracyEngine": V12_ACCURACY_ENGINE,
             "strategies": list(V12_STRATEGIES),
             "config": config.public_dict(),
         }
+
+    @mcp.tool()
+    async def explain_stock_v12(symbol: str) -> dict:
+        """說明單一股票在最新V12.4快照中通過或淘汰的逐項原因。"""
+        return await explain_database_stock_v12(symbol)
 
     @mcp.tool()
     async def run_full_bullish_radar_v10(
@@ -457,7 +464,7 @@ def register_v10_tools(mcp: Any) -> None:
     async def get_radar_weekly_report(
         start_date: str | None = None,
         end_date: str | None = None,
-        version: str = "V12",
+        version: str = V12_VERSION,
         top_n: int = 10,
     ) -> dict:
         """依日期與雷達版本產生週報，空值不計失敗且同日同股去重。"""
