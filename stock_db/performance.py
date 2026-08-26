@@ -703,7 +703,7 @@ async def update_signal_execution_performance(
               ON e.radar_run_id=c.radar_run_id AND e.symbol=c.symbol
             WHERE LOWER(r.strategy) LIKE 'v12_%'
               AND (
-                COALESCE(c.snapshot->>'accuracyEngine','') NOT LIKE 'V12.3%'
+                COALESCE(c.snapshot->>'accuracyEngine','') NOT LIKE 'V12.%'
                 OR LOWER(r.strategy) = 'v12_combined'
               )
               AND (
@@ -793,7 +793,7 @@ async def update_signal_execution_performance(
                     simulation["max_favorable_percent"],
                     simulation["max_adverse_percent"],
                     simulation["evaluated_through"],
-                    "V12.3.1_DUAL_ENTRY_20D",
+                    "V12.4",
                     str(snapshot.get("accuracyEngine") or ""),
                     str(snapshot.get("actionCode") or ""),
                     str(_mapping(snapshot.get("marketContext")).get("regime") or ""),

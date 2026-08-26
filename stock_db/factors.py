@@ -1,4 +1,4 @@
-"""V12.3.1 multi-factor enrichment for the formal bullish radar.
+"""V12.4 multi-factor enrichment for the formal bullish radar.
 
 The module deliberately stores compact daily/monthly features instead of raw
 ticks.  A missing provider is reported as missing data and is never converted
@@ -26,7 +26,8 @@ TWSE_REVENUE_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap05_L"
 TPEX_REVENUE_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O"
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 _REMOTE_CACHE: dict[tuple[str, str], tuple[Any, Any]] = {}
-V12_3_ACCURACY_ENGINE = "V12.3.1_SEVEN_FACTOR_FIX"
+# Kept as an internal compatibility name; public output is one release only.
+V12_3_ACCURACY_ENGINE = "V12.4"
 DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS = 7
 
 FACTOR_SCHEMA_SQL = """
