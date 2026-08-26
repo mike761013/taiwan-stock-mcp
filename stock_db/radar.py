@@ -13,16 +13,19 @@ from .v12 import (
     V12_ACCURACY_ENGINE,
     V12_ACTIONABLE_STATUS_CODES,
     V12_STRATEGIES,
+    V12_VERSION,
     apply_execution_prior,
     apply_market_context,
     build_market_context,
+    explain_v12_row,
+    find_v12_near_misses,
     load_v12_config,
     screen_v12_rows,
     split_v12_price_tiers,
 )
 
 
-_STRATEGIES = {"early_stage", "breakout", "pullback", "reversal_reclaim"}
+_STRATEGIES = set(V12_STRATEGIES)
 _COMMON_STOCK_FILTER = """
           UPPER(s.market) IN ('TWSE', 'TPEX', 'OTC')
           AND s.symbol ~ '^[1-9][0-9]{3}$'
@@ -44,8 +47,8 @@ async def screen_database_market(
     strategy = strategy.strip().lower()
     if strategy not in _STRATEGIES:
         raise ValueError(f"strategy must be one of {sorted(_STRATEGIES)}")
-    # reversal_reclaim is a V12 pattern and needs the richer V12 snapshot.
-    if strategy == "reversal_reclaim":
+    # V12-only patterns need the richer snapshot.
+    if strategy in {"reversal_reclaim", "reversal_continuation"}:
         return await screen_database_market_v12(
             strategy=strategy,
             limit=limit,
@@ -377,6 +380,36 @@ async def _fetch_v12_snapshot() -> tuple[list[dict[str, Any]], int, Any]:
     return [dict(row) for row in rows], universe_count, latest_trade_date
 
 
+async def explain_database_stock_v12(symbol: str) -> dict[str, Any]:
+    """Explain the latest V12.4 selection/rejection result for one symbol."""
+    normalized = str(symbol or "").strip()
+    if not normalized:
+        raise ValueError("symbol is required")
+    rows, universe_count, latest_trade_date = await _fetch_v12_snapshot()
+    row = next(
+        (item for item in rows if str(item.get("symbol") or "").strip() == normalized),
+        None,
+    )
+    if row is None:
+        return {
+            "ok": False,
+            "version": V12_VERSION,
+            "accuracyEngine": V12_ACCURACY_ENGINE,
+            "symbol": normalized,
+            "latestTradeDate": latest_trade_date,
+            "universeCount": universe_count,
+            "error": "SYMBOL_NOT_IN_LATEST_SNAPSHOT",
+        }
+    explanation = explain_v12_row(row, load_v12_config())
+    explanation.update(
+        {
+            "latestTradeDate": latest_trade_date,
+            "universeCount": universe_count,
+        }
+    )
+    return explanation
+
+
 async def _save_v12_strategy(
     strategy: str,
     candidates: list[dict[str, Any]],
@@ -418,6 +451,7 @@ async def screen_database_market_v12(
     minimum_score = max(0.0, min(float(minimum_score), 100.0))
     config = load_v12_config()
     rows, universe_count, latest_trade_date = await _fetch_v12_snapshot()
+    near_miss_observations = find_v12_near_misses(rows, config, limit=10)
     market_context = build_market_context(rows, config)
     priors = (
         await execution_strategy_priors(
@@ -503,7 +537,7 @@ async def screen_database_market_v12(
 
     return {
         "ok": True,
-        "version": "V12",
+        "version": V12_VERSION,
         "accuracyEngine": V12_ACCURACY_ENGINE,
         "strategy": strategy,
         "candidateCount": len(candidates),
@@ -534,6 +568,7 @@ async def screen_database_market_v12(
         "results": candidates,
         "actionableResults": actionable_results,
         "watchResults": watch_results,
+        "nearMissObservations": near_miss_observations,
         "primaryResults": primary_results,
         "highPriceStrongResults": high_price_results,
         "record": saved,
@@ -547,11 +582,12 @@ async def run_full_bullish_radar_v12(
     minimum_score: float = 45,
     save_result: bool = True,
 ) -> dict[str, Any]:
-    """Run all four V12 bullish strategies and merge their tradable candidates."""
+    """Run all five V12.4 bullish strategies and merge their tradable candidates."""
     limit_each = max(1, min(limit_each, 200))
     minimum_score = max(0.0, min(float(minimum_score), 100.0))
     config = load_v12_config()
     rows, universe_count, latest_trade_date = await _fetch_v12_snapshot()
+    near_miss_observations = find_v12_near_misses(rows, config, limit=10)
     market_context = build_market_context(rows, config)
     priors = (
         await execution_strategy_priors(
@@ -619,7 +655,7 @@ async def run_full_bullish_radar_v12(
             )
         grouped[strategy] = {
             "ok": True,
-            "version": "V12",
+            "version": V12_VERSION,
             "strategy": strategy,
             "candidateCount": len(candidates),
             "rawCandidateCount": len(raw_candidates),
@@ -632,6 +668,11 @@ async def run_full_bullish_radar_v12(
             "results": candidates,
             "primaryResults": primary_results,
             "highPriceStrongResults": high_price_results,
+            "nearMissObservations": (
+                near_miss_observations
+                if strategy == "reversal_continuation"
+                else []
+            ),
             "record": record,
             "source": "PostgreSQL V12",
         }
@@ -770,7 +811,7 @@ async def run_full_bullish_radar_v12(
 
     return {
         "ok": True,
-        "version": "V12",
+        "version": V12_VERSION,
         "accuracyEngine": V12_ACCURACY_ENGINE,
         "strategies": list(V12_STRATEGIES),
         "candidateCount": len(displayed_candidates),
@@ -803,6 +844,7 @@ async def run_full_bullish_radar_v12(
         "actionableCandidates": actionable_primary,
         "bullishTop10": bullish_ranked[:10],
         "watchlistCandidates": watch_primary[:10],
+        "nearMissObservations": near_miss_observations,
         "highPriceStrongCandidates": high_price_ranked,
         "byStrategy": grouped,
         "record": combined_record,
