@@ -14,8 +14,15 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-V12_STRATEGIES = ("early_stage", "breakout", "pullback", "reversal_reclaim")
-V12_ACCURACY_ENGINE = "V12.3.1_SEVEN_FACTOR_FIX"
+V12_VERSION = "V12.4"
+V12_STRATEGIES = (
+    "early_stage",
+    "breakout",
+    "pullback",
+    "reversal_reclaim",
+    "reversal_continuation",
+)
+V12_ACCURACY_ENGINE = V12_VERSION
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "v12_config.json"
 
 V12_STATUS_LABELS = {
@@ -24,6 +31,7 @@ V12_STATUS_LABELS = {
     "EARLY_ENTRY": "早期進場",
     "EARLY_ENTRY_SMALL_POSITION": "早期進場（小部位）",
     "BOTTOM_REVERSAL_WATCH": "底部止跌觀察",
+    "NEAR_MISS_OBSERVATION": "近門檻觀察",
     "PRICE_CONFIRMATION_REQUIRED": "等待價格確認",
     "SMALL_POSITION_OR_SKIP": "小部位或略過",
     "WAIT_PULLBACK": "等待拉回",
@@ -85,6 +93,22 @@ class V12Config:
     reversal_max_distance_low20_atr: float = 2.50
     reversal_min_drawdown20_pct: float = 10.0
     reversal_min_stabilization_signals: int = 2
+
+    # V12.4 bridge for a V-shaped recovery that has left the absolute bottom
+    # but is taking its first healthy pause before/while a golden triangle
+    # forms. MA60 is deliberately context, not a hard bullish-stack gate.
+    continuation_min_score: float = 65.0
+    continuation_min_drawdown20_pct: float = 15.0
+    continuation_max_distance_ma20_pct: float = 7.0
+    continuation_max_distance_support_pct: float = 3.0
+    continuation_min_volume_ratio20: float = 0.40
+    continuation_max_volume_ratio20: float = 1.30
+    continuation_min_close_position: float = 0.45
+    continuation_max_5day_change_pct: float = 18.0
+    continuation_ma20_slope_tolerance_pct: float = 0.25
+    continuation_max_above_ma60_pct: float = 3.0
+    golden_triangle_compression_pct: float = 4.0
+    near_miss_max_failed_rules: int = 1
 
     # Pullback V3: strict bullish alignment while MA5 and the rolling
     # high-volume low remain intact. A down close is allowed and rewarded when
@@ -176,7 +200,7 @@ class V12Config:
     execution_prior_max_adjustment: float = 8.0
     execution_entry_window_sessions: int = 3
 
-    # V12.3.1 seven-factor formal ranking. Missing provider data is omitted and
+    # V12.4 seven-factor formal ranking. Missing provider data is omitted and
     # the remaining weights are normalised; it is never silently scored zero.
     factor_weight_technical: float = 30.0
     factor_weight_chip: float = 20.0
@@ -330,6 +354,35 @@ def _bottom_context(row: Mapping[str, Any]) -> dict[str, float]:
         "drawdownFromHigh20Percent": (
             max(0.0, (high20 - close) / high20 * 100) if high20 > 0 else 0.0
         ),
+    }
+
+
+def _golden_triangle_context(row: Mapping[str, Any], config: V12Config) -> dict[str, Any]:
+    """Describe current/emerging MA5-MA10-MA20 structure without future data."""
+    ma5 = _number(row, "ma5")
+    ma10 = _number(row, "ma10")
+    ma20 = _number(row, "ma20")
+    prev_ma5 = _number(row, "prev_ma5")
+    prev_ma10 = _number(row, "prev_ma10")
+    prev_ma20 = _number(row, "prev_ma20")
+    valid = min(ma5, ma10, ma20) > 0
+    aligned = valid and ma5 > ma10 > ma20
+    emerging = valid and ma5 > ma20 and ma10 <= ma20
+    just_formed = aligned and (
+        (prev_ma5 > 0 and prev_ma20 > 0 and prev_ma5 <= prev_ma20)
+        or (prev_ma10 > 0 and prev_ma20 > 0 and prev_ma10 <= prev_ma20)
+    )
+    spread_pct = (
+        (max(ma5, ma10, ma20) - min(ma5, ma10, ma20)) / ma20 * 100
+        if valid
+        else 999.0
+    )
+    return {
+        "aligned": aligned,
+        "emerging": emerging,
+        "justFormed": just_formed,
+        "compressed": valid and spread_pct <= config.golden_triangle_compression_pct,
+        "spreadPercent": round(spread_pct, 4),
     }
 
 
@@ -498,6 +551,149 @@ def reversal_reclaim_score(
     )
     score = _clamp(score)
     return core_pass and score >= config.reversal_min_score, score, reasons, warnings
+
+
+def reversal_continuation_score(
+    row: Mapping[str, Any], config: V12Config
+) -> tuple[bool, float, list[str], list[str], list[str]]:
+    """Score the first controlled pause after a V-shaped MA20 reclaim.
+
+    This bridges the intentional gap between ``reversal_reclaim`` (still near
+    the low) and ``pullback`` (already above MA60 in a mature bullish stack).
+    It never relaxes the global overheat/no-chase protections.
+    """
+    close = _number(row, "close")
+    low = _number(row, "low")
+    prev_low = _number(row, "prev_low")
+    ma5 = _number(row, "ma5")
+    ma10 = _number(row, "ma10")
+    ma20 = _number(row, "ma20")
+    ma60 = _number(row, "ma60")
+    prev_ma5 = _number(row, "prev_ma5")
+    prev_ma20 = _number(row, "prev_ma20")
+    volume_ratio = _number(row, "volume_ratio")
+    close_position = _close_position(row)
+    change5 = _five_day_change_pct(row)
+    bottom = _bottom_context(row)
+    triangle = _golden_triangle_context(row, config)
+
+    dist20 = _distance_pct(close, ma20) if ma20 > 0 else 999.0
+    support_distances = [
+        abs(_distance_pct(close, value))
+        for value in (ma5, ma10, ma20)
+        if value > 0
+    ]
+    nearest_support = min(support_distances) if support_distances else 999.0
+
+    score = 0.0
+    reasons: list[str] = []
+    warnings: list[str] = []
+    failed_rules: list[str] = []
+
+    if bottom["drawdownFromHigh20Percent"] >= config.continuation_min_drawdown20_pct:
+        score += 15
+        reasons.append("近期曾有明顯回檔，屬反轉後續段而非高檔追價")
+    else:
+        failed_rules.append("20日回檔幅度不足，無法確認V型反轉背景")
+
+    if close >= ma20 > 0:
+        score += 15
+        reasons.append("已站回MA20")
+    else:
+        failed_rules.append("尚未站回MA20")
+
+    if ma5 > ma10 > 0 and (ma5 > ma20 or close >= ma5):
+        score += 15
+        reasons.append("MA5領先MA10，短線結構轉強")
+    else:
+        failed_rules.append("MA5尚未領先MA10形成反轉續強結構")
+
+    if 0 <= dist20 <= config.continuation_max_distance_ma20_pct:
+        score += 10
+    else:
+        failed_rules.append(
+            f"距MA20為{dist20:.1f}%，超過續強段{config.continuation_max_distance_ma20_pct:.1f}%上限"
+        )
+
+    if nearest_support <= config.continuation_max_distance_support_pct:
+        score += 15
+        reasons.append(f"貼近短中期均線支撐（最近{nearest_support:.1f}%）")
+    else:
+        failed_rules.append(
+            f"距最近均線支撐{nearest_support:.1f}%，尚未形成健康拉回買點"
+        )
+
+    if config.continuation_min_volume_ratio20 <= volume_ratio <= config.continuation_max_volume_ratio20:
+        score += 10
+        reasons.append("拉回量能受控")
+    else:
+        failed_rules.append(
+            f"量比{volume_ratio:.2f}不在續強段健康區間"
+        )
+
+    if close_position >= config.continuation_min_close_position:
+        score += 8
+        reasons.append("收盤位置具承接")
+    else:
+        failed_rules.append("收盤位置過低，承接尚未確認")
+
+    if prev_low > 0 and low >= prev_low:
+        score += 5
+        reasons.append("低點未再下移")
+    else:
+        warnings.append("低點仍可能下移")
+
+    if _slope_not_declining(
+        ma20,
+        prev_ma20,
+        config.continuation_ma20_slope_tolerance_pct,
+    ):
+        score += 7
+        reasons.append("MA20未明顯轉弱")
+    else:
+        failed_rules.append("MA20下彎超過反轉續強容許值")
+
+    if _slope_not_declining(ma5, prev_ma5, config.forward_ma5_slope_tolerance_pct):
+        score += 5
+    else:
+        warnings.append("MA5斜率快速轉弱")
+
+    if change5 <= config.continuation_max_5day_change_pct:
+        score += 5
+    else:
+        failed_rules.append(
+            f"五日漲幅{change5:.1f}%超過反轉續強動態上限"
+        )
+
+    if ma60 > 0 and close > ma60 * (1 + config.continuation_max_above_ma60_pct / 100):
+        failed_rules.append("已明顯站上MA60，反轉橋接階段結束")
+    elif ma60 > 0:
+        reasons.append("仍位於MA60壓力附近，保留早期橋接定位")
+
+    if triangle["aligned"]:
+        score += 10
+        reasons.append("MA5>MA10>MA20黃金三角成立")
+    elif triangle["emerging"]:
+        score += 6
+        reasons.append("黃金三角形成中")
+    if triangle["justFormed"]:
+        score += 4
+        reasons.append("均線交叉為近期新形成")
+    if triangle["compressed"]:
+        score += 4
+        reasons.append("三條均線收斂，轉強成本集中")
+
+    if _daily_change_pct(row) >= config.strong_day_change_pct:
+        warnings.append("訊號日漲幅過大，只能等待拉回，不可追價")
+
+    score = _clamp(score)
+    return (
+        not failed_rules and score >= config.continuation_min_score,
+        score,
+        reasons,
+        warnings,
+        failed_rules,
+    )
 
 
 
@@ -745,10 +941,15 @@ def predictive_quality_score(
         score -= 10
         risks.append("距MA20偏遠")
 
-    if change5 > config.predictive_max_5day_change_pct:
+    max_five_day_change = (
+        config.continuation_max_5day_change_pct
+        if strategy == "reversal_continuation"
+        else config.predictive_max_5day_change_pct
+    )
+    if change5 > max_five_day_change:
         score -= 15
         risks.append("五日漲幅過大，容易進入短線兌現")
-    elif change5 > config.predictive_max_5day_change_pct * 0.67:
+    elif change5 > max_five_day_change * 0.67:
         score -= 8
         risks.append("五日漲幅偏快")
     if change_pct >= config.strong_day_change_pct:
@@ -838,6 +1039,31 @@ def predictive_quality_score(
             score += 6
             positives.append("底部量能未失控")
 
+    elif strategy == "reversal_continuation":
+        triangle = _golden_triangle_context(row, config)
+        if triangle["aligned"]:
+            score += 10
+            positives.append("黃金三角已成立")
+        elif triangle["emerging"]:
+            score += 7
+            positives.append("黃金三角形成中")
+        if triangle["compressed"]:
+            score += 5
+            positives.append("均線收斂後轉強")
+        if 0 <= dist20 <= config.continuation_max_distance_ma20_pct:
+            score += 6
+        if min(
+            abs(dist5),
+            abs(_distance_pct(close, ma10)) if ma10 > 0 else 999.0,
+        ) <= config.continuation_max_distance_support_pct:
+            score += 8
+            positives.append("價格貼近MA5或MA10支撐")
+        if bottom["drawdownFromHigh20Percent"] >= config.continuation_min_drawdown20_pct:
+            score += 5
+        if 0 < volume_ratio <= config.continuation_max_volume_ratio20:
+            score += 6
+            positives.append("續強拉回量能受控")
+
     return _clamp(score), positives, risks
 
 
@@ -859,6 +1085,7 @@ def evaluate_forward_qualification(
         "breakout": config.forward_min_quality_breakout,
         "pullback": config.forward_min_quality_pullback,
         "reversal_reclaim": config.forward_min_quality_reversal,
+        "reversal_continuation": config.forward_min_quality_reversal,
     }
     quality_threshold = quality_thresholds[strategy]
     passed_rules: list[str] = []
@@ -887,17 +1114,22 @@ def evaluate_forward_qualification(
     close_position = _close_position(row)
     upper_shadow = _upper_shadow_pct(row)
 
-    if strategy in {"early_stage", "breakout", "pullback"}:
+    if strategy in {"early_stage", "breakout", "pullback", "reversal_continuation"}:
+        slope_tolerance = (
+            config.continuation_ma20_slope_tolerance_pct
+            if strategy == "reversal_continuation"
+            else config.forward_ma20_slope_tolerance_pct
+        )
         if _slope_not_declining(
             ma20,
             prev_ma20,
-            config.forward_ma20_slope_tolerance_pct,
+            slope_tolerance,
         ):
             passed_rules.append("MA20趨勢未明顯轉弱")
         else:
             failed_rules.append("MA20已明顯下彎")
 
-    if strategy in {"early_stage", "pullback"}:
+    if strategy in {"early_stage", "pullback", "reversal_continuation"}:
         if _slope_not_declining(
             ma5,
             prev_ma5,
@@ -918,6 +1150,15 @@ def evaluate_forward_qualification(
             passed_rules.append("上影線風險可控")
         else:
             failed_rules.append("上影線過長，突破承接不足")
+
+    if strategy == "reversal_continuation":
+        if change5 <= config.continuation_max_5day_change_pct:
+            passed_rules.append("反轉背景下五日漲幅仍在動態上限內")
+        else:
+            failed_rules.append(
+                f"五日漲幅{change5:.1f}%超過反轉續強"
+                f"{config.continuation_max_5day_change_pct:.1f}%上限"
+            )
 
     if strategy == "breakout":
         if close_position >= config.breakout_min_close_position:
@@ -1214,7 +1455,155 @@ def strategy_passes(row: Mapping[str, Any], strategy: str, config: V12Config) ->
     if strategy == "reversal_reclaim":
         passed, _, _, _ = reversal_reclaim_score(row, config)
         return passed
+    if strategy == "reversal_continuation":
+        passed, _, _, _, _ = reversal_continuation_score(row, config)
+        return passed
     raise ValueError(f"strategy must be one of {V12_STRATEGIES}")
+
+
+def audit_v12_strategy(
+    row: Mapping[str, Any], strategy: str, config: V12Config
+) -> dict[str, Any]:
+    """Return a human-readable gate audit even when a stock is rejected."""
+    if strategy not in V12_STRATEGIES:
+        raise ValueError(f"strategy must be one of {V12_STRATEGIES}")
+    passed = strategy_passes(row, strategy, config)
+    failed_rules: list[str] = []
+    passed_rules: list[str] = []
+    score: float | None = None
+
+    if strategy == "reversal_continuation":
+        passed, score, reasons, warnings, failed_rules = reversal_continuation_score(
+            row, config
+        )
+        passed_rules = reasons
+        failed_rules = list(failed_rules)
+        failed_rules.extend(f"警示：{warning}" for warning in warnings)
+    elif strategy == "reversal_reclaim":
+        passed, score, reasons, warnings = reversal_reclaim_score(row, config)
+        passed_rules = reasons
+        if not passed:
+            failed_rules = warnings or ["未同時通過底部位置、止跌與量能門檻"]
+    elif strategy == "pullback":
+        passed, score, reasons, warnings, signals = pullback_v2_score(row, config)
+        passed_rules = reasons + [f"止穩：{signal}" for signal in signals]
+        if not passed:
+            failed_rules = warnings or ["未同時通過多頭排列與健康回檔門檻"]
+    else:
+        score = _v11_base_score(row)
+        passed_rules = _strategy_reasons(row, strategy)
+        close = _number(row, "close")
+        ma5 = _number(row, "ma5")
+        ma20 = _number(row, "ma20")
+        volume_ratio = _number(row, "volume_ratio")
+        if strategy == "early_stage":
+            if not ma5 >= ma20 > 0:
+                failed_rules.append("MA5尚未站上MA20")
+            if close < ma20:
+                failed_rules.append("收盤尚未站上MA20")
+            if _distance_pct(close, ma20) > config.early_max_distance_ma20_pct:
+                failed_rules.append("距MA20過遠，不屬早期位置")
+            if not 0.8 <= volume_ratio <= config.early_max_volume_ratio20:
+                failed_rules.append("量比不在早期型態區間")
+            if _close_position(row) < config.early_min_close_position:
+                failed_rules.append("收盤位置不足")
+        else:
+            bollinger_upper = _number(row, "bollinger_upper")
+            if bollinger_upper <= 0 or close < bollinger_upper:
+                failed_rules.append("尚未突破布林上軌")
+            if not 1.2 <= volume_ratio <= config.breakout_max_volume_ratio20:
+                failed_rules.append("突破量能不合格")
+            if _distance_pct(close, ma20) > config.breakout_max_distance_ma20_pct:
+                failed_rules.append("突破位置距MA20過遠")
+            if _close_position(row) < config.breakout_min_close_position:
+                failed_rules.append("突破日收盤位置不足")
+
+    liquidity = liquidity_result(row, config)
+    actionable = passed and bool(liquidity["eligible"])
+    return {
+        "strategy": strategy,
+        "passed": actionable,
+        "patternPassed": passed,
+        "score": round(score, 2) if score is not None else None,
+        "passedRules": passed_rules,
+        "failedRules": list(liquidity["failedRules"]) + failed_rules,
+    }
+
+
+def explain_v12_row(row: Mapping[str, Any], config: V12Config) -> dict[str, Any]:
+    """Explain why one stock is selected, observed, or rejected by V12.4."""
+    audits = [audit_v12_strategy(row, strategy, config) for strategy in V12_STRATEGIES]
+    eligible = [audit for audit in audits if audit["passed"]]
+    bridge = next(
+        audit for audit in audits if audit["strategy"] == "reversal_continuation"
+    )
+    bridge_hard_failures = [
+        reason for reason in bridge["failedRules"] if not reason.startswith("警示：")
+    ]
+    dist20 = _distance_pct(_number(row, "close"), _number(row, "ma20"))
+    strong_day = _daily_change_pct(row) >= config.strong_day_change_pct
+    overextended = dist20 >= config.ma20_distance_warning_pct
+    if strong_day or overextended:
+        decision = "DO_NOT_CHASE"
+    elif eligible:
+        decision = "CANDIDATE"
+    elif len(bridge_hard_failures) <= config.near_miss_max_failed_rules:
+        decision = "NEAR_MISS_OBSERVATION"
+    else:
+        decision = "REJECTED"
+    return {
+        "ok": True,
+        "version": V12_VERSION,
+        "accuracyEngine": V12_ACCURACY_ENGINE,
+        "symbol": str(row.get("symbol") or ""),
+        "name": str(row.get("name") or ""),
+        "tradeDate": str(row.get("trade_date") or ""),
+        "decisionCode": decision,
+        "decision": v12_status_label(decision),
+        "passedStrategies": [audit["strategy"] for audit in eligible],
+        "closestStrategy": min(
+            audits,
+            key=lambda audit: (len(audit["failedRules"]), -(audit["score"] or 0)),
+        )["strategy"],
+        "strategyAudits": audits,
+        "goldenTriangle": _golden_triangle_context(row, config),
+        "fiveDayChangePercent": round(_five_day_change_pct(row), 2),
+        "distanceFromMA20Percent": round(dist20, 2),
+    }
+
+
+def find_v12_near_misses(
+    rows: Sequence[Mapping[str, Any]],
+    config: V12Config,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Return bridge setups that miss at most one hard rule, outside ranking."""
+    observations: list[dict[str, Any]] = []
+    for row in rows:
+        if not liquidity_result(row, config)["eligible"]:
+            continue
+        audit = audit_v12_strategy(row, "reversal_continuation", config)
+        hard_failures = [
+            reason for reason in audit["failedRules"] if not reason.startswith("警示：")
+        ]
+        if audit["passed"] or len(hard_failures) > config.near_miss_max_failed_rules:
+            continue
+        explanation = explain_v12_row(row, config)
+        explanation["nearMissFailedRules"] = hard_failures
+        observations.append(explanation)
+    observations.sort(
+        key=lambda item: (
+            len(item.get("nearMissFailedRules") or []),
+            -float(
+                next(
+                    audit["score"] or 0
+                    for audit in item["strategyAudits"]
+                    if audit["strategy"] == "reversal_continuation"
+                )
+            ),
+        )
+    )
+    return observations[: max(0, limit)]
 
 
 def _strategy_reasons(row: Mapping[str, Any], strategy: str) -> list[str]:
@@ -1234,6 +1623,13 @@ def _strategy_reasons(row: Mapping[str, Any], strategy: str) -> list[str]:
         reasons.append("多頭趨勢內回測短均線")
     elif strategy == "early_stage":
         reasons.append("短均線剛轉強")
+    elif strategy == "reversal_continuation":
+        triangle = _golden_triangle_context(row, V12Config())
+        reasons.append("V型反轉後的第一段健康整理")
+        if triangle["aligned"]:
+            reasons.append("MA5>MA10>MA20黃金三角成立")
+        elif triangle["emerging"]:
+            reasons.append("黃金三角形成中")
     return reasons
 
 
@@ -1294,7 +1690,7 @@ def _dual_entry_position_split(
         return 0, 30
     if status == "SMALL_POSITION_OR_SKIP":
         return 20, 30
-    if strategy in {"early_stage", "reversal_reclaim"}:
+    if strategy in {"early_stage", "reversal_reclaim", "reversal_continuation"}:
         return 30, 70
     return 40, 60
 
@@ -1460,7 +1856,7 @@ def build_trading_plan(
     elif strategy == "reversal_reclaim":
         entry_low = max(signal_defense, close - atr14 * config.entry_low_atr_multiple)
         entry_high = close + atr14 * 0.10
-    elif strategy == "pullback":
+    elif strategy in {"pullback", "reversal_continuation"}:
         reference = ma5 if ma5 > 0 else close
         entry_low = max(signal_defense, reference - atr14 * 0.20)
         entry_high = min(close, reference + atr14 * 0.20)
@@ -1493,7 +1889,7 @@ def build_trading_plan(
     # pullback candidates could be reported as BUY_ZONE even when the signal
     # price was already above maximumBuyPrice.
     change_pct = _daily_change_pct(row)
-    if strategy == "reversal_reclaim" and change_pct >= config.strong_day_change_pct:
+    if strategy in {"reversal_reclaim", "reversal_continuation"} and change_pct >= config.strong_day_change_pct:
         status = "DO_NOT_CHASE"
         initial_position = 0
     elif rounded_signal_price >= rounded_no_chase:
@@ -1514,10 +1910,10 @@ def build_trading_plan(
     elif strategy == "breakout":
         status = "BUY_ON_BREAKOUT"
         initial_position = 40
-    elif strategy == "pullback":
+    elif strategy in {"pullback", "reversal_continuation"}:
         if rounded_entry_low <= rounded_signal_price <= rounded_entry_high:
             status = "BUY_ZONE"
-            initial_position = 40
+            initial_position = 30 if strategy == "reversal_continuation" else 40
         else:
             status = "PRICE_CONFIRMATION_REQUIRED"
             initial_position = 0
@@ -1568,6 +1964,10 @@ def build_v12_candidate(
 
     if strategy == "reversal_reclaim":
         _, raw_score, reasons, pattern_warnings = reversal_reclaim_score(row, config)
+    elif strategy == "reversal_continuation":
+        _, raw_score, reasons, pattern_warnings, _ = reversal_continuation_score(
+            row, config
+        )
     elif strategy == "pullback":
         _, raw_score, reasons, pattern_warnings, stabilization_signals = pullback_v2_score(
             row, config
@@ -1660,7 +2060,7 @@ def build_v12_candidate(
                 + (
                     []
                     if forward_qualification["qualified"]
-                    else ["尚未通過V12.2後勢持續性門檻，保留觀察但不列正式前十"]
+                    else [f"尚未通過{V12_VERSION}後勢持續性門檻，保留觀察但不列正式前十"]
                 )
             ),
             "executionScoreDetails": execution_reasons,
@@ -1677,12 +2077,14 @@ def build_v12_candidate(
             "lowerShadowPercent": round(_lower_shadow_pct(row), 2),
         }
     )
-    if strategy == "reversal_reclaim":
+    if strategy in {"reversal_reclaim", "reversal_continuation"}:
         bottom = _bottom_context(row)
         item["bottomContext"] = {
             key: round(value, 4) if isinstance(value, float) else value
             for key, value in bottom.items()
         }
+    if strategy == "reversal_continuation":
+        item["goldenTriangle"] = _golden_triangle_context(row, config)
     return item
 
 
