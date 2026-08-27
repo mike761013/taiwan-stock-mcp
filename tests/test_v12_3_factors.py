@@ -179,10 +179,14 @@ def test_missing_factor_is_reweighted_not_scored_zero(monkeypatch):
     ))
     item = rows[0]
     assert item["factorScores"]["chip"] is None
-    assert item["missingFactors"] == ["chip", "fundamental", "theme", "intraday"]
-    # (80*30 + 50*5 + 50*5) / 40 = 72.5, not a zero-filled 29.
-    assert item["finalScore"] == 72.5
-    assert item["dataConfidence"] == 40
+    assert item["missingFactors"] == [
+        "chip", "fundamental", "event", "theme", "intraday",
+        "cross_market", "derivatives", "sector_driver", "sentiment",
+    ]
+    # Only technical, market and isolated history remain. Missing sources are
+    # reweighted rather than silently treated as bearish zeroes.
+    assert item["finalScore"] == 73.44
+    assert item["dataConfidence"] == 32
 
 
 def test_official_industry_theme_uses_market_heat(monkeypatch):
@@ -269,7 +273,7 @@ def test_final_score_below_formal_threshold_is_watch_only(monkeypatch):
         V12Config(),
     ))
 
-    assert rows[0]["finalScore"] == 57.5
+    assert rows[0]["finalScore"] == 57.81
     assert rows[0]["forwardQualified"] is False
     assert any(
         "低於正式門檻" in rule

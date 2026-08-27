@@ -1,0 +1,33 @@
+V12.4 完整因子版（提交 ce417bb）
+================================
+
+建議使用方式
+------------
+1. 下載 V12.4_ce417bb_changed_files.zip 並解壓縮。
+2. 將壓縮檔內的檔案依照原有目錄結構，覆蓋到
+   mike761013/taiwan-stock-mcp 儲存庫根目錄。
+3. 在 GitHub 建立提交，提交訊息可填：
+   Complete V12.4 factors and net execution model
+4. 確認變更進入 main 分支後，Render 會依 main 自動部署。
+5. 部署完成後執行 validate_v12_release，並確認回傳版本仍為 V12.4。
+
+檔案用途
+--------
+- V12.4_ce417bb_changed_files.zip：只含本次 13 個新增／修改檔案，最適合覆蓋上傳。
+- V12.4_ce417bb_full_source.zip：提交 ce417bb 的完整專案原始碼備份，不含 .git。
+- V12.4_ce417bb.patch：供熟悉 Git 的使用者以 git apply / git am 套用。
+- V12.4_ce417bb_SHA256.txt：三份檔案的 SHA-256 校驗碼。
+
+驗證狀態
+--------
+- 原提交完整測試：101/101 通過。
+- 本次打包前離線發布驗證：V12.4 VERIFY PASSED。
+- 本次工作環境無法重新下載 pytest 等套件，因此沒有再次重跑完整 101 項；
+  這是測試環境依賴缺失，不是程式測試失敗。
+
+注意
+----
+- 對外版本名稱維持 V12.4。
+- 內部因子模型：V12.4-COMPLETE-FACTORS-1。
+- 內部成交模型：V12.4-NET-EXECUTION-1。
+- 新績效資料應與舊模型分開累積，不可混算。

@@ -109,9 +109,16 @@ def test_execution_backtest_fills_two_stages_and_uses_weighted_cost():
     )
     assert result["execution_status"] == "FILLED"
     assert result["aggressive_fill_price"] == 100.0
-    assert result["confirmation_fill_price"] == 103.0
-    assert result["filled_position_percent"] == 100
-    assert 101.7 < result["weighted_entry_price"] < 101.9
+    # A wick-only touch fills half of the aggressive tranche. Confirmation is
+    # priced near that day's close plus slippage, not at the earlier trigger.
+    assert result["aggressive_fill_percent"] == 20
+    assert result["confirmation_fill_price"] == 103.5517
+    assert result["filled_position_percent"] == 80
+    assert result["planned_position_percent"] == 100
+    assert result["fill_ratio_percent"] == 80
+    assert 102.5 < result["weighted_entry_price"] < 102.8
+    assert result["cost_model"]["buyCostFactor"] == 1.000399
+    assert result["cost_model"]["sellProceedsFactor"] == 0.996601
     assert result["return_d3"] > 0
 
 
@@ -134,9 +141,23 @@ def test_execution_backtest_exits_next_open_after_close_failure():
         ),
     )
     assert result["execution_status"] == "EXITED"
-    assert result["exit_price"] == 94.0
+    assert result["exit_price"] == 93.953
     assert result["exit_reason"] == "CLOSE_FAILURE"
     assert result["return_d5"] < 0
+
+
+def test_execution_does_not_assume_same_bar_low_then_high_order():
+    result = simulate_signal_execution(
+        _plan(),
+        _bars(
+            (101, 104, 99, 103.5),
+            (101, 102, 100.5, 101),
+            (101, 102, 100.5, 101),
+        ),
+    )
+    assert result["aggressive_fill_percent"] == 20
+    assert result["confirmation_fill_percent"] == 0
+    assert result["fill_ratio_percent"] == 20
 
 
 def test_fake_breakout_is_rejected_when_it_closes_away_from_day_high():

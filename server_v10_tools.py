@@ -7,6 +7,7 @@ from typing import Any
 from stock_db.maintenance import run_daily_maintenance
 from stock_db.factors import (
     DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS,
+    V12_4_FACTOR_MODEL,
     get_fundamental_refresh_status,
     refresh_monthly_revenue,
     update_theme_tags,
@@ -457,9 +458,14 @@ def register_v10_tools(mcp: Any) -> None:
     async def get_v12_execution_performance_summary(
         strategy: str | None = None,
         accuracy_engine: str | None = None,
+        factor_model_revision: str | None = V12_4_FACTOR_MODEL,
     ) -> dict:
-        """只統計真正觸及V12雙買點的訊號；可指定accuracy_engine隔離新版績效。"""
-        return await execution_performance_summary(strategy, accuracy_engine)
+        """只統計可執行淨績效；預設隔離目前V12.4完整因子模型。"""
+        return await execution_performance_summary(
+            strategy,
+            accuracy_engine,
+            factor_model_revision,
+        )
     @mcp.tool()
     async def get_radar_weekly_report(
         start_date: str | None = None,

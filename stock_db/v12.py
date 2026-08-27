@@ -200,15 +200,21 @@ class V12Config:
     execution_prior_max_adjustment: float = 8.0
     execution_entry_window_sessions: int = 3
 
-    # V12.4 seven-factor formal ranking. Missing provider data is omitted and
-    # the remaining weights are normalised; it is never silently scored zero.
-    factor_weight_technical: float = 30.0
-    factor_weight_chip: float = 20.0
-    factor_weight_fundamental: float = 15.0
-    factor_weight_theme: float = 15.0
+    # V12.4 complete-factor formal ranking.  Event, cross-market, derivatives,
+    # industry drivers and sentiment are explicit point-in-time factors.  The
+    # weights sum to 100; missing providers are omitted and re-normalised.
+    factor_weight_technical: float = 25.0
+    factor_weight_chip: float = 15.0
+    factor_weight_fundamental: float = 12.0
+    factor_weight_event: float = 10.0
+    factor_weight_theme: float = 8.0
     factor_weight_intraday: float = 10.0
     factor_weight_market: float = 5.0
-    factor_weight_history: float = 5.0
+    factor_weight_cross_market: float = 5.0
+    factor_weight_derivatives: float = 3.0
+    factor_weight_sector_driver: float = 3.0
+    factor_weight_sentiment: float = 2.0
+    factor_weight_history: float = 2.0
     factor_minimum_confidence: float = 60.0
     factor_api_concurrency: int = 3
     factor_prefilter_limit: int = 40

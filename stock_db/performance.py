@@ -7,6 +7,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 import json
 import math
+import os
 from typing import Any, Iterable, Mapping, Sequence
 
 from .connection import stock_database
@@ -25,6 +26,24 @@ _V12_ONLY_STRATEGY_ALIASES = {
 }
 DEFAULT_PERFORMANCE_UPDATE_LIMIT = 5000
 MAX_PERFORMANCE_UPDATE_LIMIT = 20000
+
+# User-confirmed Cathay e-order cost factors for ordinary Taiwan stocks.
+# The factors already include the discounted brokerage fee; the sell factor
+# also includes transaction tax.  Slippage is kept separate so the execution
+# assumption remains auditable and can be overridden without changing code.
+BUY_COST_FACTOR = float(os.getenv("V12_BUY_COST_FACTOR", "1.000399"))
+SELL_PROCEEDS_FACTOR = float(
+    os.getenv("V12_SELL_PROCEEDS_FACTOR", "0.996601")
+)
+CONFIRMATION_ENTRY_SLIPPAGE_BPS = float(
+    os.getenv("V12_CONFIRMATION_ENTRY_SLIPPAGE_BPS", "5")
+)
+EXIT_SLIPPAGE_BPS = float(os.getenv("V12_EXIT_SLIPPAGE_BPS", "5"))
+WICK_TOUCH_FILL_RATIO = max(
+    0.0,
+    min(float(os.getenv("V12_WICK_TOUCH_FILL_RATIO", "0.5")), 1.0),
+)
+EXECUTION_MODEL_REVISION = "V12.4-NET-EXECUTION-1"
 
 _EXECUTION_TERMINAL_STATUSES = {"NO_TRADE", "CANCELLED", "EXITED"}
 _EXECUTION_FILLED_STATUSES = {
@@ -71,6 +90,12 @@ CREATE INDEX IF NOT EXISTS idx_signal_execution_strategy
 ALTER TABLE signal_execution_performance
     ADD COLUMN IF NOT EXISTS label_version VARCHAR(32),
     ADD COLUMN IF NOT EXISTS accuracy_engine VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS factor_model_revision VARCHAR(80),
+    ADD COLUMN IF NOT EXISTS execution_model_revision VARCHAR(80),
+    ADD COLUMN IF NOT EXISTS cost_model JSONB NOT NULL DEFAULT '{}'::JSONB,
+    ADD COLUMN IF NOT EXISTS fill_assumption VARCHAR(80),
+    ADD COLUMN IF NOT EXISTS planned_position_percent NUMERIC(8,4),
+    ADD COLUMN IF NOT EXISTS fill_ratio_percent NUMERIC(10,4),
     ADD COLUMN IF NOT EXISTS action_code VARCHAR(40),
     ADD COLUMN IF NOT EXISTS market_regime VARCHAR(24),
     ADD COLUMN IF NOT EXISTS industry VARCHAR(80),
@@ -384,15 +409,30 @@ def _execution_return(
     ]
     if not active:
         return None
-    cost = sum(float(fill["percent"]) for fill in active)
+    capital = sum(float(fill["percent"]) for fill in active)
     shares = sum(
-        float(fill["percent"]) / float(fill["price"])
+        float(fill["percent"])
+        / (float(fill["price"]) * BUY_COST_FACTOR)
         for fill in active
         if float(fill["price"]) > 0
     )
-    if cost <= 0 or shares <= 0:
+    if capital <= 0 or shares <= 0:
         return None
-    return round((shares * price / cost - 1) * 100, 4)
+    net_proceeds = shares * price * SELL_PROCEEDS_FACTOR
+    return round((net_proceeds / capital - 1) * 100, 4)
+
+
+def _execution_cost_model() -> dict[str, Any]:
+    return {
+        "returnBasis": "NET_AFTER_COST_AND_SLIPPAGE",
+        "buyCostFactor": BUY_COST_FACTOR,
+        "sellProceedsFactor": SELL_PROCEEDS_FACTOR,
+        "confirmationEntrySlippageBps": CONFIRMATION_ENTRY_SLIPPAGE_BPS,
+        "exitSlippageBps": EXIT_SLIPPAGE_BPS,
+        "wickTouchFillRatio": WICK_TOUCH_FILL_RATIO,
+        "broker": "Cathay e-order 28% fee, ordinary stock",
+        "executionModelRevision": EXECUTION_MODEL_REVISION,
+    }
 
 
 def simulate_signal_execution(
@@ -406,14 +446,12 @@ def simulate_signal_execution(
     Bars must begin after the signal date.  No same-day high/low is used to
     manufacture a fill.  A closing failure cancels an unfilled signal; after a
     fill it exits at the following session's open, matching the published
-    close-confirmation rule.
+    close-confirmation rule.  A daily wick touching the aggressive zone is
+    only a partial fill and still needs a visible support/rebound proxy.  A
+    confirmation entry is priced near that session's close instead of granting
+    the backtest the earlier trigger price with hindsight.
     """
     plan = _mapping(snapshot.get("tradingPlan"))
-    action_code = str(
-        snapshot.get("actionCode")
-        or plan.get("statusCode")
-        or ""
-    ).strip().upper()
     aggressive = _mapping(plan.get("aggressiveEntry"))
     confirmation = _mapping(plan.get("confirmationEntry"))
     position_plan = _mapping(plan.get("positionPlan"))
@@ -435,6 +473,8 @@ def simulate_signal_execution(
         "entry_date": None,
         "weighted_entry_price": None,
         "filled_position_percent": 0.0,
+        "planned_position_percent": None,
+        "fill_ratio_percent": 0.0,
         "exit_date": None,
         "exit_price": None,
         "exit_reason": None,
@@ -445,6 +485,12 @@ def simulate_signal_execution(
         "return_d20": None,
         "max_favorable_percent": None,
         "max_adverse_percent": None,
+        "factor_model_revision": str(
+            snapshot.get("factorModelRevision") or ""
+        ),
+        "execution_model_revision": EXECUTION_MODEL_REVISION,
+        "fill_assumption": "SUPPORT_PROXY_WICK_PARTIAL_CLOSE_CONFIRMATION",
+        "cost_model": _execution_cost_model(),
         "evaluated_through": (
             ordered[-1].get("trade_date") if ordered else None
         ),
@@ -482,11 +528,18 @@ def simulate_signal_execution(
     )
     failure_price = _as_float(failure.get("price")) or 0.0
     no_chase = _as_float(plan.get("noChasePrice")) or float("inf")
+    planned_position = aggressive_pct + (
+        confirmation_pct if confirmation_available else 0.0
+    )
+    result["planned_position_percent"] = planned_position
 
     fills: list[dict[str, Any]] = []
     failure_close_index: int | None = None
+    signal_low = _as_float(snapshot.get("low"))
+    prior_bar_low = signal_low
 
     for index, bar in enumerate(ordered):
+        aggressive_filled_this_bar = False
         open_price = _bar_number(bar, "open")
         high = _bar_number(bar, "high")
         low = _bar_number(bar, "low")
@@ -495,6 +548,24 @@ def simulate_signal_execution(
             continue
         assert open_price is not None and high is not None
         assert low is not None and close is not None
+
+        day_range = max(high - low, 0.0)
+        close_position = (
+            (close - low) / day_range if day_range > 0 else 0.5
+        )
+        lower_body = min(open_price, close)
+        lower_shadow_ratio = (
+            max(0.0, lower_body - low) / day_range
+            if day_range > 0 else 0.0
+        )
+        low_not_lower = (
+            prior_bar_low is not None and low >= prior_bar_low
+        )
+        support_proxy = (
+            close_position >= 0.45
+            or lower_shadow_ratio >= 0.20
+            or low_not_lower
+        )
 
         # A close-confirmed failure invalidates a not-yet-filled setup.  This
         # conservative ordering avoids pretending we knew the intraday path.
@@ -514,6 +585,7 @@ def simulate_signal_execution(
                 and aggressive_high >= aggressive_low
                 and low <= aggressive_high
                 and high >= aggressive_low
+                and support_proxy
             ):
                 if open_price > aggressive_high:
                     fill_price = aggressive_high
@@ -523,30 +595,49 @@ def simulate_signal_execution(
                     # A gap below the zone is priced at the zone floor rather
                     # than granting the backtest an unrealistically good fill.
                     fill_price = aggressive_low
+                wick_only = (
+                    open_price > aggressive_high
+                    and close > aggressive_high
+                    and low > aggressive_low
+                )
+                filled_percent = aggressive_pct * (
+                    WICK_TOUCH_FILL_RATIO if wick_only else 1.0
+                )
                 fills.append(
                     {
                         "kind": "aggressive",
                         "index": index,
                         "date": bar.get("trade_date"),
                         "price": fill_price,
-                        "percent": aggressive_pct,
+                        "percent": filled_percent,
+                        "planned_percent": aggressive_pct,
+                        "wick_only": wick_only,
+                        "support_proxy": {
+                            "closePosition": round(close_position, 4),
+                            "lowerShadowRatio": round(lower_shadow_ratio, 4),
+                            "lowNotLower": low_not_lower,
+                        },
                     }
                 )
+                aggressive_filled_this_bar = True
 
             has_confirmation = any(
                 fill["kind"] == "confirmation" for fill in fills
             )
             if (
                 not has_confirmation
+                and not aggressive_filled_this_bar
                 and confirmation_pct > 0
                 and confirmation_available
                 and confirmation_price > 0
                 and confirmation_price <= no_chase
                 and high >= confirmation_price
                 and close >= confirmation_price
-                and open_price <= no_chase
+                and close <= no_chase
             ):
-                fill_price = max(open_price, confirmation_price)
+                fill_price = close * (
+                    1 + CONFIRMATION_ENTRY_SLIPPAGE_BPS / 10_000
+                )
                 if fill_price <= no_chase:
                     fills.append(
                         {
@@ -555,12 +646,15 @@ def simulate_signal_execution(
                             "date": bar.get("trade_date"),
                             "price": fill_price,
                             "percent": confirmation_pct,
+                            "planned_percent": confirmation_pct,
+                            "priced_from": "confirmation session close",
                         }
                     )
 
         if fills and failure_price > 0 and close < failure_price:
             failure_close_index = index
             break
+        prior_bar_low = low
 
     if not fills:
         if len(ordered) >= entry_window_sessions:
@@ -587,14 +681,14 @@ def simulate_signal_execution(
     exit_price: float | None = None
     exit_date: Any = None
     status = "FILLED"
-    reason = "已依V12.1交易劇本成交"
+    reason = "已依V12.4可執行劇本成交"
     if failure_close_index is not None:
         next_index = failure_close_index + 1
         if next_index < len(ordered):
             next_open = _bar_number(ordered[next_index], "open")
             if next_open is not None:
                 exit_index = next_index
-                exit_price = next_open
+                exit_price = next_open * (1 - EXIT_SLIPPAGE_BPS / 10_000)
                 exit_date = ordered[next_index].get("trade_date")
                 status = "EXITED"
                 reason = "收盤跌破失敗條件，隔日開盤退出"
@@ -631,6 +725,11 @@ def simulate_signal_execution(
             round(weighted_entry, 4) if weighted_entry is not None else None
         ),
         filled_position_percent=cost,
+        planned_position_percent=planned_position,
+        fill_ratio_percent=(
+            round(cost / planned_position * 100, 4)
+            if planned_position > 0 else 0.0
+        ),
         exit_date=exit_date,
         exit_price=round(exit_price, 4) if exit_price is not None else None,
         exit_reason=("CLOSE_FAILURE" if exit_index is not None else None),
@@ -651,21 +750,34 @@ def simulate_signal_execution(
             target_close = _bar_number(ordered[target_index], "close")
             if target_close is not None:
                 result[field] = _execution_return(
-                    fills, target_close, target_index
+                    fills,
+                    target_close * (1 - EXIT_SLIPPAGE_BPS / 10_000),
+                    target_index,
                 )
 
     window_end = exit_index if exit_index is not None else len(ordered) - 1
     favorable: list[float] = []
     adverse: list[float] = []
-    for index in range(first_index, window_end + 1):
+    # The daily bar cannot tell whether its high/low occurred before or after
+    # the first fill.  Start excursion statistics on the following session so
+    # same-bar ordering never manufactures MFE or MAE.
+    for index in range(first_index + 1, window_end + 1):
         high = _bar_number(ordered[index], "high")
         low = _bar_number(ordered[index], "low")
         if high is not None:
-            value = _execution_return(fills, high, index)
+            value = _execution_return(
+                fills,
+                high * (1 - EXIT_SLIPPAGE_BPS / 10_000),
+                index,
+            )
             if value is not None:
                 favorable.append(value)
         if low is not None:
-            value = _execution_return(fills, low, index)
+            value = _execution_return(
+                fills,
+                low * (1 - EXIT_SLIPPAGE_BPS / 10_000),
+                index,
+            )
             if value is not None:
                 adverse.append(value)
     if exit_index is not None and exit_price is not None:
@@ -708,19 +820,27 @@ async def update_signal_execution_performance(
               )
               AND (
                 e.radar_run_id IS NULL
-                OR e.execution_status IN (
-                    'PENDING', 'FILLED', 'FILLED_PENDING_EXIT'
+                OR e.execution_model_revision IS DISTINCT FROM $2
+                OR (
+                  e.execution_status IN (
+                      'PENDING', 'FILLED', 'FILLED_PENDING_EXIT'
+                  )
+                  AND (e.return_d20 IS NULL OR e.execution_status='PENDING')
                 )
               )
-              AND (e.return_d20 IS NULL OR e.execution_status='PENDING')
             ORDER BY
-              CASE WHEN e.radar_run_id IS NULL THEN 0 ELSE 1 END,
+              CASE
+                WHEN e.radar_run_id IS NULL THEN 0
+                WHEN e.execution_model_revision IS DISTINCT FROM $2 THEN 1
+                ELSE 2
+              END,
               r.run_date DESC,
               c.radar_run_id DESC,
               c.symbol ASC
             LIMIT $1
             """,
             limit,
+            EXECUTION_MODEL_REVISION,
         )
         if not signals:
             return {
@@ -782,6 +902,8 @@ async def update_signal_execution_performance(
                     simulation["entry_date"],
                     simulation["weighted_entry_price"],
                     simulation["filled_position_percent"],
+                    simulation["planned_position_percent"],
+                    simulation["fill_ratio_percent"],
                     simulation["exit_date"],
                     simulation["exit_price"],
                     simulation["exit_reason"],
@@ -795,6 +917,10 @@ async def update_signal_execution_performance(
                     simulation["evaluated_through"],
                     "V12.4",
                     str(snapshot.get("accuracyEngine") or ""),
+                    str(snapshot.get("factorModelRevision") or ""),
+                    simulation["execution_model_revision"],
+                    json.dumps(simulation["cost_model"], ensure_ascii=False),
+                    simulation["fill_assumption"],
                     str(snapshot.get("actionCode") or ""),
                     str(_mapping(snapshot.get("marketContext")).get("regime") or ""),
                     str(snapshot.get("industry") or ""),
@@ -812,16 +938,19 @@ async def update_signal_execution_performance(
                 confirmation_fill_date, confirmation_fill_price,
                 confirmation_fill_percent,
                 entry_date, weighted_entry_price, filled_position_percent,
+                planned_position_percent, fill_ratio_percent,
                 exit_date, exit_price, exit_reason,
                 return_d1, return_d3, return_d5, return_d10, return_d20,
                 max_favorable_percent, max_adverse_percent,
                 evaluated_through, label_version, accuracy_engine,
+                factor_model_revision, execution_model_revision,
+                cost_model, fill_assumption,
                 action_code, market_regime, industry, factor_confidence,
                 calculated_at
             ) VALUES(
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
                 $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
-                $29,$30,$31,$32,NOW()
+                $29,$30,$31,$32,$33::jsonb,$34,$35,$36,$37,$38,NOW()
             )
             ON CONFLICT(radar_run_id, symbol) DO UPDATE SET
                 execution_status=EXCLUDED.execution_status,
@@ -835,6 +964,8 @@ async def update_signal_execution_performance(
                 entry_date=EXCLUDED.entry_date,
                 weighted_entry_price=EXCLUDED.weighted_entry_price,
                 filled_position_percent=EXCLUDED.filled_position_percent,
+                planned_position_percent=EXCLUDED.planned_position_percent,
+                fill_ratio_percent=EXCLUDED.fill_ratio_percent,
                 exit_date=EXCLUDED.exit_date,
                 exit_price=EXCLUDED.exit_price,
                 exit_reason=EXCLUDED.exit_reason,
@@ -848,6 +979,10 @@ async def update_signal_execution_performance(
                 evaluated_through=EXCLUDED.evaluated_through,
                 label_version=EXCLUDED.label_version,
                 accuracy_engine=EXCLUDED.accuracy_engine,
+                factor_model_revision=EXCLUDED.factor_model_revision,
+                execution_model_revision=EXCLUDED.execution_model_revision,
+                cost_model=EXCLUDED.cost_model,
+                fill_assumption=EXCLUDED.fill_assumption,
                 action_code=EXCLUDED.action_code,
                 market_regime=EXCLUDED.market_regime,
                 industry=EXCLUDED.industry,
@@ -870,6 +1005,7 @@ async def update_signal_execution_performance(
 async def execution_performance_summary(
     strategy: str | None = None,
     accuracy_engine: str | None = None,
+    factor_model_revision: str | None = None,
 ) -> dict[str, Any]:
     """Return performance only for plans that would really have filled."""
     requested = str(strategy or "").strip().lower()
@@ -887,7 +1023,15 @@ async def execution_performance_summary(
         if requested_engine:
             args.append(requested_engine)
             conditions.append(
-                f"COALESCE(c.snapshot->>'accuracyEngine', '')=${len(args)}"
+                "COALESCE(NULLIF(e.accuracy_engine, ''), "
+                f"c.snapshot->>'accuracyEngine', '')=${len(args)}"
+            )
+        requested_factor_model = str(factor_model_revision or "").strip()
+        if requested_factor_model:
+            args.append(requested_factor_model)
+            conditions.append(
+                "COALESCE(NULLIF(e.factor_model_revision, ''), "
+                f"c.snapshot->>'factorModelRevision', '')=${len(args)}"
             )
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         distinct_keys = (
@@ -916,11 +1060,26 @@ async def execution_performance_summary(
                 )
               ) AS filled,
               COUNT(*) FILTER (WHERE execution_status='EXITED') AS stopped,
+              COUNT(*) FILTER (
+                WHERE execution_status IN (
+                  'FILLED','FILLED_PENDING_EXIT','EXITED'
+                ) AND fill_ratio_percent >= 99.9
+              ) AS fully_filled,
+              COUNT(*) FILTER (
+                WHERE execution_status IN (
+                  'FILLED','FILLED_PENDING_EXIT','EXITED'
+                ) AND fill_ratio_percent < 99.9
+              ) AS partially_filled,
               AVG(filled_position_percent) FILTER (
                 WHERE execution_status IN (
                   'FILLED','FILLED_PENDING_EXIT','EXITED'
                 )
               ) AS avg_filled_position,
+              AVG(fill_ratio_percent) FILTER (
+                WHERE execution_status IN (
+                  'FILLED','FILLED_PENDING_EXIT','EXITED'
+                )
+              ) AS avg_fill_ratio,
               COUNT(return_d1) AS samples_d1,
               COUNT(return_d3) AS samples_d3,
               COUNT(return_d5) AS samples_d5,
@@ -949,17 +1108,25 @@ async def execution_performance_summary(
     summary["entry_rate_percent"] = (
         round(filled / matured * 100, 2) if matured > 0 else None
     )
+    fully_filled = int(summary.get("fully_filled") or 0)
+    summary["full_fill_rate_percent"] = (
+        round(fully_filled / matured * 100, 2) if matured > 0 else None
+    )
     return {
         "ok": True,
         "strategy": requested or None,
         "resolvedStrategy": resolved or None,
         "accuracyEngine": requested_engine or None,
+        "factorModelRevision": requested_factor_model or None,
         "summary": summary,
-        "method": "V12.1_DUAL_ENTRY_EXECUTION",
+        "method": EXECUTION_MODEL_REVISION,
+        "costModel": _execution_cost_model(),
         "notes": [
-            "只有實際觸及激進低接或確認買點的訊號才計算勝率。",
+            "碰到激進區間仍須有承接代理訊號；只有影線碰價只算部分成交。",
+            "確認買點以確認日收盤附近加滑價成交，不回填較早的盤中觸價。",
             "不追價、未觸價與成交前失效不列為虧損交易。",
             "收盤確認失敗後，以次一交易日開盤價退出。",
+            "所有報酬均已套用買進1.000399、賣出0.996601與設定滑價。",
         ],
     }
 
@@ -969,16 +1136,30 @@ async def execution_strategy_priors(
     full_confidence_samples: int = 120,
     maximum_adjustment: float = 8.0,
     accuracy_engine: str | None = None,
+    factor_model_revision: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Build small confidence-weighted priors from matured executable trades."""
     minimum_samples = max(10, int(minimum_samples))
     full_confidence_samples = max(minimum_samples, int(full_confidence_samples))
     maximum_adjustment = max(0.0, min(float(maximum_adjustment), 15.0))
     requested_engine = str(accuracy_engine or "").strip()
+    requested_factor_model = str(factor_model_revision or "").strip()
+    prior_conditions: list[str] = []
+    prior_args: list[Any] = []
+    if requested_engine:
+        prior_args.append(requested_engine)
+        prior_conditions.append(
+            "COALESCE(NULLIF(e.accuracy_engine, ''), "
+            "c.snapshot->>'accuracyEngine', '')=$1"
+        )
+    if requested_factor_model:
+        prior_args.append(requested_factor_model)
+        prior_conditions.append(
+            "COALESCE(NULLIF(e.factor_model_revision, ''), "
+            f"c.snapshot->>'factorModelRevision', '')=${len(prior_args)}"
+        )
     engine_where = (
-        "WHERE COALESCE(c.snapshot->>'accuracyEngine', '')=$1"
-        if requested_engine
-        else ""
+        f"WHERE {' AND '.join(prior_conditions)}" if prior_conditions else ""
     )
     async with stock_database.acquire() as connection:
         await _ensure_execution_schema(connection)
@@ -1006,7 +1187,7 @@ async def execution_strategy_priors(
             WHERE execution_status IN ('FILLED','EXITED')
             GROUP BY LOWER(strategy)
             """,
-            *([requested_engine] if requested_engine else []),
+            *prior_args,
         )
 
     priors: dict[str, dict[str, Any]] = {}

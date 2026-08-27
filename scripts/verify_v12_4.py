@@ -28,6 +28,7 @@ def main() -> None:
         "stock_db/v12.py",
         "stock_db/radar.py",
         "stock_db/factors.py",
+        "stock_db/advanced_factors.py",
         "stock_db/performance.py",
         "server_v10_tools.py",
     )
@@ -40,8 +41,30 @@ def main() -> None:
         "continuation_max_distance_support_pct",
         "golden_triangle_compression_pct",
         "near_miss_max_failed_rules",
+        "factor_weight_event",
+        "factor_weight_cross_market",
+        "factor_weight_derivatives",
+        "factor_weight_sector_driver",
+        "factor_weight_sentiment",
     }
     assert required.issubset(config), "V12.4 config fields are incomplete"
+    factor_weight_keys = {
+        key for key in config if key.startswith("factor_weight_")
+    }
+    assert sum(float(config[key]) for key in factor_weight_keys) == 100
+
+    factors_source = (ROOT / "stock_db" / "factors.py").read_text(
+        encoding="utf-8"
+    )
+    performance_source = (ROOT / "stock_db" / "performance.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'V12_4_FACTOR_MODEL = "V12.4-COMPLETE-FACTORS-1"' in factors_source
+    assert 'EXECUTION_MODEL_REVISION = "V12.4-NET-EXECUTION-1"' in (
+        performance_source
+    )
+    assert '"1.000399"' in performance_source
+    assert '"0.996601"' in performance_source
 
     v12 = load_v12_module()
     assert v12.V12_VERSION == "V12.4"
@@ -84,4 +107,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

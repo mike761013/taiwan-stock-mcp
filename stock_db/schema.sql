@@ -141,6 +141,12 @@ CREATE TABLE IF NOT EXISTS signal_execution_performance (
 ALTER TABLE signal_execution_performance
     ADD COLUMN IF NOT EXISTS label_version VARCHAR(32),
     ADD COLUMN IF NOT EXISTS accuracy_engine VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS factor_model_revision VARCHAR(80),
+    ADD COLUMN IF NOT EXISTS execution_model_revision VARCHAR(80),
+    ADD COLUMN IF NOT EXISTS cost_model JSONB NOT NULL DEFAULT '{}'::JSONB,
+    ADD COLUMN IF NOT EXISTS fill_assumption VARCHAR(80),
+    ADD COLUMN IF NOT EXISTS planned_position_percent NUMERIC(8,4),
+    ADD COLUMN IF NOT EXISTS fill_ratio_percent NUMERIC(10,4),
     ADD COLUMN IF NOT EXISTS action_code VARCHAR(40),
     ADD COLUMN IF NOT EXISTS market_regime VARCHAR(24),
     ADD COLUMN IF NOT EXISTS industry VARCHAR(80),
@@ -174,7 +180,7 @@ CREATE INDEX IF NOT EXISTS idx_signal_execution_strategy
 CREATE INDEX IF NOT EXISTS idx_database_jobs_status
     ON database_jobs(status, created_at DESC);
 
--- V12.3 compact seven-factor storage. Raw intraday ticks are intentionally
+-- V12.4 compact complete-factor storage. Raw intraday ticks are intentionally
 -- not retained so a 1 GB Render database remains practical.
 CREATE TABLE IF NOT EXISTS monthly_revenue (
     symbol VARCHAR(16) NOT NULL,
@@ -216,6 +222,12 @@ CREATE TABLE IF NOT EXISTS daily_factor_snapshots (
     theme_score NUMERIC(10,4),
     sector_score NUMERIC(10,4),
     intraday_score NUMERIC(10,4),
+    event_score NUMERIC(10,4),
+    cross_market_score NUMERIC(10,4),
+    derivatives_score NUMERIC(10,4),
+    sector_driver_score NUMERIC(10,4),
+    sentiment_score NUMERIC(10,4),
+    portfolio_risk_score NUMERIC(10,4),
     data_confidence NUMERIC(10,4) NOT NULL DEFAULT 0,
     missing_factors JSONB NOT NULL DEFAULT '[]'::JSONB,
     features JSONB NOT NULL DEFAULT '{}'::JSONB,
@@ -248,6 +260,27 @@ BEGIN
     END IF;
 END $$;
 
+ALTER TABLE daily_factor_snapshots
+    ADD COLUMN IF NOT EXISTS event_score NUMERIC(10,4),
+    ADD COLUMN IF NOT EXISTS cross_market_score NUMERIC(10,4),
+    ADD COLUMN IF NOT EXISTS derivatives_score NUMERIC(10,4),
+    ADD COLUMN IF NOT EXISTS sector_driver_score NUMERIC(10,4),
+    ADD COLUMN IF NOT EXISTS sentiment_score NUMERIC(10,4),
+    ADD COLUMN IF NOT EXISTS portfolio_risk_score NUMERIC(10,4);
+
+CREATE TABLE IF NOT EXISTS tdcc_distribution_snapshots (
+    symbol VARCHAR(16) NOT NULL,
+    snapshot_date DATE NOT NULL,
+    under_100_lots_percent NUMERIC(10,4),
+    over_400_lots_percent NUMERIC(10,4),
+    holder_count BIGINT,
+    source VARCHAR(80) NOT NULL DEFAULT 'TDCC OpenData 1-5',
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(symbol, snapshot_date)
+);
+CREATE INDEX IF NOT EXISTS idx_tdcc_distribution_symbol_date
+    ON tdcc_distribution_snapshots(symbol, snapshot_date DESC);
+
 INSERT INTO schema_versions(version, description)
 VALUES (1, 'V10 complete PostgreSQL schema')
 ON CONFLICT (version) DO NOTHING;
@@ -262,4 +295,12 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO schema_versions(version, description)
 VALUES (1232, 'V12.3.1 monthly revenue extreme growth precision hotfix')
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO schema_versions(version, description)
+VALUES (1241, 'V12.4 complete point-in-time factors and ownership history')
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO schema_versions(version, description)
+VALUES (1242, 'V12.4 net execution cost and model revision isolation')
 ON CONFLICT (version) DO NOTHING;

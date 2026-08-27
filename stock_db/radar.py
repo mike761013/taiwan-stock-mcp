@@ -6,7 +6,7 @@ from datetime import date
 from typing import Any
 
 from .connection import stock_database
-from .factors import enrich_candidates_v12_3
+from .factors import V12_4_FACTOR_MODEL, enrich_candidates_v12_3
 from .performance import execution_strategy_priors
 from .service import stock_database_service
 from .v12 import (
@@ -459,6 +459,7 @@ async def screen_database_market_v12(
             full_confidence_samples=config.execution_prior_full_confidence_samples,
             maximum_adjustment=config.execution_prior_max_adjustment,
             accuracy_engine=V12_ACCURACY_ENGINE,
+            factor_model_revision=V12_4_FACTOR_MODEL,
         )
         if rows else {}
     )
@@ -595,6 +596,7 @@ async def run_full_bullish_radar_v12(
             full_confidence_samples=config.execution_prior_full_confidence_samples,
             maximum_adjustment=config.execution_prior_max_adjustment,
             accuracy_engine=V12_ACCURACY_ENGINE,
+            factor_model_revision=V12_4_FACTOR_MODEL,
         )
         if rows else {}
     )
