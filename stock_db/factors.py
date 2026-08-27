@@ -45,7 +45,7 @@ TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 _REMOTE_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
 # Kept as an internal compatibility name; public output is one release only.
 V12_3_ACCURACY_ENGINE = "V12.4"
-V12_4_FACTOR_MODEL = "V12.4-COMPLETE-FACTORS-1"
+V12_4_FACTOR_MODEL = "V12.4-COMPLETE-FACTORS-2"
 DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS = 7
 
 FACTOR_SCHEMA_SQL = """
@@ -488,6 +488,13 @@ async def _finmind_rows(dataset: str, symbol: str, start: date, end: date) -> li
             "start_date": start.isoformat(),
             "end_date": end.isoformat(),
         }
+        if dataset == "TaiwanStockNews":
+            # FinMind documents TaiwanStockNews as a single-day dataset.  A
+            # multi-day range (or an end_date on some API revisions) returns
+            # HTTP 400.  The formal radar therefore spends exactly one request
+            # per candidate/trade date and relies on the existing same-day
+            # remote cache for repeated radar reads.
+            params.pop("end_date", None)
     body = await _json_get(
         url,
         params=params,
@@ -841,12 +848,18 @@ async def _sentiment_factor(
         rows = await _finmind_rows(
             "TaiwanStockNews",
             symbol,
-            trade_date - timedelta(days=7),
+            trade_date,
             trade_date,
         )
     except Exception as exc:
         return None, {"error": f"{type(exc).__name__}: {exc}"}
-    return score_news_rows(rows, trade_date)
+    score, detail = score_news_rows(rows, trade_date)
+    return score, {
+        **detail,
+        "queryMode": "SINGLE_TRADE_DATE",
+        "requestCount": 1,
+        "finMindConstraint": "TaiwanStockNews單次請求僅提供一天資料",
+    }
 
 
 async def _cashflow_context(symbol: str, trade_date: date) -> dict[str, Any]:

@@ -856,21 +856,82 @@ def score_cashflow_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 GLOBAL_ASSETS: tuple[str, ...] = (
     "^GSPC", "^IXIC", "^SOX", "EWT", "TSM", "UMC", "ASX",
     "SOXX", "SMH", "QQQ", "XBI", "TAN", "XLI", "XLB", "XLE",
-    "XLF", "BDRY", "JETS", "ITB", "IYZ", "GLD",
+    "XLF", "BDRY", "JETS", "ITB", "IYZ", "GLD", "XLP", "XLY",
 )
 ADR_MAP = {"2330": "TSM", "2303": "UMC", "3711": "ASX"}
+
+# TWSE and TPEx security-master rows commonly carry the two-digit industry
+# code instead of the Chinese industry name used by ``INDUSTRY_DRIVER_MAP``.
+# Keep the official code normalisation here so every caller (formal radar,
+# deep check and tests) resolves the same driver set.
+INDUSTRY_CODE_NAMES: dict[str, str] = {
+    "01": "水泥工業",
+    "02": "食品工業",
+    "03": "塑膠工業",
+    "04": "紡織纖維",
+    "05": "電機機械",
+    "06": "電器電纜",
+    "08": "玻璃陶瓷",
+    "09": "造紙工業",
+    "10": "鋼鐵工業",
+    "11": "橡膠工業",
+    "12": "汽車工業",
+    "14": "建材營造",
+    "15": "航運業",
+    "16": "觀光餐旅",
+    "17": "金融保險",
+    "18": "貿易百貨",
+    "20": "其他業",
+    "21": "化學工業",
+    "22": "生技醫療",
+    "23": "油電燃氣業",
+    "24": "半導體業",
+    "25": "電腦及週邊設備業",
+    "26": "光電業",
+    "27": "通信網路業",
+    "28": "電子零組件業",
+    "29": "電子通路業",
+    "30": "資訊服務業",
+    "31": "其他電子業",
+    "32": "文化創意業",
+    "33": "農業科技業",
+    "34": "電子商務業",
+    "35": "綠能環保業",
+    "36": "運動休閒業",
+    "37": "居家生活業",
+    "38": "數位雲端業",
+    "80": "管理股票",
+}
+
+
+def normalise_industry(industry: Any) -> tuple[str, str | None]:
+    """Return a searchable industry label and its official code, if present."""
+    raw = str(industry or "").strip()
+    code: str | None = None
+    match = re.match(r"^0?(\d{1,2})(?:\D|$)", raw)
+    if match:
+        code = f"{int(match.group(1)):02d}"
+    official_name = INDUSTRY_CODE_NAMES.get(code or "")
+    if official_name and official_name not in raw:
+        return f"{raw} {official_name}".strip(), code
+    return raw, code
+
+
 INDUSTRY_DRIVER_MAP: tuple[tuple[tuple[str, ...], tuple[tuple[str, float], ...]], ...] = (
     (("半導體",), (("^SOX", 1), ("SOXX", 1), ("SMH", 1))),
-    (("電子零組件", "電腦及週邊", "其他電子", "資訊服務", "數位雲端"), (("QQQ", 1), ("SOXX", 0.7))),
+    (("電子零組件", "電腦及週邊", "其他電子", "資訊服務", "數位雲端", "電子通路", "電子商務"), (("QQQ", 1), ("SOXX", 0.7))),
+    (("電機機械", "電器電纜", "綠能環保"), (("XLI", 1), ("QQQ", 0.35))),
     (("光電",), (("TAN", 0.7), ("QQQ", 0.5))),
     (("通信網路",), (("IYZ", 1), ("QQQ", 0.5))),
     (("生技",), (("XBI", 1),)),
     (("航運",), (("BDRY", 1), ("JETS", 0.4))),
-    (("鋼鐵", "玻璃", "水泥", "塑膠", "化學"), (("XLB", 1),)),
-    (("油電燃氣",), (("XLE", 1),)),
+    (("鋼鐵", "玻璃", "水泥", "塑膠", "化學", "造紙", "橡膠"), (("XLB", 1),)),
+    (("油電燃氣",), (("XLE", 1), ("macro:wti", 0.35), ("macro:brent", 0.35))),
     (("金融",), (("XLF", 1),)),
     (("建材營造",), (("ITB", 1),)),
     (("汽車",), (("XLI", 0.6), ("QQQ", 0.4))),
+    (("食品", "農業科技"), (("XLP", 1),)),
+    (("觀光", "貿易百貨", "運動休閒", "居家生活", "文化創意"), (("XLY", 1),)),
 )
 
 FinMindFetcher = Callable[[str, str, date, date], Awaitable[list[dict[str, Any]]]]
@@ -1174,9 +1235,11 @@ async def build_derivatives_context(trade_date: date, fetcher: FinMindFetcher) -
 
 def score_sector_driver(symbol: str, industry: str, global_context: Mapping[str, Any]) -> tuple[float | None, dict[str, Any]]:
     assets = global_context.get("assets") or {}
+    macro = global_context.get("macro") or {}
+    resolved_industry, industry_code = normalise_industry(industry)
     drivers: list[tuple[str, float]] = []
     for keywords, configured in INDUSTRY_DRIVER_MAP:
-        if any(keyword in industry for keyword in keywords):
+        if any(keyword in resolved_industry for keyword in keywords):
             drivers.extend(configured)
             break
     adr = ADR_MAP.get(symbol)
@@ -1185,7 +1248,9 @@ def score_sector_driver(symbol: str, industry: str, global_context: Mapping[str,
     observations: list[dict[str, Any]] = []
     weighted = weight_sum = 0.0
     for ticker, direction in drivers:
-        value = assets.get(ticker)
+        is_macro = ticker.startswith("macro:")
+        lookup_key = ticker.split(":", 1)[1] if is_macro else ticker
+        value = macro.get(lookup_key) if is_macro else assets.get(lookup_key)
         if not isinstance(value, Mapping):
             continue
         one = _float(value.get("change1dPercent"))
@@ -1195,13 +1260,26 @@ def score_sector_driver(symbol: str, industry: str, global_context: Mapping[str,
         impulse = (one or 0.0) * 0.75 + (five or 0.0) * 0.25
         weighted += impulse * direction
         weight_sum += abs(direction)
-        observations.append({"ticker": ticker, "direction": direction, **dict(value)})
+        observations.append({
+            "ticker": lookup_key,
+            "datasetGroup": "macro" if is_macro else "assets",
+            "direction": direction,
+            **dict(value),
+        })
     if not observations or weight_sum <= 0:
-        return None, {"reason": "此產業尚無可用的海外領先指標", "industry": industry}
+        return None, {
+            "reason": "此產業尚無可用的海外領先指標",
+            "industry": industry,
+            "industryCode": industry_code,
+            "resolvedIndustry": resolved_industry,
+            "configuredDrivers": [ticker for ticker, _ in drivers],
+        }
     driver_change = weighted / weight_sum
     score = _clamp(50 + driver_change * 4)
     return round(score, 2), {
         "industry": industry,
+        "industryCode": industry_code,
+        "resolvedIndustry": resolved_industry,
         "driverChangePercent": round(driver_change, 4),
         "drivers": observations,
         "source": global_context.get("source"),

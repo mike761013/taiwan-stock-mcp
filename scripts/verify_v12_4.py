@@ -59,7 +59,7 @@ def main() -> None:
     performance_source = (ROOT / "stock_db" / "performance.py").read_text(
         encoding="utf-8"
     )
-    assert 'V12_4_FACTOR_MODEL = "V12.4-COMPLETE-FACTORS-1"' in factors_source
+    assert 'V12_4_FACTOR_MODEL = "V12.4-COMPLETE-FACTORS-2"' in factors_source
     assert 'EXECUTION_MODEL_REVISION = "V12.4-NET-EXECUTION-1"' in (
         performance_source
     )

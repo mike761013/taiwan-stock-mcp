@@ -192,6 +192,102 @@ def test_news_deduplicates_headlines_and_rejects_future_rows():
     assert detail["analystRevisionMentions"] == ["法人調升目標價"]
 
 
+def test_finmind_news_uses_one_day_request_without_end_date(monkeypatch):
+    captured = {}
+
+    async def fake_json_get(url, **kwargs):
+        captured["url"] = url
+        captured["params"] = dict(kwargs["params"])
+        return {"status": 200, "data": []}
+
+    monkeypatch.setenv("FINMIND_TOKEN", "test-token")
+    monkeypatch.setattr(factors, "_json_get", fake_json_get)
+    rows = asyncio.run(
+        factors._finmind_rows(
+            "TaiwanStockNews",
+            "2330",
+            date(2026, 8, 27),
+            date(2026, 8, 27),
+        )
+    )
+
+    assert rows == []
+    assert captured["params"] == {
+        "dataset": "TaiwanStockNews",
+        "data_id": "2330",
+        "start_date": "2026-08-27",
+    }
+
+
+@pytest.mark.parametrize(
+    ("symbol", "industry", "expected_name", "expected_driver"),
+    [
+        ("6505", "23", "油電燃氣業", "XLE"),
+        ("2606", "15", "航運業", "BDRY"),
+        ("1326", "03", "塑膠工業", "XLB"),
+        ("1513", "05", "電機機械", "XLI"),
+        ("2375", "28", "電子零組件業", "QQQ"),
+    ],
+)
+def test_sector_driver_resolves_twse_numeric_industry_codes(
+    symbol, industry, expected_name, expected_driver
+):
+    asset_row = {
+        "latestDate": "2026-08-26",
+        "change1dPercent": 1.0,
+        "change5dPercent": 2.0,
+    }
+    context = {
+        "assets": {
+            ticker: dict(asset_row)
+            for ticker in (
+                "XLE", "BDRY", "JETS", "XLB", "XLI", "QQQ", "SOXX"
+            )
+        },
+        "macro": {
+            "wti": dict(asset_row),
+            "brent": dict(asset_row),
+        },
+        "source": "test",
+        "taiwanImpactTiming": {"completedUSSession": "complete"},
+    }
+
+    score, detail = advanced_factors.score_sector_driver(
+        symbol, industry, context
+    )
+
+    assert score is not None and score > 50
+    assert detail["industryCode"] == industry
+    assert expected_name in detail["resolvedIndustry"]
+    assert expected_driver in {
+        row["ticker"] for row in detail["drivers"]
+    }
+
+
+def test_oil_driver_can_use_macro_series_as_well_as_etf():
+    context = {
+        "assets": {
+            "XLE": {"change1dPercent": 1.0, "change5dPercent": 1.0}
+        },
+        "macro": {
+            "wti": {"change1dPercent": 2.0, "change5dPercent": 3.0},
+            "brent": {"change1dPercent": 1.5, "change5dPercent": 2.5},
+        },
+        "source": "test",
+        "taiwanImpactTiming": {},
+    }
+
+    score, detail = advanced_factors.score_sector_driver(
+        "6505", "23", context
+    )
+
+    assert score is not None
+    assert {
+        (row["datasetGroup"], row["ticker"])
+        for row in detail["drivers"]
+    } >= {("assets", "XLE"), ("macro", "wti"), ("macro", "brent")}
+
+
 def test_cross_market_same_date_is_only_a_live_preopen_overlay():
     async def fetcher(dataset, data_id, start, end):
         return [
