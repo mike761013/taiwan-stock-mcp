@@ -276,3 +276,23 @@ def test_full_v12_radar_initialises_high_price_rejection_tracking(
     assert result["candidateCount"] == 0
     assert result["excludedHighPriceCount"] == 0
 
+
+def test_formal_actionable_candidate_beats_higher_scoring_probe_duplicate():
+    formal = {
+        "symbol": "3049",
+        "strategy": "pullback",
+        "actionCode": "BUY_ZONE",
+        "forwardQualified": True,
+        "ranking_score": 60,
+    }
+    probe = {
+        "symbol": "3049",
+        "strategy": "trend_support_probe",
+        "actionCode": "PROBE_ENTRY",
+        "forwardQualified": False,
+        "ranking_score": 90,
+    }
+
+    assert radar._candidate_bucket(formal) > radar._candidate_bucket(probe)
+    assert radar._is_formal_actionable(formal) is True
+    assert radar._is_probe_candidate(probe) is True

@@ -21,6 +21,7 @@ V12_STRATEGIES = (
     "pullback",
     "reversal_reclaim",
     "reversal_continuation",
+    "trend_support_probe",
 )
 V12_ACCURACY_ENGINE = V12_VERSION
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "v12_config.json"
@@ -31,6 +32,7 @@ V12_STATUS_LABELS = {
     "EARLY_ENTRY": "早期進場",
     "EARLY_ENTRY_SMALL_POSITION": "早期進場（小部位）",
     "BOTTOM_REVERSAL_WATCH": "底部止跌觀察",
+    "PROBE_ENTRY": "多頭支撐試單",
     "NEAR_MISS_OBSERVATION": "近門檻觀察",
     "PRICE_CONFIRMATION_REQUIRED": "等待價格確認",
     "SMALL_POSITION_OR_SKIP": "小部位或略過",
@@ -57,6 +59,8 @@ V12_ACTIONABLE_STATUS_CODES = frozenset(
         "PRICE_CONFIRMATION_REQUIRED",
     }
 )
+
+V12_PROBE_STATUS_CODES = frozenset({"PROBE_ENTRY"})
 
 
 def v12_status_label(status_code: str) -> str:
@@ -121,6 +125,19 @@ class V12Config:
     pullback_preferred_volume_ratio20: float = 0.80
     pullback_min_stabilization_signals: int = 2
 
+    # User-defined probe layer: a short-term golden triangle may be tradable
+    # before MA20 has crossed above MA60, provided price itself is above MA60,
+    # the whole candle holds MA5 and the rolling high-volume low, and at least
+    # two independent stabilisation signals are visible.  This is deliberately
+    # kept outside the formal actionable ranking and uses a reduced position.
+    probe_max_distance_ma5_pct: float = 3.0
+    probe_max_distance_ma20_pct: float = 20.0
+    probe_min_volume_ratio20: float = 0.40
+    probe_max_volume_ratio20: float = 3.50
+    probe_max_5day_change_pct: float = 15.0
+    probe_min_stabilization_signals: int = 2
+    probe_max_position_percent: int = 40
+
     # ATR and stop management.
     atr_period: int = 14
     atr_stop_multiple: float = 0.25
@@ -175,6 +192,7 @@ class V12Config:
     forward_min_quality_breakout: float = 68.0
     forward_min_quality_pullback: float = 66.0
     forward_min_quality_reversal: float = 68.0
+    forward_min_quality_probe: float = 55.0
     forward_ma20_slope_tolerance_pct: float = 0.15
     forward_ma5_slope_tolerance_pct: float = 0.35
     pullback_down_day_min_close_position: float = 0.45
@@ -856,6 +874,175 @@ def pullback_v2_score(
     return core_pass, _clamp(score), reasons, warnings, signals
 
 
+def trend_support_probe_score(
+    row: Mapping[str, Any], config: V12Config
+) -> tuple[bool, float, list[str], list[str], list[str], list[str]]:
+    """Score a reduced-position probe that holds MA5 and the volume-floor low.
+
+    This is intentionally distinct from ``pullback``.  Pullback requires the
+    complete MA5>MA10>MA20>MA60 stack and contracting volume.  The probe layer
+    accepts an earlier MA5>MA10>MA20 golden triangle while MA20 is still below
+    MA60, but price itself must already be above MA60 and the entire signal
+    candle must hold both MA5 and the rolling high-volume low.
+    """
+    close = _number(row, "close")
+    open_price = _number(row, "open")
+    low = _number(row, "low")
+    prev_low = _number(row, "prev_low")
+    prev_high = _number(row, "prev_high")
+    ma5 = _number(row, "ma5")
+    ma10 = _number(row, "ma10")
+    ma20 = _number(row, "ma20")
+    ma60 = _number(row, "ma60")
+    prev_ma5 = _number(row, "prev_ma5")
+    prev_ma20 = _number(row, "prev_ma20")
+    volume_ratio = _number(row, "volume_ratio")
+    large_volume_low = _number(row, "large_volume_low")
+    close_position = _close_position(row)
+    upper_shadow = _upper_shadow_pct(row)
+    dist5 = _distance_pct(close, ma5) if ma5 > 0 else 999.0
+    dist20 = _distance_pct(close, ma20) if ma20 > 0 else 999.0
+    change5 = _five_day_change_pct(row)
+
+    score = 0.0
+    reasons: list[str] = []
+    warnings: list[str] = []
+    failed_rules: list[str] = []
+    signals: list[str] = []
+
+    short_trend = ma5 > ma10 > ma20 > 0
+    if short_trend:
+        score += 20
+        reasons.append("MA5>MA10>MA20短期黃金三角成立")
+    else:
+        failed_rules.append("尚未形成MA5>MA10>MA20短期多頭排列")
+
+    price_above_ma60 = ma60 > 0 and close >= ma60
+    if price_above_ma60:
+        score += 8
+        reasons.append("股價已站上MA60")
+    else:
+        failed_rules.append("股價尚未站上MA60")
+
+    candle_holds_ma5 = ma5 > 0 and low >= ma5 and close >= ma5
+    if candle_holds_ma5:
+        score += 20
+        reasons.append("盤中與收盤均守住MA5")
+        signals.append("盤中與收盤均守住MA5")
+    else:
+        failed_rules.append("盤中或收盤曾跌破MA5")
+
+    near_ma5 = candle_holds_ma5 and 0 <= dist5 <= config.probe_max_distance_ma5_pct
+    if near_ma5:
+        score += 10
+        reasons.append(f"收盤距MA5僅{dist5:.1f}%")
+    else:
+        failed_rules.append(
+            f"距MA5超過試單上限{config.probe_max_distance_ma5_pct:.1f}%"
+        )
+
+    massive_low_hold = (
+        large_volume_low > 0
+        and low >= large_volume_low
+        and close >= large_volume_low
+    )
+    if massive_low_hold:
+        score += 20
+        reasons.append(f"守住滾動大量低點{large_volume_low:g}")
+        signals.append("盤中與收盤均守住滾動大量低點")
+    elif large_volume_low <= 0:
+        failed_rules.append("缺少滾動大量低點")
+    else:
+        failed_rules.append("盤中或收盤跌破滾動大量低點")
+
+    if not 0 <= dist20 <= config.probe_max_distance_ma20_pct:
+        failed_rules.append(
+            f"距MA20為{dist20:.1f}%，超過試單上限"
+            f"{config.probe_max_distance_ma20_pct:.1f}%"
+        )
+    elif dist20 > config.ma20_distance_warning_pct:
+        warnings.append(f"距MA20達{dist20:.1f}%，只允許小部位試單")
+
+    volume_ok = (
+        config.probe_min_volume_ratio20
+        <= volume_ratio
+        <= config.probe_max_volume_ratio20
+    )
+    if not volume_ok:
+        failed_rules.append(
+            f"量比{volume_ratio:.2f}不在試單區間"
+            f"{config.probe_min_volume_ratio20:.2f}～"
+            f"{config.probe_max_volume_ratio20:.2f}"
+        )
+    elif volume_ratio <= config.pullback_max_volume_ratio20:
+        score += 10
+        reasons.append("量能受控")
+    else:
+        score += 6
+        reasons.append("放量換手但未達高潮量")
+        warnings.append("量能高於健康拉回，只能列試單")
+
+    ma5_persistent = _slope_not_declining(
+        ma5, prev_ma5, config.forward_ma5_slope_tolerance_pct
+    )
+    ma20_persistent = _slope_not_declining(
+        ma20, prev_ma20, config.forward_ma20_slope_tolerance_pct
+    )
+    if ma5_persistent:
+        score += 5
+        reasons.append("MA5斜率未轉弱")
+    else:
+        failed_rules.append("MA5斜率快速轉弱")
+    if ma20_persistent:
+        score += 5
+        reasons.append("MA20斜率未轉弱")
+    else:
+        failed_rules.append("MA20斜率快速轉弱")
+
+    if prev_low > 0 and low >= prev_low:
+        signals.append("低點未再下移")
+    if close_position >= 0.55:
+        signals.append("收盤位於當日振幅上半部")
+    if prev_high > 0 and close > prev_high:
+        signals.append("突破前一日高點")
+    if close > open_price > 0:
+        signals.append("收紅K")
+    score += min(9, len(set(signals)) * 3)
+
+    stabilization_ok = (
+        len(set(signals)) >= config.probe_min_stabilization_signals
+    )
+    if not stabilization_ok:
+        failed_rules.append(
+            f"止穩訊號少於{config.probe_min_stabilization_signals}項"
+        )
+
+    if change5 <= config.probe_max_5day_change_pct:
+        score += 5
+    else:
+        failed_rules.append(
+            f"五日漲幅{change5:.1f}%超過試單上限"
+            f"{config.probe_max_5day_change_pct:.1f}%"
+        )
+
+    if upper_shadow > config.predictive_max_upper_shadow_pct:
+        score -= 10
+        warnings.append("上影線偏長，必須等待價格確認")
+    if close_position <= 0.30:
+        score -= 8
+        warnings.append("收盤接近日低，只能等待承接試單")
+
+    passed = not failed_rules
+    return (
+        passed,
+        _clamp(score),
+        reasons,
+        warnings,
+        failed_rules,
+        list(dict.fromkeys(signals)),
+    )
+
+
 def _five_day_change_pct(row: Mapping[str, Any]) -> float:
     close = _number(row, "close")
     close5 = _number(row, "close5")
@@ -950,7 +1137,11 @@ def predictive_quality_score(
     max_five_day_change = (
         config.continuation_max_5day_change_pct
         if strategy == "reversal_continuation"
-        else config.predictive_max_5day_change_pct
+        else (
+            config.probe_max_5day_change_pct
+            if strategy == "trend_support_probe"
+            else config.predictive_max_5day_change_pct
+        )
     )
     if change5 > max_five_day_change:
         score -= 15
@@ -1028,6 +1219,32 @@ def predictive_quality_score(
             score += 5
             positives.append("低點未再下移")
 
+    elif strategy == "trend_support_probe":
+        if ma5 > ma10 > ma20 > 0:
+            score += 12
+            positives.append("MA5>MA10>MA20短期黃金三角成立")
+        if ma60 > 0 and close >= ma60:
+            score += 4
+            positives.append("股價站上MA60")
+        low = _number(row, "low")
+        if low >= ma5 > 0 and close >= ma5:
+            score += 10
+            positives.append("整根K線守住MA5")
+        if 0 <= dist5 <= config.probe_max_distance_ma5_pct:
+            score += 8
+            positives.append("仍貼近MA5支撐")
+        if prev_low > 0 and _number(row, "low") >= prev_low:
+            score += 5
+            positives.append("低點未再下移")
+        if (
+            config.probe_min_volume_ratio20
+            <= volume_ratio
+            <= config.probe_max_volume_ratio20
+        ):
+            score += 4
+            if volume_ratio > config.pullback_max_volume_ratio20:
+                positives.append("放量換手仍在試單容許區")
+
     elif strategy == "reversal_reclaim":
         if bottom["rangePosition20"] <= 0.30:
             score += 10
@@ -1092,6 +1309,7 @@ def evaluate_forward_qualification(
         "pullback": config.forward_min_quality_pullback,
         "reversal_reclaim": config.forward_min_quality_reversal,
         "reversal_continuation": config.forward_min_quality_reversal,
+        "trend_support_probe": config.forward_min_quality_probe,
     }
     quality_threshold = quality_thresholds[strategy]
     passed_rules: list[str] = []
@@ -1120,7 +1338,13 @@ def evaluate_forward_qualification(
     close_position = _close_position(row)
     upper_shadow = _upper_shadow_pct(row)
 
-    if strategy in {"early_stage", "breakout", "pullback", "reversal_continuation"}:
+    if strategy in {
+        "early_stage",
+        "breakout",
+        "pullback",
+        "reversal_continuation",
+        "trend_support_probe",
+    }:
         slope_tolerance = (
             config.continuation_ma20_slope_tolerance_pct
             if strategy == "reversal_continuation"
@@ -1135,7 +1359,12 @@ def evaluate_forward_qualification(
         else:
             failed_rules.append("MA20已明顯下彎")
 
-    if strategy in {"early_stage", "pullback", "reversal_continuation"}:
+    if strategy in {
+        "early_stage",
+        "pullback",
+        "reversal_continuation",
+        "trend_support_probe",
+    }:
         if _slope_not_declining(
             ma5,
             prev_ma5,
@@ -1193,6 +1422,11 @@ def evaluate_forward_qualification(
             passed_rules.append("反轉訊號已站回MA20")
         else:
             failed_rules.append("反轉訊號尚未站回MA20，只列底部觀察")
+
+    if strategy == "trend_support_probe":
+        # This layer is intentionally executable only as a reduced-position
+        # probe and never promoted into the formal actionable top ten.
+        failed_rules.append("多頭支撐策略固定列入試單區，不升正式買進榜")
 
     return {
         "qualified": not failed_rules,
@@ -1368,6 +1602,7 @@ def actionability_adjustment(
         "EARLY_ENTRY": 5.0,
         "EARLY_ENTRY_SMALL_POSITION": 3.0,
         "PRICE_CONFIRMATION_REQUIRED": 2.0,
+        "PROBE_ENTRY": -4.0,
         "SMALL_POSITION_OR_SKIP": -6.0,
         "BOTTOM_REVERSAL_WATCH": -8.0,
         "WAIT_PULLBACK": -10.0,
@@ -1464,6 +1699,9 @@ def strategy_passes(row: Mapping[str, Any], strategy: str, config: V12Config) ->
     if strategy == "reversal_continuation":
         passed, _, _, _, _ = reversal_continuation_score(row, config)
         return passed
+    if strategy == "trend_support_probe":
+        passed, _, _, _, _, _ = trend_support_probe_score(row, config)
+        return passed
     raise ValueError(f"strategy must be one of {V12_STRATEGIES}")
 
 
@@ -1483,6 +1721,13 @@ def audit_v12_strategy(
             row, config
         )
         passed_rules = reasons
+        failed_rules = list(failed_rules)
+        failed_rules.extend(f"警示：{warning}" for warning in warnings)
+    elif strategy == "trend_support_probe":
+        passed, score, reasons, warnings, failed_rules, signals = (
+            trend_support_probe_score(row, config)
+        )
+        passed_rules = reasons + [f"止穩：{signal}" for signal in signals]
         failed_rules = list(failed_rules)
         failed_rules.extend(f"警示：{warning}" for warning in warnings)
     elif strategy == "reversal_reclaim":
@@ -1549,7 +1794,15 @@ def explain_v12_row(row: Mapping[str, Any], config: V12Config) -> dict[str, Any]
     dist20 = _distance_pct(_number(row, "close"), _number(row, "ma20"))
     strong_day = _daily_change_pct(row) >= config.strong_day_change_pct
     overextended = dist20 >= config.ma20_distance_warning_pct
-    if strong_day or overextended:
+    probe_eligible = any(
+        audit["passed"] and audit["strategy"] == "trend_support_probe"
+        for audit in audits
+    )
+    if strong_day:
+        decision = "DO_NOT_CHASE"
+    elif probe_eligible:
+        decision = "PROBE_ENTRY"
+    elif overextended:
         decision = "DO_NOT_CHASE"
     elif eligible:
         decision = "CANDIDATE"
@@ -1636,6 +1889,8 @@ def _strategy_reasons(row: Mapping[str, Any], strategy: str) -> list[str]:
             reasons.append("MA5>MA10>MA20黃金三角成立")
         elif triangle["emerging"]:
             reasons.append("黃金三角形成中")
+    elif strategy == "trend_support_probe":
+        reasons.append("短多排列守住MA5與滾動大量低點")
     return reasons
 
 
@@ -1761,6 +2016,9 @@ def _build_dual_entry_plan(
     elif strategy == "pullback":
         confirmation_candidates = (body_midpoint, discounted_ma5)
         confirmation_detail = "低點不再下移，並收復MA5附近或訊號K實體中值"
+    elif strategy == "trend_support_probe":
+        confirmation_candidates = (body_midpoint, ma5)
+        confirmation_detail = "MA5與大量低點不破，並收復訊號K實體中值"
     else:
         confirmation_candidates = (body_midpoint, discounted_ma5, ma20)
         confirmation_detail = "短均線維持上彎，並收復訊號K實體中值"
@@ -1769,10 +2027,15 @@ def _build_dual_entry_plan(
         aggressive_high,
         *(value for value in confirmation_candidates if value > 0),
     )
-    aggressive_percent, confirmation_percent = _dual_entry_position_split(
-        strategy,
-        status,
-    )
+    if strategy == "trend_support_probe":
+        maximum_probe = max(0, min(int(config.probe_max_position_percent), 100))
+        aggressive_percent = maximum_probe // 2
+        confirmation_percent = maximum_probe - aggressive_percent
+    else:
+        aggressive_percent, confirmation_percent = _dual_entry_position_split(
+            strategy,
+            status,
+        )
 
     rounded_aggressive_low = round_tw_price(aggressive_low)
     rounded_aggressive_high = round_tw_price(aggressive_high)
@@ -1841,12 +2104,20 @@ def build_trading_plan(
     low = _number(row, "low") or close
     ma5 = _number(row, "ma5")
     ma20 = _number(row, "ma20")
+    large_volume_low = _number(row, "large_volume_low")
     atr14 = _number(row, "atr14")
     prev_high = _number(row, "prev_high")
     bollinger_upper = _number(row, "bollinger_upper")
     breakout_trigger = 0.0
 
-    signal_defense = low
+    signal_defense = (
+        large_volume_low
+        if (
+            strategy == "trend_support_probe"
+            and 0 < large_volume_low <= close
+        )
+        else low
+    )
     stop_buffer = max(
         signal_defense * config.minimum_stop_buffer_pct / 100.0,
         atr14 * config.atr_stop_multiple,
@@ -1862,7 +2133,11 @@ def build_trading_plan(
     elif strategy == "reversal_reclaim":
         entry_low = max(signal_defense, close - atr14 * config.entry_low_atr_multiple)
         entry_high = close + atr14 * 0.10
-    elif strategy in {"pullback", "reversal_continuation"}:
+    elif strategy in {
+        "pullback",
+        "reversal_continuation",
+        "trend_support_probe",
+    }:
         reference = ma5 if ma5 > 0 else close
         entry_low = max(signal_defense, reference - atr14 * 0.20)
         entry_high = min(close, reference + atr14 * 0.20)
@@ -1895,7 +2170,14 @@ def build_trading_plan(
     # pullback candidates could be reported as BUY_ZONE even when the signal
     # price was already above maximumBuyPrice.
     change_pct = _daily_change_pct(row)
-    if strategy in {"reversal_reclaim", "reversal_continuation"} and change_pct >= config.strong_day_change_pct:
+    if (
+        strategy in {
+            "reversal_reclaim",
+            "reversal_continuation",
+            "trend_support_probe",
+        }
+        and change_pct >= config.strong_day_change_pct
+    ):
         status = "DO_NOT_CHASE"
         initial_position = 0
     elif rounded_signal_price >= rounded_no_chase:
@@ -1905,8 +2187,16 @@ def build_trading_plan(
         status = "WAIT_PULLBACK"
         initial_position = 0
     elif risk_pct > config.max_entry_to_hard_stop_risk_pct:
-        status = "BOTTOM_REVERSAL_WATCH" if strategy == "reversal_reclaim" else "SMALL_POSITION_OR_SKIP"
-        initial_position = 0 if strategy == "reversal_reclaim" else 30
+        status = (
+            "BOTTOM_REVERSAL_WATCH"
+            if strategy == "reversal_reclaim"
+            else "SMALL_POSITION_OR_SKIP"
+        )
+        initial_position = (
+            0
+            if strategy in {"reversal_reclaim", "trend_support_probe"}
+            else 30
+        )
     elif strategy == "reversal_reclaim" and close < ma20:
         status = "BOTTOM_REVERSAL_WATCH"
         initial_position = 0
@@ -1916,6 +2206,13 @@ def build_trading_plan(
     elif strategy == "breakout":
         status = "BUY_ON_BREAKOUT"
         initial_position = 40
+    elif strategy == "trend_support_probe":
+        status = "PROBE_ENTRY"
+        initial_position = (
+            20
+            if rounded_entry_low <= rounded_signal_price <= rounded_entry_high
+            else 0
+        )
     elif strategy in {"pullback", "reversal_continuation"}:
         if rounded_entry_low <= rounded_signal_price <= rounded_entry_high:
             status = "BUY_ZONE"
@@ -1974,6 +2271,18 @@ def build_v12_candidate(
         _, raw_score, reasons, pattern_warnings, _ = reversal_continuation_score(
             row, config
         )
+    elif strategy == "trend_support_probe":
+        (
+            _,
+            raw_score,
+            reasons,
+            pattern_warnings,
+            _,
+            stabilization_signals,
+        ) = trend_support_probe_score(row, config)
+        reasons = reasons + [
+            f"止穩：{signal}" for signal in stabilization_signals
+        ]
     elif strategy == "pullback":
         _, raw_score, reasons, pattern_warnings, stabilization_signals = pullback_v2_score(
             row, config
@@ -1988,6 +2297,12 @@ def build_v12_candidate(
         row, strategy, config
     )
     adjustment, trading_warnings = trading_adjustment(row, config)
+    if strategy == "trend_support_probe" and adjustment < -15:
+        # MA20 extension and a weak signal-day close remain visible warnings,
+        # but this dedicated reduced-position layer must not be deleted by the
+        # same penalty intended to suppress formal full-size entries.
+        adjustment = -15.0
+        trading_warnings.append("乖離與K線風險改以試單部位上限控制")
     bullish_score = _clamp(
         raw_score * config.bullish_raw_score_weight
         + quality_score * config.bullish_quality_score_weight
@@ -2004,16 +2319,17 @@ def build_v12_candidate(
 
     # A heavily penalised setup is observable but should not be presented as a buy.
     action_code = str(plan["statusCode"])
-    if adjustment <= -25:
-        action_code = "DO_NOT_CHASE"
-    elif adjustment <= -10 and action_code not in {
-        "DO_NOT_CHASE",
-        "WAIT_PULLBACK",
-        "SMALL_POSITION_OR_SKIP",
-        "EARLY_ENTRY_SMALL_POSITION",
-        "BOTTOM_REVERSAL_WATCH",
-    }:
-        action_code = "WAIT_PULLBACK"
+    if strategy != "trend_support_probe":
+        if adjustment <= -25:
+            action_code = "DO_NOT_CHASE"
+        elif adjustment <= -10 and action_code not in {
+            "DO_NOT_CHASE",
+            "WAIT_PULLBACK",
+            "SMALL_POSITION_OR_SKIP",
+            "EARLY_ENTRY_SMALL_POSITION",
+            "BOTTOM_REVERSAL_WATCH",
+        }:
+            action_code = "WAIT_PULLBACK"
 
     if action_code != plan["statusCode"]:
         plan = dict(plan)
@@ -2091,6 +2407,31 @@ def build_v12_candidate(
         }
     if strategy == "reversal_continuation":
         item["goldenTriangle"] = _golden_triangle_context(row, config)
+    if strategy == "trend_support_probe":
+        item["trendSupportProbe"] = {
+            "shortBullishAlignment": (
+                _number(row, "ma5")
+                > _number(row, "ma10")
+                > _number(row, "ma20")
+                > 0
+            ),
+            "fullBullishAlignment": (
+                _number(row, "ma5")
+                > _number(row, "ma10")
+                > _number(row, "ma20")
+                > _number(row, "ma60")
+                > 0
+            ),
+            "candleHeldMA5": (
+                _number(row, "low") >= _number(row, "ma5") > 0
+                and _number(row, "close") >= _number(row, "ma5")
+            ),
+            "rollingMassiveVolumeLow": (
+                _number(row, "large_volume_low") or None
+            ),
+            "maximumPlannedPositionPercent": config.probe_max_position_percent,
+            "formalActionable": False,
+        }
     return item
 
 

@@ -299,7 +299,7 @@ def register_v10_tools(mcp: Any) -> None:
         minimum_score: float = 45,
         save_result: bool = True,
     ) -> dict:
-        """V12全市場雷達：V7流動性、V11三策略、反轉收復與ATR交易計畫。"""
+        """V12全市場雷達：六策略、獨立支撐試單層與ATR交易計畫。"""
         return await screen_database_market_v12(
             strategy=strategy,
             limit=limit,
@@ -313,7 +313,7 @@ def register_v10_tools(mcp: Any) -> None:
         minimum_score: float = 45,
         save_result: bool = True,
     ) -> dict:
-        """執行V12.4五種看漲策略，輸出買點、觀察區、分批比例與失敗條件。"""
+        """執行V12.4六種策略，分開輸出正式買點、支撐試單與觀察區。"""
         return await run_full_bullish_radar_v12_core(
             limit_each=limit_each,
             minimum_score=minimum_score,

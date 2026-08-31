@@ -12,6 +12,7 @@ from .service import stock_database_service
 from .v12 import (
     V12_ACCURACY_ENGINE,
     V12_ACTIONABLE_STATUS_CODES,
+    V12_PROBE_STATUS_CODES,
     V12_STRATEGIES,
     V12_VERSION,
     apply_execution_prior,
@@ -38,6 +39,46 @@ _COMMON_STOCK_UNIVERSE_COUNT_QUERY = f"""
 """
 
 
+def _is_probe_candidate(candidate: dict[str, Any]) -> bool:
+    strategies = {
+        str(value).strip()
+        for value in candidate.get("strategies") or []
+        if str(value).strip()
+    }
+    strategy = str(candidate.get("strategy") or "").strip()
+    action_code = str(candidate.get("actionCode") or "").strip()
+    return (
+        action_code in V12_PROBE_STATUS_CODES
+        or strategy == "trend_support_probe"
+        or "trend_support_probe" in strategies
+    )
+
+
+def _is_formal_actionable(candidate: dict[str, Any]) -> bool:
+    return (
+        str(candidate.get("actionCode") or "")
+        in V12_ACTIONABLE_STATUS_CODES
+        and bool(candidate.get("forwardQualified", True))
+    )
+
+
+def _candidate_bucket(candidate: dict[str, Any]) -> int:
+    """Prefer a formal setup, then a probe, then an ordinary watch item."""
+    if _is_formal_actionable(candidate):
+        return 2
+    if _is_probe_candidate(candidate):
+        return 1
+    return 0
+
+
+def _candidate_rank_score(candidate: dict[str, Any]) -> float:
+    return float(
+        candidate.get("ranking_score")
+        or candidate.get("total_score")
+        or 0
+    )
+
+
 async def screen_database_market(
     strategy: str = "early_stage",
     limit: int = 30,
@@ -48,7 +89,11 @@ async def screen_database_market(
     if strategy not in _STRATEGIES:
         raise ValueError(f"strategy must be one of {sorted(_STRATEGIES)}")
     # V12-only patterns need the richer snapshot.
-    if strategy in {"reversal_reclaim", "reversal_continuation"}:
+    if strategy in {
+        "reversal_reclaim",
+        "reversal_continuation",
+        "trend_support_probe",
+    }:
         return await screen_database_market_v12(
             strategy=strategy,
             limit=limit,
@@ -508,15 +553,23 @@ async def screen_database_market_v12(
     candidates = primary_results + high_price_results
     actionable_results = [
         candidate for candidate in candidates
-        if str(candidate.get("actionCode") or "")
-        in V12_ACTIONABLE_STATUS_CODES
-        and bool(candidate.get("forwardQualified", True))
+        if _is_formal_actionable(candidate)
     ]
+    actionable_symbols = {
+        str(candidate.get("symbol") or "") for candidate in actionable_results
+    }
+    probe_results = [
+        candidate for candidate in candidates
+        if str(candidate.get("symbol") or "") not in actionable_symbols
+        and _is_probe_candidate(candidate)
+    ]
+    probe_symbols = {
+        str(candidate.get("symbol") or "") for candidate in probe_results
+    }
     watch_results = [
         candidate for candidate in candidates
-        if str(candidate.get("actionCode") or "")
-        not in V12_ACTIONABLE_STATUS_CODES
-        or not bool(candidate.get("forwardQualified", True))
+        if str(candidate.get("symbol") or "") not in actionable_symbols
+        and str(candidate.get("symbol") or "") not in probe_symbols
     ]
     for rank, candidate in enumerate(primary_results, start=1):
         candidate["rank"] = rank
@@ -547,6 +600,7 @@ async def screen_database_market_v12(
         "highPriceCandidateCount": len(high_price_results),
         "excludedHighPriceCount": len(tiers["rejectedHighPrice"]),
         "actionableCandidateCount": len(actionable_results),
+        "probeCandidateCount": len(probe_results),
         "watchCandidateCount": len(watch_results),
         "universeCount": universe_count,
         "snapshotCount": len(rows),
@@ -568,6 +622,7 @@ async def screen_database_market_v12(
         "rejectionSummary": rejection_summary,
         "results": candidates,
         "actionableResults": actionable_results,
+        "probeResults": probe_results,
         "watchResults": watch_results,
         "nearMissObservations": near_miss_observations,
         "primaryResults": primary_results,
@@ -583,7 +638,7 @@ async def run_full_bullish_radar_v12(
     minimum_score: float = 45,
     save_result: bool = True,
 ) -> dict[str, Any]:
-    """Run all five V12.4 bullish strategies and merge their tradable candidates."""
+    """Run all six V12.4 bullish/probe strategies and merge their candidates."""
     limit_each = max(1, min(limit_each, 200))
     minimum_score = max(0.0, min(float(minimum_score), 100.0))
     config = load_v12_config()
@@ -639,6 +694,20 @@ async def run_full_bullish_radar_v12(
             if str(candidate.get("symbol") or "").strip()
         )
         candidates = primary_results + high_price_results
+        strategy_actionable = [
+            candidate for candidate in candidates
+            if _is_formal_actionable(candidate)
+        ]
+        strategy_probes = [
+            candidate for candidate in candidates
+            if candidate not in strategy_actionable
+            and _is_probe_candidate(candidate)
+        ]
+        strategy_watch = [
+            candidate for candidate in candidates
+            if candidate not in strategy_actionable
+            and candidate not in strategy_probes
+        ]
         for rank, candidate in enumerate(primary_results, start=1):
             candidate["rank"] = rank
         for rank, candidate in enumerate(high_price_results, start=1):
@@ -664,10 +733,16 @@ async def run_full_bullish_radar_v12(
             "mainCandidateCount": len(primary_results),
             "highPriceCandidateCount": len(high_price_results),
             "excludedHighPriceCount": len(tiers["rejectedHighPrice"]),
+            "actionableCandidateCount": len(strategy_actionable),
+            "probeCandidateCount": len(strategy_probes),
+            "watchCandidateCount": len(strategy_watch),
             "universeCount": universe_count,
             "latestTradeDate": latest_trade_date,
             "rejectionSummary": rejection_summary,
             "results": candidates,
+            "actionableResults": strategy_actionable,
+            "probeResults": strategy_probes,
+            "watchResults": strategy_watch,
             "primaryResults": primary_results,
             "highPriceStrongResults": high_price_results,
             "nearMissObservations": (
@@ -691,21 +766,22 @@ async def run_full_bullish_radar_v12(
 
             strategies = set(existing.get("strategies") or [])
             strategies.add(strategy)
-            if float(
-                candidate.get("ranking_score")
-                or candidate.get("total_score")
-                or 0
-            ) > float(
-                existing.get("ranking_score")
-                or existing.get("total_score")
-                or 0
-            ):
+            candidate_priority = (
+                _candidate_bucket(candidate),
+                _candidate_rank_score(candidate),
+            )
+            existing_priority = (
+                _candidate_bucket(existing),
+                _candidate_rank_score(existing),
+            )
+            if candidate_priority > existing_priority:
                 replacement = dict(candidate)
                 replacement["strategies"] = sorted(strategies)
                 merged[symbol] = replacement
             else:
                 existing["strategies"] = sorted(strategies)
 
+    preliminary_limit = max(10, int(config.factor_prefilter_limit))
     preliminary = sorted(
         merged.values(),
         key=lambda item: (
@@ -713,7 +789,29 @@ async def run_full_bullish_radar_v12(
             float(item.get("bullish_score") or item.get("total_score") or 0),
         ),
         reverse=True,
-    )[: max(10, int(config.factor_prefilter_limit))]
+    )[:preliminary_limit]
+    # The formal prefilter can be crowded by conventional setups. Reserve a
+    # separate reduced-position lane so valid probe candidates cannot disappear
+    # again before advanced-factor enrichment and the combined output.
+    reserved_probes = sorted(
+        (
+            item for item in merged.values()
+            if _is_probe_candidate(item)
+            and not _is_formal_actionable(item)
+        ),
+        key=lambda item: (
+            _candidate_rank_score(item),
+            float(item.get("bullish_score") or item.get("total_score") or 0),
+        ),
+        reverse=True,
+    )[:limit_each]
+    preliminary_symbols = {
+        str(item.get("symbol") or "") for item in preliminary
+    }
+    preliminary.extend(
+        item for item in reserved_probes
+        if str(item.get("symbol") or "") not in preliminary_symbols
+    )
     factor_date = latest_trade_date or date.today()
     enriched_merged = await enrich_candidates_v12_3(
         preliminary,
@@ -761,18 +859,28 @@ async def run_full_bullish_radar_v12(
         item["highPriceRank"] = index
     actionable_primary = [
         item for item in primary_ranked
-        if str(item.get("actionCode") or "")
-        in V12_ACTIONABLE_STATUS_CODES
-        and bool(item.get("forwardQualified", True))
+        if _is_formal_actionable(item)
     ]
+    actionable_symbols = {
+        str(item.get("symbol") or "") for item in actionable_primary
+    }
+    probe_primary = [
+        item for item in primary_ranked
+        if str(item.get("symbol") or "") not in actionable_symbols
+        and _is_probe_candidate(item)
+    ]
+    probe_symbols = {
+        str(item.get("symbol") or "") for item in probe_primary
+    }
     watch_primary = [
         item for item in primary_ranked
-        if str(item.get("actionCode") or "")
-        not in V12_ACTIONABLE_STATUS_CODES
-        or not bool(item.get("forwardQualified", True))
+        if str(item.get("symbol") or "") not in actionable_symbols
+        and str(item.get("symbol") or "") not in probe_symbols
     ]
     for index, item in enumerate(actionable_primary, start=1):
         item["actionableRank"] = index
+    for index, item in enumerate(probe_primary, start=1):
+        item["probeRank"] = index
     bullish_ranked = sorted(
         primary_ranked,
         key=lambda item: (
@@ -821,6 +929,7 @@ async def run_full_bullish_radar_v12(
         "mainCandidateCount": len(primary_ranked),
         "highPriceCandidateCount": len(high_price_ranked),
         "actionableCandidateCount": len(actionable_primary),
+        "probeCandidateCount": len(probe_primary),
         "watchCandidateCount": len(watch_primary),
         "excludedHighPriceCount": excluded_high_price_count,
         "minimumScore": minimum_score,
@@ -844,6 +953,7 @@ async def run_full_bullish_radar_v12(
         "top10": actionable_primary[:10],
         "top5": actionable_primary[:5],
         "actionableCandidates": actionable_primary,
+        "probeCandidates": probe_primary,
         "bullishTop10": bullish_ranked[:10],
         "watchlistCandidates": watch_primary[:10],
         "nearMissObservations": near_miss_observations,
@@ -859,10 +969,12 @@ async def run_full_bullish_radar_v12(
                 "DO_NOT_CHASE",
                 "BOTTOM_REVERSAL_WATCH",
                 "SMALL_POSITION_OR_SKIP",
+                "PROBE_ENTRY",
             ],
             "historicalAdjustmentUsesExecutionOnly": True,
             "formalTop10RequiresForwardQualification": True,
             "watchlistRetainsUnconfirmedAndOverheatedSignals": True,
+            "probeLayerExcludedFromFormalTop10": True,
         },
         "source": "PostgreSQL V12",
     }
