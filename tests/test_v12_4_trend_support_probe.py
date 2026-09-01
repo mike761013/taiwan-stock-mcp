@@ -118,14 +118,44 @@ def test_jingjin_survives_the_real_minimum_score_screen():
     }
 
 
-def test_probe_rejects_a_real_break_of_ma5_or_massive_volume_low():
+def test_probe_accepts_intraday_support_breaks_reclaimed_by_close():
+    config = V12Config()
+    reclaimed = jingjin_2026_08_31()
+    reclaimed.update({"low": 13.10, "close": 13.55})
+
+    assert strategy_passes(reclaimed, "trend_support_probe", config) is True
+    passed, _, reasons, warnings, failed, signals = trend_support_probe_score(
+        reclaimed,
+        config,
+    )
+    assert passed is True
+    assert failed == []
+    assert "盤中跌破MA5後收回" in reasons
+    assert "收盤收復滾動大量低點13.2" in reasons
+    assert "盤中曾跌破MA5，收盤已收回" in warnings
+    assert "盤中曾跌破滾動大量低點，收盤已收回" in warnings
+    assert "收盤收復MA5" in signals
+
+    candidate = build_v12_candidate(reclaimed, "trend_support_probe", config)
+    assert candidate is not None
+    probe = candidate["trendSupportProbe"]
+    assert probe["candleHeldMA5"] is False
+    assert probe["closeHeldMA5"] is True
+    assert probe["intradayReclaimedMA5"] is True
+    assert probe["closeHeldMassiveVolumeLow"] is True
+    assert probe["intradayReclaimedMassiveVolumeLow"] is True
+
+
+def test_probe_rejects_a_real_close_break_of_ma5_or_massive_volume_low():
     config = V12Config()
     below_ma5 = jingjin_2026_08_31()
     below_ma5.update({"low": 13.10, "close": 13.25})
     assert strategy_passes(below_ma5, "trend_support_probe", config) is False
 
     below_massive_low = jingjin_2026_08_31()
-    below_massive_low.update({"low": 13.05, "close": 13.15})
+    below_massive_low.update(
+        {"low": 13.10, "close": 13.35, "large_volume_low": 13.40}
+    )
     assert strategy_passes(
         below_massive_low,
         "trend_support_probe",

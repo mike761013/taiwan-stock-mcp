@@ -136,6 +136,36 @@ def main() -> None:
         "description": "激進低接先買20%，確認後再買20%",
     }
 
+    reclaimed = dict(jingjin)
+    reclaimed.update({"low": 13.10, "close": 13.55})
+    passed, _, reasons, warnings, failures, signals = (
+        v12.trend_support_probe_score(reclaimed, v12.V12Config())
+    )
+    assert passed and not failures
+    assert "盤中跌破MA5後收回" in reasons
+    assert "收盤收復滾動大量低點13.2" in reasons
+    assert "盤中曾跌破MA5，收盤已收回" in warnings
+    assert "收盤收復MA5" in signals
+
+    reclaimed_candidate = v12.build_v12_candidate(
+        reclaimed,
+        "trend_support_probe",
+        v12.V12Config(),
+    )
+    assert reclaimed_candidate is not None
+    probe = reclaimed_candidate["trendSupportProbe"]
+    assert probe["candleHeldMA5"] is False
+    assert probe["closeHeldMA5"] is True
+    assert probe["intradayReclaimedMA5"] is True
+
+    close_broken = dict(jingjin)
+    close_broken.update({"low": 13.10, "close": 13.25})
+    assert not v12.strategy_passes(
+        close_broken,
+        "trend_support_probe",
+        v12.V12Config(),
+    )
+
     print("V12.4 VERIFY PASSED")
 
 

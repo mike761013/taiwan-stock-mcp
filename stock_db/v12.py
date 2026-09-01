@@ -127,7 +127,7 @@ class V12Config:
 
     # User-defined probe layer: a short-term golden triangle may be tradable
     # before MA20 has crossed above MA60, provided price itself is above MA60,
-    # the whole candle holds MA5 and the rolling high-volume low, and at least
+    # the signal close holds MA5 and the rolling high-volume low, and at least
     # two independent stabilisation signals are visible.  This is deliberately
     # kept outside the formal actionable ranking and uses a reduced position.
     probe_max_distance_ma5_pct: float = 3.0
@@ -883,7 +883,9 @@ def trend_support_probe_score(
     complete MA5>MA10>MA20>MA60 stack and contracting volume.  The probe layer
     accepts an earlier MA5>MA10>MA20 golden triangle while MA20 is still below
     MA60, but price itself must already be above MA60 and the entire signal
-    candle must hold both MA5 and the rolling high-volume low.
+    close must hold both MA5 and the rolling high-volume low.  An intraday
+    break that is reclaimed by the close remains a probe candidate, with a
+    warning, rather than being discarded.
     """
     close = _number(row, "close")
     open_price = _number(row, "open")
@@ -924,15 +926,20 @@ def trend_support_probe_score(
     else:
         failed_rules.append("股價尚未站上MA60")
 
-    candle_holds_ma5 = ma5 > 0 and low >= ma5 and close >= ma5
-    if candle_holds_ma5:
+    close_holds_ma5 = ma5 > 0 and close >= ma5
+    if close_holds_ma5:
         score += 20
-        reasons.append("盤中與收盤均守住MA5")
-        signals.append("盤中與收盤均守住MA5")
+        if low >= ma5:
+            reasons.append("盤中與收盤均守住MA5")
+            signals.append("盤中與收盤均守住MA5")
+        else:
+            reasons.append("盤中跌破MA5後收回")
+            signals.append("收盤收復MA5")
+            warnings.append("盤中曾跌破MA5，收盤已收回")
     else:
-        failed_rules.append("盤中或收盤曾跌破MA5")
+        failed_rules.append("收盤跌破MA5")
 
-    near_ma5 = candle_holds_ma5 and 0 <= dist5 <= config.probe_max_distance_ma5_pct
+    near_ma5 = close_holds_ma5 and 0 <= dist5 <= config.probe_max_distance_ma5_pct
     if near_ma5:
         score += 10
         reasons.append(f"收盤距MA5僅{dist5:.1f}%")
@@ -941,19 +948,20 @@ def trend_support_probe_score(
             f"距MA5超過試單上限{config.probe_max_distance_ma5_pct:.1f}%"
         )
 
-    massive_low_hold = (
-        large_volume_low > 0
-        and low >= large_volume_low
-        and close >= large_volume_low
-    )
+    massive_low_hold = large_volume_low > 0 and close >= large_volume_low
     if massive_low_hold:
         score += 20
-        reasons.append(f"守住滾動大量低點{large_volume_low:g}")
-        signals.append("盤中與收盤均守住滾動大量低點")
+        if low >= large_volume_low:
+            reasons.append(f"守住滾動大量低點{large_volume_low:g}")
+            signals.append("盤中與收盤均守住滾動大量低點")
+        else:
+            reasons.append(f"收盤收復滾動大量低點{large_volume_low:g}")
+            signals.append("收盤收復滾動大量低點")
+            warnings.append("盤中曾跌破滾動大量低點，收盤已收回")
     elif large_volume_low <= 0:
         failed_rules.append("缺少滾動大量低點")
     else:
-        failed_rules.append("盤中或收盤跌破滾動大量低點")
+        failed_rules.append("收盤跌破滾動大量低點")
 
     if not 0 <= dist20 <= config.probe_max_distance_ma20_pct:
         failed_rules.append(
@@ -1227,9 +1235,12 @@ def predictive_quality_score(
             score += 4
             positives.append("股價站上MA60")
         low = _number(row, "low")
-        if low >= ma5 > 0 and close >= ma5:
+        if ma5 > 0 and close >= ma5:
             score += 10
-            positives.append("整根K線守住MA5")
+            if low >= ma5:
+                positives.append("盤中與收盤均守住MA5")
+            else:
+                positives.append("盤中跌破MA5後收回")
         if 0 <= dist5 <= config.probe_max_distance_ma5_pct:
             score += 8
             positives.append("仍貼近MA5支撐")
@@ -2426,8 +2437,27 @@ def build_v12_candidate(
                 _number(row, "low") >= _number(row, "ma5") > 0
                 and _number(row, "close") >= _number(row, "ma5")
             ),
+            "closeHeldMA5": (
+                _number(row, "ma5") > 0
+                and _number(row, "close") >= _number(row, "ma5")
+            ),
+            "intradayReclaimedMA5": (
+                _number(row, "ma5") > 0
+                and _number(row, "low") < _number(row, "ma5")
+                <= _number(row, "close")
+            ),
             "rollingMassiveVolumeLow": (
                 _number(row, "large_volume_low") or None
+            ),
+            "closeHeldMassiveVolumeLow": (
+                _number(row, "large_volume_low") > 0
+                and _number(row, "close")
+                >= _number(row, "large_volume_low")
+            ),
+            "intradayReclaimedMassiveVolumeLow": (
+                _number(row, "large_volume_low") > 0
+                and _number(row, "low") < _number(row, "large_volume_low")
+                <= _number(row, "close")
             ),
             "maximumPlannedPositionPercent": config.probe_max_position_percent,
             "formalActionable": False,
