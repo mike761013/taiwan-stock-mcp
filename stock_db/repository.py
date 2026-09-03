@@ -277,6 +277,20 @@ class StockRepository:
                     (SELECT MIN(trade_date) FROM daily_bars) AS first_date,
                     (SELECT MAX(trade_date) FROM daily_bars) AS latest_date
             """)
+            portfolio_transactions = 0
+            portfolio_position_plans = 0
+            if await connection.fetchval(
+                "SELECT to_regclass('portfolio_transactions') IS NOT NULL"
+            ):
+                portfolio_transactions = int(await connection.fetchval(
+                    """
+                    SELECT COUNT(*) FROM portfolio_transactions
+                    WHERE voided_at IS NULL
+                    """
+                ) or 0)
+                portfolio_position_plans = int(await connection.fetchval(
+                    "SELECT COUNT(*) FROM portfolio_position_plans"
+                ) or 0)
             size_bytes = int(await connection.fetchval(
                 "SELECT pg_database_size(current_database())"
             ) or 0)
@@ -293,6 +307,8 @@ class StockRepository:
 
         result = dict(row)
         result.update({
+            "portfolio_transactions": portfolio_transactions,
+            "portfolio_position_plans": portfolio_position_plans,
             "databaseSize": size,
             "databaseSizeBytes": size_bytes,
             "databaseLimitBytes": limit_bytes,

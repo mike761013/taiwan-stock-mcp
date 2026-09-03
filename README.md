@@ -71,3 +71,18 @@ force_refresh=false
 ```
 
 舊的 `scope=snapshot` 仍保留相容性，也會清除官方全市場資料快取。
+
+## V12.4 永久持股帳本
+
+帳本寫入既有 PostgreSQL，交易與原始進場策略分開保存。原始策略採
+append-only；新的收盤技術位階只能拿來比較，不能覆寫原計畫。
+
+- `record_portfolio_trade`：新增買賣，現股／融資、一般／定期定額分開。
+- `record_position_plan`：保存訊號來源、買點、上限、部位與明確停損。
+- `get_portfolio_positions`：查 FIFO 批次、最新損益及原始計畫稽核。
+- `get_portfolio_history`：查交易、配對與策略歷史。
+- `void_latest_portfolio_trade`：保留稽核軌跡地更正最新交易。
+
+成本預設採國泰電子下單 28 折：手續費 0.0399%；普通股票賣出稅
+0.3%、股票當沖 0.15%、ETF 0.1%。同日交易先採最有利已實現損益
+配對，剩餘庫存再依 FIFO；融資利率預設年息 6.45%。

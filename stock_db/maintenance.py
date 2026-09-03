@@ -15,6 +15,7 @@ from .factors import (
     refresh_monthly_revenue_if_due,
 )
 from .radar import run_full_bullish_radar_v12
+from .portfolio import portfolio_ledger
 
 # Compatibility name kept for older tests/imports and third-party callers.
 run_full_bullish_radar = run_full_bullish_radar_v12
@@ -118,6 +119,16 @@ async def run_daily_maintenance(
         except Exception as exc:
             result["ok"] = False
             result["performanceError"] = f"{type(exc).__name__}: {exc}"
+
+    # Holdings are read-only here.  The original entry plan remains immutable;
+    # close maintenance only compares the latest close with explicit fields.
+    try:
+        result["portfolioLedger"] = await portfolio_ledger.get_positions()
+    except Exception as exc:
+        result["portfolioLedger"] = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
     result.update({
         "completed": True,

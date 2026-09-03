@@ -30,6 +30,7 @@ def main() -> None:
         "stock_db/factors.py",
         "stock_db/advanced_factors.py",
         "stock_db/performance.py",
+        "stock_db/portfolio.py",
         "server_v10_tools.py",
     )
     for relative in files:

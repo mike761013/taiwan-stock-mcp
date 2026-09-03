@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from stock_db.maintenance import run_daily_maintenance
@@ -42,6 +43,26 @@ from stock_db.v12 import (
     validate_v12_candidates,
 )
 from stock_db.service import stock_database_service
+from stock_db.portfolio import PortfolioLedgerError, portfolio_ledger
+
+
+def _parse_json_object(value: str | None, field: str) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise PortfolioLedgerError(f"{field} must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise PortfolioLedgerError(f"{field} must be a JSON object")
+    return parsed
+
+
+async def _portfolio_call(operation: Any) -> dict[str, Any]:
+    try:
+        return await operation
+    except PortfolioLedgerError as exc:
+        return {"ok": False, "errorType": "VALIDATION", "error": str(exc)}
 
 
 async def validate_v12_release_core(
@@ -145,6 +166,153 @@ def register_v10_tools(mcp: Any) -> None:
     async def get_stock_database_statistics() -> dict:
         """資料庫筆數、日期、容量與剩餘空間。"""
         return await stock_database_service.statistics()
+
+    @mcp.tool()
+    async def record_portfolio_trade(
+        symbol: str,
+        side: str,
+        quantity: int,
+        price: float,
+        trade_date: str,
+        account_type: str = "CASH",
+        asset_type: str = "STOCK",
+        lot_type: str = "REGULAR",
+        tax_treatment: str = "AUTO",
+        margin_principal: float | None = None,
+        margin_annual_rate: float | None = None,
+        plan_id: int | None = None,
+        client_reference: str | None = None,
+        source: str = "manual",
+        notes: str | None = None,
+        metadata_json: str | None = None,
+    ) -> dict:
+        """新增持股交易；同日先採券商最有利損益配對，其餘依FIFO。"""
+        try:
+            metadata = _parse_json_object(metadata_json, "metadata_json")
+        except PortfolioLedgerError as exc:
+            return {"ok": False, "errorType": "VALIDATION", "error": str(exc)}
+        return await _portfolio_call(portfolio_ledger.record_trade(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            price=price,
+            trade_date=trade_date,
+            account_type=account_type,
+            asset_type=asset_type,
+            lot_type=lot_type,
+            tax_treatment=tax_treatment,
+            margin_principal=margin_principal,
+            margin_annual_rate=margin_annual_rate,
+            plan_id=plan_id,
+            client_reference=client_reference,
+            source=source,
+            notes=notes,
+            metadata=metadata,
+        ))
+
+    @mcp.tool()
+    async def record_position_plan(
+        symbol: str,
+        plan_date: str,
+        source_type: str,
+        verification_status: str = "UNVERIFIED",
+        source_reference: str | None = None,
+        action_code: str | None = None,
+        trial_price: float | None = None,
+        entry_low: float | None = None,
+        entry_high: float | None = None,
+        confirmation_price: float | None = None,
+        maximum_entry_price: float | None = None,
+        planned_position_percent: float | None = None,
+        entry_condition_price: float | None = None,
+        entry_condition_basis: str | None = None,
+        signal_defense_price: float | None = None,
+        hard_stop_price: float | None = None,
+        entry_condition: str | None = None,
+        invalidation_condition: str | None = None,
+        evidence_reference: str | None = None,
+        notes: str | None = None,
+        plan_snapshot_json: str | None = None,
+        supersedes_plan_id: int | None = None,
+        link_transaction_id: int | None = None,
+    ) -> dict:
+        """永久新增原始進場計畫；不覆寫舊計畫，未知欄位必須留空。"""
+        try:
+            snapshot = _parse_json_object(
+                plan_snapshot_json,
+                "plan_snapshot_json",
+            )
+        except PortfolioLedgerError as exc:
+            return {"ok": False, "errorType": "VALIDATION", "error": str(exc)}
+        return await _portfolio_call(portfolio_ledger.record_plan(
+            symbol=symbol,
+            plan_date=plan_date,
+            source_type=source_type,
+            verification_status=verification_status,
+            source_reference=source_reference,
+            action_code=action_code,
+            trial_price=trial_price,
+            entry_low=entry_low,
+            entry_high=entry_high,
+            confirmation_price=confirmation_price,
+            maximum_entry_price=maximum_entry_price,
+            planned_position_percent=planned_position_percent,
+            entry_condition_price=entry_condition_price,
+            entry_condition_basis=entry_condition_basis,
+            signal_defense_price=signal_defense_price,
+            hard_stop_price=hard_stop_price,
+            entry_condition=entry_condition,
+            invalidation_condition=invalidation_condition,
+            evidence_reference=evidence_reference,
+            notes=notes,
+            plan_snapshot=snapshot,
+            supersedes_plan_id=supersedes_plan_id,
+            link_transaction_id=link_transaction_id,
+        ))
+
+    @mcp.tool()
+    async def get_portfolio_positions(
+        symbol: str | None = None,
+        include_closed: bool = False,
+        exclude_symbols: str = "0050",
+        as_of_date: str | None = None,
+    ) -> dict:
+        """查詢持股、FIFO批次、成本、最新損益與不可覆寫的原始計畫稽核。"""
+        excluded = [
+            item.strip()
+            for item in exclude_symbols.replace("，", ",").split(",")
+            if item.strip()
+        ]
+        return await _portfolio_call(portfolio_ledger.get_positions(
+            symbol=symbol,
+            include_closed=include_closed,
+            exclude_symbols=excluded,
+            as_of_date=as_of_date,
+        ))
+
+    @mcp.tool()
+    async def get_portfolio_history(
+        symbol: str | None = None,
+        limit: int = 100,
+        include_voided: bool = False,
+    ) -> dict:
+        """查詢交易、FIFO配對與歷次原始策略稽核軌跡。"""
+        return await _portfolio_call(portfolio_ledger.get_history(
+            symbol=symbol,
+            limit=limit,
+            include_voided=include_voided,
+        ))
+
+    @mcp.tool()
+    async def void_latest_portfolio_trade(
+        transaction_id: int,
+        reason: str,
+    ) -> dict:
+        """更正最新一筆交易但保留紀錄；已有後續交易時拒絕危險撤銷。"""
+        return await _portfolio_call(portfolio_ledger.void_latest_trade(
+            transaction_id=transaction_id,
+            reason=reason,
+        ))
 
     @mcp.tool()
     async def sync_stock_security_master() -> dict:

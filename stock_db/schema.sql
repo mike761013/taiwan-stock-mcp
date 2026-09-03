@@ -281,6 +281,121 @@ CREATE TABLE IF NOT EXISTS tdcc_distribution_snapshots (
 CREATE INDEX IF NOT EXISTS idx_tdcc_distribution_symbol_date
     ON tdcc_distribution_snapshots(symbol, snapshot_date DESC);
 
+-- Permanent portfolio ledger.  Trades and original plans are append-only;
+-- corrections void the latest trade instead of deleting its audit trail.
+CREATE TABLE IF NOT EXISTS portfolio_position_plans (
+    id BIGSERIAL PRIMARY KEY,
+    symbol VARCHAR(16) NOT NULL,
+    plan_date DATE NOT NULL,
+    source_type VARCHAR(40) NOT NULL DEFAULT 'manual',
+    source_reference TEXT,
+    verification_status VARCHAR(16) NOT NULL DEFAULT 'UNVERIFIED',
+    action_code VARCHAR(40),
+    trial_price NUMERIC(14,4),
+    entry_low NUMERIC(14,4),
+    entry_high NUMERIC(14,4),
+    confirmation_price NUMERIC(14,4),
+    maximum_entry_price NUMERIC(14,4),
+    planned_position_percent NUMERIC(8,4),
+    entry_condition_price NUMERIC(14,4),
+    entry_condition_basis VARCHAR(24),
+    signal_defense_price NUMERIC(14,4),
+    hard_stop_price NUMERIC(14,4),
+    entry_condition TEXT,
+    invalidation_condition TEXT,
+    evidence_reference TEXT,
+    notes TEXT,
+    plan_snapshot JSONB NOT NULL DEFAULT '{}'::JSONB,
+    supersedes_plan_id BIGINT REFERENCES portfolio_position_plans(id)
+        ON DELETE RESTRICT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (verification_status IN ('VERIFIED', 'UNVERIFIED', 'DISPUTED')),
+    CHECK (entry_condition_basis IS NULL OR entry_condition_basis IN (
+        'OPENING_ONLY', 'INTRADAY', 'CLOSE', 'UNSPECIFIED'
+    )),
+    CHECK (planned_position_percent IS NULL OR (
+        planned_position_percent > 0 AND planned_position_percent <= 100
+    )),
+    CHECK (entry_low IS NULL OR entry_high IS NULL OR entry_low <= entry_high)
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_transactions (
+    id BIGSERIAL PRIMARY KEY,
+    client_reference VARCHAR(160) UNIQUE,
+    symbol VARCHAR(16) NOT NULL,
+    trade_date DATE NOT NULL,
+    side VARCHAR(8) NOT NULL,
+    quantity INTEGER NOT NULL,
+    price NUMERIC(14,4) NOT NULL,
+    account_type VARCHAR(16) NOT NULL DEFAULT 'CASH',
+    asset_type VARCHAR(16) NOT NULL DEFAULT 'STOCK',
+    lot_type VARCHAR(16) NOT NULL DEFAULT 'REGULAR',
+    tax_treatment VARCHAR(16) NOT NULL DEFAULT 'AUTO',
+    commission_rate NUMERIC(12,8) NOT NULL DEFAULT 0.000399,
+    gross_amount NUMERIC(20,4) NOT NULL,
+    commission NUMERIC(20,4) NOT NULL DEFAULT 0,
+    transaction_tax NUMERIC(20,4) NOT NULL DEFAULT 0,
+    margin_principal NUMERIC(20,4),
+    margin_annual_rate NUMERIC(12,8),
+    margin_interest NUMERIC(20,4) NOT NULL DEFAULT 0,
+    net_cash_flow NUMERIC(20,4) NOT NULL,
+    realized_pnl NUMERIC(20,4),
+    source VARCHAR(40) NOT NULL DEFAULT 'manual',
+    notes TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    voided_at TIMESTAMPTZ,
+    void_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (side IN ('BUY', 'SELL')),
+    CHECK (account_type IN ('CASH', 'MARGIN', 'SHORT')),
+    CHECK (asset_type IN ('STOCK', 'ETF')),
+    CHECK (lot_type IN ('REGULAR', 'RECURRING')),
+    CHECK (tax_treatment IN ('AUTO', 'NORMAL', 'DAY_TRADE')),
+    CHECK (quantity > 0),
+    CHECK (price > 0),
+    CHECK (commission_rate >= 0),
+    CHECK (account_type = 'MARGIN' OR margin_principal IS NULL)
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_lot_allocations (
+    sell_transaction_id BIGINT NOT NULL REFERENCES portfolio_transactions(id)
+        ON DELETE RESTRICT,
+    buy_transaction_id BIGINT NOT NULL REFERENCES portfolio_transactions(id)
+        ON DELETE RESTRICT,
+    quantity INTEGER NOT NULL,
+    matching_rule VARCHAR(40) NOT NULL,
+    buy_cost NUMERIC(20,4) NOT NULL,
+    sell_proceeds NUMERIC(20,4) NOT NULL,
+    sell_commission NUMERIC(20,4) NOT NULL,
+    transaction_tax NUMERIC(20,4) NOT NULL,
+    tax_rate NUMERIC(12,8) NOT NULL,
+    margin_interest NUMERIC(20,4) NOT NULL DEFAULT 0,
+    realized_pnl NUMERIC(20,4) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(sell_transaction_id, buy_transaction_id),
+    CHECK (quantity > 0)
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_trade_plan_links (
+    transaction_id BIGINT NOT NULL REFERENCES portfolio_transactions(id)
+        ON DELETE RESTRICT,
+    plan_id BIGINT NOT NULL REFERENCES portfolio_position_plans(id)
+        ON DELETE RESTRICT,
+    relation VARCHAR(24) NOT NULL DEFAULT 'ORIGINAL_ENTRY',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(transaction_id, plan_id),
+    CHECK (relation IN ('ORIGINAL_ENTRY', 'FOLLOW_UP', 'REFERENCE'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_transactions_position
+    ON portfolio_transactions(
+        symbol, account_type, asset_type, lot_type, trade_date, id
+    ) WHERE voided_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_portfolio_allocations_buy
+    ON portfolio_lot_allocations(buy_transaction_id);
+CREATE INDEX IF NOT EXISTS idx_portfolio_plans_symbol_date
+    ON portfolio_position_plans(symbol, plan_date DESC, id DESC);
+
 INSERT INTO schema_versions(version, description)
 VALUES (1, 'V10 complete PostgreSQL schema')
 ON CONFLICT (version) DO NOTHING;
@@ -303,4 +418,8 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO schema_versions(version, description)
 VALUES (1242, 'V12.4 net execution cost and model revision isolation')
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO schema_versions(version, description)
+VALUES (1243, 'Permanent portfolio trade and immutable entry-plan ledger')
 ON CONFLICT (version) DO NOTHING;
