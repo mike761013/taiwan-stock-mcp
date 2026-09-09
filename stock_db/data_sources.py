@@ -845,6 +845,89 @@ async def _fetch_fallback_market_snapshot(
     }
 
 
+async def fetch_official_trade_date_snapshot(
+    target_date: str,
+) -> dict[str, Any]:
+    """Fetch one exact TWSE/TPEx session from official historical endpoints.
+
+    This is intentionally separate from the normal latest-session resolver.
+    It is used to repair a missed close without making one FinMind request per
+    stock or silently skipping an intervening trading day.
+    """
+    normalised_target = _normalise_trade_date(target_date)
+    if not normalised_target:
+        raise ValueError("target_date 格式不正確，請使用 YYYY-MM-DD")
+
+    markets = ("TWSE", "TPEx")
+    results = await asyncio.gather(
+        *(
+            _fetch_fallback_market_snapshot(market, normalised_target)
+            for market in markets
+        ),
+        return_exceptions=True,
+    )
+    by_market: dict[str, dict[str, Any]] = {}
+    errors: dict[str, str] = {}
+    for market, result in zip(markets, results):
+        if isinstance(result, BaseException):
+            errors[market] = f"{type(result).__name__}: {result}"
+        else:
+            by_market[market] = result
+
+    final_dates = {
+        market: by_market.get(market, {}).get("date")
+        for market in markets
+    }
+    all_markets_present = all(market in by_market for market in markets)
+    all_markets_match_target = all(
+        final_dates.get(market) == normalised_target
+        for market in markets
+    )
+    if not all_markets_present or not all_markets_match_target:
+        return {
+            "ok": False,
+            "errorCode": "HISTORICAL_MARKET_DATE_INCOMPLETE",
+            "error": (
+                f"指定交易日 {normalised_target} 的上市櫃官方行情不完整"
+            ),
+            "rows": [],
+            "targetDate": normalised_target,
+            "finalMarketDates": final_dates,
+            "primaryErrors": errors,
+            "dataIntegrity": {
+                "historicalRepair": True,
+                "allMarketsPresent": all_markets_present,
+                "allMarketsSameDate": False,
+                "matchesRequestedDate": all_markets_match_target,
+            },
+        }
+
+    rows = [
+        row
+        for market in markets
+        for row in by_market[market].get("rows", [])
+    ]
+    return {
+        "ok": True,
+        "rows": rows,
+        "targetDate": normalised_target,
+        "primaryMarketDates": {},
+        "finalMarketDates": final_dates,
+        "referenceDate": None,
+        "fallbackEnabled": True,
+        "fallbackUsed": True,
+        "fallbackMarkets": list(markets),
+        "fallbackAttempts": [],
+        "primaryErrors": errors,
+        "dataIntegrity": {
+            "historicalRepair": True,
+            "allMarketsPresent": True,
+            "allMarketsSameDate": True,
+            "matchesRequestedDate": True,
+        },
+    }
+
+
 async def fetch_official_daily_snapshot_with_fallback() -> dict[str, Any]:
     """Resolve TWSE/TPEx to one trade date before allowing database writes."""
     markets = ("TWSE", "TPEx")

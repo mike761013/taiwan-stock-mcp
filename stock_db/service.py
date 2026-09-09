@@ -133,6 +133,74 @@ class StockDatabaseService:
             "lookbackBars": lookback_bars,
         }
 
+    async def calculate_indicators_for_date_bulk(
+        self,
+        symbols: Sequence[str],
+        trade_date: date,
+        lookback_bars: int = 61,
+    ) -> dict[str, Any]:
+        """Calculate one indicator row per symbol for an exact trade date."""
+        unique_symbols = list(dict.fromkeys(
+            str(symbol).strip() for symbol in symbols if str(symbol).strip()
+        ))
+        if not unique_symbols:
+            return {
+                "ok": True,
+                "requestedSymbols": 0,
+                "processedSymbols": 0,
+                "failedSymbols": 0,
+                "indicatorRowsWritten": 0,
+                "failures": [],
+                "lookbackBars": lookback_bars,
+                "tradeDate": trade_date.isoformat(),
+            }
+
+        bars_by_symbol = (
+            await self.repository.get_recent_daily_bars_for_symbols_through_date(
+                unique_symbols,
+                end_date=trade_date,
+                limit_per_symbol=lookback_bars,
+            )
+        )
+        rows: list[DailyIndicator] = []
+        failures: list[dict[str, str]] = []
+        for symbol in unique_symbols:
+            try:
+                bars = bars_by_symbol.get(symbol) or []
+                if not bars:
+                    raise ValueError("no daily bars through target date")
+                latest = calculate_indicators(bars)[-1]
+                if latest["trade_date"] != trade_date:
+                    raise ValueError(
+                        f"target trade date missing; latest={latest['trade_date']}"
+                    )
+                rows.append(DailyIndicator(
+                    symbol=latest["symbol"],
+                    trade_date=latest["trade_date"],
+                    values={
+                        key: value
+                        for key, value in latest.items()
+                        if key not in {"symbol", "trade_date"}
+                    },
+                ))
+            except Exception as exc:
+                failures.append({
+                    "symbol": symbol,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+
+        written = await self.repository.bulk_upsert_indicators(rows)
+        return {
+            "ok": not failures,
+            "requestedSymbols": len(unique_symbols),
+            "processedSymbols": len(rows),
+            "failedSymbols": len(failures),
+            "indicatorRowsWritten": written,
+            "failures": failures[:100],
+            "lookbackBars": lookback_bars,
+            "tradeDate": trade_date.isoformat(),
+        }
+
     async def cleanup(
         self,
         retention_years: int = 5,
