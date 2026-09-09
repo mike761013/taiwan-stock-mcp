@@ -266,6 +266,52 @@ def test_equally_stale_primary_feeds_use_reference_date_for_both_fallbacks(
     assert set(result["finalMarketDates"].values()) == {"2026-07-23"}
 
 
+def test_exact_trade_date_snapshot_requires_both_official_markets(
+    monkeypatch,
+) -> None:
+    async def fallback(market, target_date):
+        assert target_date == "2026-07-22"
+        if market == "TPEx":
+            raise RuntimeError("尚未發布")
+        return _market_snapshot(market, target_date, fallback=True)
+
+    monkeypatch.setattr(
+        data_sources,
+        "_fetch_fallback_market_snapshot",
+        fallback,
+    )
+
+    result = asyncio.run(
+        data_sources.fetch_official_trade_date_snapshot("2026-07-22")
+    )
+
+    assert result["ok"] is False
+    assert result["errorCode"] == "HISTORICAL_MARKET_DATE_INCOMPLETE"
+    assert result["rows"] == []
+    assert "尚未發布" in result["primaryErrors"]["TPEx"]
+
+
+def test_exact_trade_date_snapshot_combines_valid_markets(monkeypatch) -> None:
+    async def fallback(market, target_date):
+        return _market_snapshot(market, target_date, fallback=True)
+
+    monkeypatch.setattr(
+        data_sources,
+        "_fetch_fallback_market_snapshot",
+        fallback,
+    )
+
+    result = asyncio.run(
+        data_sources.fetch_official_trade_date_snapshot("2026-07-22")
+    )
+
+    assert result["ok"] is True
+    assert result["targetDate"] == "2026-07-22"
+    assert result["fallbackMarkets"] == ["TWSE", "TPEx"]
+    assert len(result["rows"]) == 2
+    assert result["dataIntegrity"]["matchesRequestedDate"] is True
+
+
 def test_existing_fallback_environment_switch_is_now_effective(
     monkeypatch,
 ) -> None:

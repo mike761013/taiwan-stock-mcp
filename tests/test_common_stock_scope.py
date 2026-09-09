@@ -1,4 +1,5 @@
 import asyncio
+from datetime import date
 
 from stock_db import pipeline
 from stock_db.pipeline import is_listed_otc_common_stock
@@ -196,3 +197,105 @@ def test_daily_update_persists_only_listed_otc_common_stocks(monkeypatch) -> Non
     assert captured_security_symbols == ["2330", "4939"]
     assert captured_bar_symbols == ["2330", "4939"]
     assert result["indicatorSymbols"] == 2
+
+
+def test_exact_date_update_uses_historical_snapshot_and_indicators(
+    monkeypatch,
+) -> None:
+    requested = date(2026, 7, 22)
+
+    async def initialize():
+        return {"ok": True}
+
+    async def fetch_snapshot(target_date):
+        assert target_date == requested.isoformat()
+        base = {
+            "date": requested.isoformat(),
+            "open": 100,
+            "high": 102,
+            "low": 99,
+            "close": 101,
+            "volume": 3_000_000,
+            "turnover": 303_000_000,
+            "change_percent": 1,
+            "source": "official historical",
+        }
+        return {
+            "ok": True,
+            "rows": [
+                {**base, "symbol": "2330", "name": "台積電", "market": "TWSE"},
+                {**base, "symbol": "4939", "name": "亞電", "market": "TPEx"},
+            ],
+            "targetDate": requested.isoformat(),
+            "finalMarketDates": {
+                "TWSE": requested.isoformat(),
+                "TPEx": requested.isoformat(),
+            },
+            "dataIntegrity": {
+                "historicalRepair": True,
+                "allMarketsPresent": True,
+                "allMarketsSameDate": True,
+                "matchesRequestedDate": True,
+            },
+        }
+
+    async def upsert_securities(securities):
+        return len(securities)
+
+    async def upsert_bars(bars):
+        return len(bars)
+
+    async def symbols_for_date(trade_date):
+        assert trade_date == requested
+        return ["2330", "4939"]
+
+    async def exact_indicators(symbols, trade_date, lookback_bars):
+        assert symbols == ["2330", "4939"]
+        assert trade_date == requested
+        assert lookback_bars == 61
+        return {
+            "processedSymbols": 2,
+            "failedSymbols": 0,
+            "indicatorRowsWritten": 2,
+            "failures": [],
+        }
+
+    monkeypatch.setattr(pipeline.stock_database_service, "initialize", initialize)
+    monkeypatch.setattr(
+        pipeline,
+        "fetch_official_trade_date_snapshot",
+        fetch_snapshot,
+    )
+    monkeypatch.setattr(
+        pipeline.stock_repository,
+        "upsert_securities",
+        upsert_securities,
+    )
+    monkeypatch.setattr(
+        pipeline.stock_repository,
+        "bulk_upsert_daily_bars",
+        upsert_bars,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_common_stock_symbols_for_date",
+        symbols_for_date,
+    )
+    monkeypatch.setattr(
+        pipeline.stock_database_service,
+        "calculate_indicators_for_date_bulk",
+        exact_indicators,
+    )
+
+    result = asyncio.run(pipeline.update_official_daily(
+        batch_size=10,
+        target_date=requested.isoformat(),
+    ))
+
+    assert result["ok"] is True
+    assert result["requestedTradeDate"] == requested.isoformat()
+    assert result["barsWritten"] == 2
+    assert result["indicatorSymbols"] == 2
+    assert result["indicatorCalculationMode"] == (
+        "bulk_exact_trade_date_61_bars"
+    )

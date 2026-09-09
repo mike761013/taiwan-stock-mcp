@@ -11,6 +11,7 @@ from .connection import stock_database
 from .data_sources import (
     fetch_finmind_history,
     fetch_official_daily_snapshot_with_fallback,
+    fetch_official_trade_date_snapshot,
     fetch_security_master,
 )
 from .importers import row_to_daily_bar
@@ -63,6 +64,27 @@ async def _latest_common_stock_symbols() -> list[str]:
     """
     async with stock_database.acquire() as connection:
         rows = await connection.fetch(query, sorted(_COMMON_STOCK_MARKETS))
+    return [str(row["symbol"]) for row in rows]
+
+
+async def _common_stock_symbols_for_date(trade_date: date) -> list[str]:
+    """Read the common-stock universe actually present on one trade date."""
+    query = """
+        SELECT DISTINCT b.symbol
+        FROM daily_bars b
+        JOIN securities s ON s.symbol = b.symbol
+        WHERE s.is_active = TRUE
+          AND UPPER(s.market) = ANY($1::varchar[])
+          AND b.symbol ~ '^[1-9][0-9]{3}$'
+          AND b.trade_date = $2
+        ORDER BY b.symbol
+    """
+    async with stock_database.acquire() as connection:
+        rows = await connection.fetch(
+            query,
+            sorted(_COMMON_STOCK_MARKETS),
+            trade_date,
+        )
     return [str(row["symbol"]) for row in rows]
 
 
@@ -294,6 +316,7 @@ async def update_official_daily(
     batch_size: int = 500,
     start_after: str | None = None,
     concurrency: int = 6,
+    target_date: str | None = None,
 ) -> dict[str, Any]:
     """Update official daily bars and calculate one resumable indicator batch.
 
@@ -302,6 +325,20 @@ async def update_official_daily(
     Continuation calls reuse the first call's committed snapshot, keeping each
     HTTP request short enough for a free Render Web Service.
     """
+    requested_trade_date: date | None = None
+    if target_date:
+        try:
+            requested_trade_date = date.fromisoformat(str(target_date).strip())
+        except ValueError:
+            return {
+                "ok": False,
+                "errorCode": "INVALID_TARGET_DATE",
+                "error": "target_date 格式不正確，請使用 YYYY-MM-DD",
+                "hasMore": False,
+                "nextStartAfter": None,
+                "remainingSymbols": 0,
+            }
+
     init = await stock_database_service.initialize()
     if not init.get("ok"):
         return init
@@ -325,9 +362,19 @@ async def update_official_daily(
         "dataIntegrity": {
             "reusedCommittedSnapshot": not refresh_snapshot,
         },
+        "requestedTradeDate": (
+            requested_trade_date.isoformat()
+            if requested_trade_date is not None
+            else None
+        ),
     }
     if refresh_snapshot:
-        snapshot = await fetch_official_daily_snapshot_with_fallback()
+        if requested_trade_date is not None:
+            snapshot = await fetch_official_trade_date_snapshot(
+                requested_trade_date.isoformat()
+            )
+        else:
+            snapshot = await fetch_official_daily_snapshot_with_fallback()
         snapshot_metadata = {
             key: snapshot.get(key)
             for key in (
@@ -343,6 +390,11 @@ async def update_official_daily(
                 "dataIntegrity",
             )
         }
+        snapshot_metadata["requestedTradeDate"] = (
+            requested_trade_date.isoformat()
+            if requested_trade_date is not None
+            else None
+        )
         if not snapshot.get("ok"):
             return {
                 "ok": False,
@@ -390,7 +442,12 @@ async def update_official_daily(
         ]
         written = await stock_repository.bulk_upsert_daily_bars(bars)
 
-    all_symbols = await _latest_common_stock_symbols()
+    if requested_trade_date is not None:
+        all_symbols = await _common_stock_symbols_for_date(
+            requested_trade_date
+        )
+    else:
+        all_symbols = await _latest_common_stock_symbols()
     remaining, marker_found = _resume_slice(all_symbols, start_after)
     batch_size = max(1, min(batch_size, 500))
     target_symbols = remaining[:batch_size]
@@ -399,12 +456,21 @@ async def update_official_daily(
     indicator_failures: list[dict[str, str]] = []
     if target_symbols:
         try:
-            indicator_result = (
-                await stock_database_service.calculate_latest_indicators_bulk(
-                    target_symbols,
-                    lookback_bars=61,
+            if requested_trade_date is not None:
+                indicator_result = await (
+                    stock_database_service.calculate_indicators_for_date_bulk(
+                        target_symbols,
+                        trade_date=requested_trade_date,
+                        lookback_bars=61,
+                    )
                 )
-            )
+            else:
+                indicator_result = await (
+                    stock_database_service.calculate_latest_indicators_bulk(
+                        target_symbols,
+                        lookback_bars=61,
+                    )
+                )
             processed = int(indicator_result.get("processedSymbols", 0))
             failed = int(indicator_result.get("failedSymbols", 0))
             indicator_rows_written = int(
@@ -420,12 +486,27 @@ async def update_official_daily(
             bulk_error = f"{type(exc).__name__}: {exc}"
             for symbol in target_symbols:
                 try:
-                    one = await stock_database_service.calculate_symbol_indicators(
-                        symbol,
-                        latest_only=True,
-                    )
-                    processed += 1
-                    indicator_rows_written += int(one.get("processed", 0))
+                    if requested_trade_date is not None:
+                        one = await (
+                            stock_database_service.calculate_indicators_for_date_bulk(
+                                [symbol],
+                                trade_date=requested_trade_date,
+                                lookback_bars=61,
+                            )
+                        )
+                        processed += int(one.get("processedSymbols", 0))
+                        failed += int(one.get("failedSymbols", 0))
+                        indicator_rows_written += int(
+                            one.get("indicatorRowsWritten", 0)
+                        )
+                        indicator_failures.extend(one.get("failures") or [])
+                    else:
+                        one = await stock_database_service.calculate_symbol_indicators(
+                            symbol,
+                            latest_only=True,
+                        )
+                        processed += 1
+                        indicator_rows_written += int(one.get("processed", 0))
                 except Exception as one_exc:
                     failed += 1
                     indicator_failures.append({
@@ -450,7 +531,11 @@ async def update_official_daily(
         "barsWritten": written,
         "universeCount": len(all_symbols),
         "batchSize": batch_size,
-        "indicatorCalculationMode": "bulk_latest_61_bars",
+        "indicatorCalculationMode": (
+            "bulk_exact_trade_date_61_bars"
+            if requested_trade_date is not None
+            else "bulk_latest_61_bars"
+        ),
         "batchSymbolCount": len(target_symbols),
         "batchSymbols": target_symbols,
         "indicatorSymbols": processed,

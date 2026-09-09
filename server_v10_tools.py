@@ -391,12 +391,14 @@ def register_v10_tools(mcp: Any) -> None:
         batch_size: int = 500,
         start_after: str | None = None,
         concurrency: int = 6,
+        target_date: str | None = None,
     ) -> dict:
-        """更新官方當日日K，以最多500檔批次計算最新指標。"""
+        """更新最新或指定日期的官方日K，以最多500檔批次計算指標。"""
         return await update_official_daily(
             batch_size=batch_size,
             start_after=start_after,
             concurrency=concurrency,
+            target_date=target_date,
         )
 
     @mcp.tool()

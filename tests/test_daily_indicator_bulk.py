@@ -26,6 +26,23 @@ class FakeRepository:
             for symbol in symbols
         }
 
+    async def get_recent_daily_bars_for_symbols_through_date(
+        self,
+        symbols,
+        end_date,
+        limit_per_symbol=61,
+    ):
+        self.requested_symbols = list(symbols)
+        self.requested_limit = limit_per_symbol
+        return {
+            symbol: [
+                row
+                for row in self.rows_by_symbol.get(symbol, [])
+                if row["trade_date"] <= end_date
+            ][-limit_per_symbol:]
+            for symbol in symbols
+        }
+
     async def bulk_upsert_indicators(self, rows):
         self.written_rows = list(rows)
         return len(self.written_rows)
@@ -109,3 +126,22 @@ def test_bulk_latest_reports_symbol_without_bars() -> None:
     assert result["failedSymbols"] == 1
     assert result["indicatorRowsWritten"] == 1
     assert result["failures"][0]["symbol"] == "9999"
+
+
+def test_bulk_exact_date_ignores_later_bars() -> None:
+    rows = make_bars("2330")
+    target = rows[-3]["trade_date"]
+    repository = FakeRepository({"2330": rows})
+    service = StockDatabaseService(repository=repository)
+
+    result = asyncio.run(service.calculate_indicators_for_date_bulk(
+        ["2330"],
+        trade_date=target,
+        lookback_bars=61,
+    ))
+
+    assert result["ok"] is True
+    assert result["tradeDate"] == target.isoformat()
+    assert repository.written_rows[0].trade_date == target
+    expected = calculate_indicators(rows[:-2])[-1]
+    assert repository.written_rows[0].values["ma20"] == expected["ma20"]
