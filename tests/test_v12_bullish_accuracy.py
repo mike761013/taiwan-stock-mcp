@@ -160,6 +160,37 @@ def test_execution_does_not_assume_same_bar_low_then_high_order():
     assert result["fill_ratio_percent"] == 20
 
 
+def test_execution_takes_profit_in_stages_then_uses_next_day_trailing_stop():
+    result = simulate_signal_execution(
+        _plan(),
+        _bars(
+            (99, 102, 98, 101),
+            (102, 104, 101, 103.5),
+            (104, 106, 103, 105),
+            # The low is below the trailing level formed from this day's high;
+            # daily-bar ordering must not use that new stop on the same bar.
+            (106, 108, 100, 107.5),
+            (109, 114, 106, 113),
+            (109, 110, 107, 108),
+        ),
+    )
+
+    assert result["execution_status"] == "EXITED"
+    assert result["exit_reason"] == "PARTIAL_PROFIT_TRAILING_STOP"
+    assert [item["reason"] for item in result["exit_ledger"]] == [
+        "TAKE_PROFIT_1",
+        "TAKE_PROFIT_2",
+        "TRAILING_STOP",
+    ]
+    assert sum(
+        item["share_ratio"] for item in result["exit_ledger"]
+    ) == 1.0
+    assert result["profit_management"]["target1"]["hit"] is True
+    assert result["profit_management"]["target2"]["hit"] is True
+    assert result["profit_management"]["remainingShareRatio"] == 0.0
+    assert result["return_d5"] > 0
+
+
 def test_fake_breakout_is_rejected_when_it_closes_away_from_day_high():
     row = {
         "open": 100,
@@ -308,12 +339,48 @@ def test_weak_market_downgrades_only_marginal_breakout_confirmation():
     }
     updated = apply_market_context(candidate, context, config)
     assert context["regime"] == "WEAK"
-    assert updated["bullish_score"] == 76.0
+    assert updated["bullish_score"] == 72.0
     assert updated["forwardQualified"] is False
     assert any(
         "弱勢市場" in reason
         for reason in updated["forwardQualification"]["failedRules"]
     )
+
+
+def test_weak_market_keeps_only_high_quality_strong_sector_breakout():
+    config = V12Config()
+    context = {
+        "regime": "WEAK",
+        "regimeLabel": "市場寬度偏弱",
+        "aboveMA20Percent": 35.0,
+        "ma5AboveMA20Percent": 32.0,
+        "industries": {
+            "領先產業": {
+                "memberCount": 8,
+                "aboveMA20Percent": 75.0,
+                "relativeBreadthPercent": 40.0,
+                "medianFiveDayChangePercent": 3.0,
+            },
+        },
+    }
+    candidate = {
+        "symbol": "1000",
+        "industry": "領先產業",
+        "strategy": "breakout",
+        "bullish_score": 80.0,
+        "execution_score": 80.0,
+        "ranking_score": 80.0,
+        "predictive_quality_score": 84.0,
+        "forwardQualified": True,
+        "forwardQualification": {"qualified": True, "failedRules": []},
+        "warnings": [],
+    }
+
+    updated = apply_market_context(candidate, context, config)
+
+    assert updated["bullish_score"] == 74.0
+    assert updated["forwardQualified"] is True
+    assert updated["marketContext"]["weakMarketGate"]["passed"] is True
 
 
 def test_predictive_quality_penalises_exhausted_five_day_move():

@@ -50,6 +50,11 @@ def main() -> None:
         "factor_weight_derivatives",
         "factor_weight_sector_driver",
         "factor_weight_sentiment",
+        "market_weak_risk_strategy_penalty",
+        "market_weak_early_strategy_penalty",
+        "market_weak_reversal_min_quality",
+        "market_weak_early_min_quality",
+        "market_weak_leader_relative_breadth_pct",
     }
     assert required.issubset(config), "V12.4 config fields are incomplete"
     factor_weight_keys = {
@@ -64,11 +69,14 @@ def main() -> None:
         encoding="utf-8"
     )
     assert 'V12_4_FACTOR_MODEL = "V12.4-COMPLETE-FACTORS-2"' in factors_source
-    assert 'EXECUTION_MODEL_REVISION = "V12.4-NET-EXECUTION-1"' in (
+    assert 'EXECUTION_MODEL_REVISION = "V12.4-NET-EXECUTION-2"' in (
         performance_source
     )
     assert '"1.000399"' in performance_source
     assert '"0.996601"' in performance_source
+    assert '"TAKE_PROFIT_1"' in performance_source
+    assert '"TRAILING_STOP"' in performance_source
+    assert '"FORMAL_ACTIONABLE_ONLY"' in performance_source
 
     v12 = load_v12_module()
     assert v12.V12_VERSION == "V12.4"

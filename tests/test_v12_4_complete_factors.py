@@ -461,10 +461,78 @@ def test_execution_upsert_persists_cost_fill_and_model_revisions(monkeypatch):
     result = asyncio.run(performance.update_signal_execution_performance())
     assert result["processed"] == 1
     query, records = connection.executemany_call
-    assert "$38" in query
-    assert len(records[0]) == 38
+    assert "$40" in query
+    assert len(records[0]) == 40
+    assert records[0][2] == "v12_early_stage"
     assert records[0][15] == 100
     assert records[0][16] == 100
-    assert records[0][30] == "V12.4-COMPLETE-FACTORS-1"
-    assert records[0][31] == performance.EXECUTION_MODEL_REVISION
-    assert '"buyCostFactor": 1.000399' in records[0][32]
+    assert records[0][20] == "[]"
+    assert '"enabled": true' in records[0][21]
+    assert records[0][32] == "V12.4-COMPLETE-FACTORS-1"
+    assert records[0][33] == performance.EXECUTION_MODEL_REVISION
+    assert '"buyCostFactor": 1.000399' in records[0][34]
+
+
+def test_execution_summary_matches_every_strategy_in_combined_snapshot(monkeypatch):
+    class FakeConnection:
+        def __init__(self):
+            self.fetchrow_call = None
+
+        async def execute(self, query, *args):
+            return "OK"
+
+        async def fetchrow(self, query, *args):
+            self.fetchrow_call = (query, args)
+            return {
+                "evaluated_signals": 3,
+                "pending": 0,
+                "no_trade": 1,
+                "cancelled": 1,
+                "filled": 1,
+                "exited": 0,
+                "stopped": 0,
+                "trailing_exits": 0,
+                "first_profit_taken": 0,
+                "second_profit_taken": 0,
+                "fully_filled": 1,
+                "partially_filled": 0,
+            }
+
+    class Acquire:
+        def __init__(self, connection):
+            self.connection = connection
+
+        async def __aenter__(self):
+            return self.connection
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeDatabase:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def acquire(self):
+            return Acquire(self.connection)
+
+    connection = FakeConnection()
+    monkeypatch.setattr(
+        performance,
+        "stock_database",
+        FakeDatabase(connection),
+    )
+
+    result = asyncio.run(
+        performance.execution_performance_summary(
+            strategy="v12_breakout",
+            factor_model_revision="V12.4-COMPLETE-FACTORS-2",
+        )
+    )
+
+    query, args = connection.fetchrow_call
+    assert args == ("breakout", "V12.4-COMPLETE-FACTORS-2")
+    assert "JSONB_ARRAY_ELEMENTS_TEXT" in query
+    assert "c.snapshot->'strategies'" in query
+    assert result["resolvedStrategy"] == "breakout"
+    assert result["strategyLabel"] == "放量突破"
+    assert result["summary"]["entry_rate_percent"] == 33.33

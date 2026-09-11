@@ -24,6 +24,29 @@ _ALLOWED_REPORT_VERSIONS = {"V12", "V11", "ALL"}
 _V12_ONLY_STRATEGY_ALIASES = {
     "reversal_reclaim": "v12_reversal_reclaim",
 }
+_STRATEGY_LABELS = {
+    "early_stage": "多頭初升段",
+    "breakout": "放量突破",
+    "pullback": "多頭拉回",
+    "reversal_reclaim": "底部反轉收復",
+    "reversal_continuation": "反轉續強",
+    "trend_support_probe": "多頭支撐試單",
+    "combined": "綜合雷達",
+}
+_FORMAL_ACTION_CODES = frozenset({
+    "BUY_ZONE",
+    "BUY_ON_BREAKOUT",
+    "EARLY_ENTRY",
+    "EARLY_ENTRY_SMALL_POSITION",
+    "PRICE_CONFIRMATION_REQUIRED",
+})
+_PROBE_ACTION_CODES = frozenset({"PROBE_ENTRY"})
+_ACTION_TIER_LABELS = {
+    "ACTIONABLE": "正式進場",
+    "PROBE": "小部位試單",
+    "WATCH": "等待觀察",
+    "UNCLASSIFIED": "舊版未分層",
+}
 DEFAULT_PERFORMANCE_UPDATE_LIMIT = 5000
 MAX_PERFORMANCE_UPDATE_LIMIT = 20000
 
@@ -43,7 +66,30 @@ WICK_TOUCH_FILL_RATIO = max(
     0.0,
     min(float(os.getenv("V12_WICK_TOUCH_FILL_RATIO", "0.5")), 1.0),
 )
-EXECUTION_MODEL_REVISION = "V12.4-NET-EXECUTION-1"
+TAKE_PROFIT_1_R = max(
+    0.25,
+    float(os.getenv("V12_TAKE_PROFIT_1_R", "1.0")),
+)
+TAKE_PROFIT_2_R = max(
+    TAKE_PROFIT_1_R,
+    float(os.getenv("V12_TAKE_PROFIT_2_R", "2.0")),
+)
+TAKE_PROFIT_1_RATIO = max(
+    0.0,
+    min(float(os.getenv("V12_TAKE_PROFIT_1_RATIO", "0.5")), 1.0),
+)
+TAKE_PROFIT_2_RATIO = max(
+    0.0,
+    min(
+        float(os.getenv("V12_TAKE_PROFIT_2_RATIO", "0.25")),
+        1.0 - TAKE_PROFIT_1_RATIO,
+    ),
+)
+TRAILING_DISTANCE_R = max(
+    0.25,
+    float(os.getenv("V12_TRAILING_DISTANCE_R", "1.0")),
+)
+EXECUTION_MODEL_REVISION = "V12.4-NET-EXECUTION-2"
 
 _EXECUTION_TERMINAL_STATUSES = {"NO_TRADE", "CANCELLED", "EXITED"}
 _EXECUTION_FILLED_STATUSES = {
@@ -99,7 +145,9 @@ ALTER TABLE signal_execution_performance
     ADD COLUMN IF NOT EXISTS action_code VARCHAR(40),
     ADD COLUMN IF NOT EXISTS market_regime VARCHAR(24),
     ADD COLUMN IF NOT EXISTS industry VARCHAR(80),
-    ADD COLUMN IF NOT EXISTS factor_confidence NUMERIC(10,4);
+    ADD COLUMN IF NOT EXISTS factor_confidence NUMERIC(10,4),
+    ADD COLUMN IF NOT EXISTS exit_ledger JSONB NOT NULL DEFAULT '[]'::JSONB,
+    ADD COLUMN IF NOT EXISTS profit_management JSONB NOT NULL DEFAULT '{}'::JSONB;
 """
 
 
@@ -165,6 +213,68 @@ def _normalise_strategy(strategy: Any) -> str:
     return value
 
 
+def _strategy_label(strategy: Any) -> str:
+    normalised = _normalise_strategy(strategy)
+    return _STRATEGY_LABELS.get(normalised, normalised)
+
+
+def _snapshot_strategies(
+    snapshot: Mapping[str, Any],
+    fallback_strategy: Any = None,
+) -> list[str]:
+    raw = snapshot.get("strategies")
+    strategies: list[str] = []
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        strategies.extend(
+            _normalise_strategy(value)
+            for value in raw
+            if str(value or "").strip()
+        )
+    primary = snapshot.get("strategy")
+    if primary:
+        strategies.append(_normalise_strategy(primary))
+    if fallback_strategy:
+        strategies.append(_normalise_strategy(fallback_strategy))
+    return list(dict.fromkeys(
+        value for value in strategies if value and value != "unknown"
+    ))
+
+
+def _action_tier(row: Mapping[str, Any]) -> str:
+    snapshot = _mapping(row.get("snapshot"))
+    plan = _mapping(snapshot.get("tradingPlan"))
+    action_code = str(
+        row.get("action_code")
+        or snapshot.get("actionCode")
+        or plan.get("statusCode")
+        or ""
+    ).strip().upper()
+    forward_qualified = bool(snapshot.get("forwardQualified", True))
+    strategies = _snapshot_strategies(
+        snapshot,
+        row.get("normalised_strategy") or row.get("strategy"),
+    )
+    if action_code in _FORMAL_ACTION_CODES and forward_qualified:
+        return "ACTIONABLE"
+    if (
+        action_code in _PROBE_ACTION_CODES
+        or "trend_support_probe" in strategies
+    ):
+        return "PROBE"
+    if action_code or snapshot:
+        return "WATCH"
+    return "UNCLASSIFIED"
+
+
+def _canonical_execution_strategy(strategy: Any) -> str:
+    normalised = _normalise_strategy(strategy)
+    return (
+        f"v12_{normalised}"
+        if normalised and normalised != "unknown"
+        else "v12_combined"
+    )
+
+
 def _row_score(row: Mapping[str, Any]) -> tuple[float, int]:
     score = _as_float(row.get("total_score"))
     run_id = int(row.get("radar_run_id") or 0)
@@ -175,7 +285,21 @@ def _prefer_row(
     current: Mapping[str, Any] | None,
     candidate: Mapping[str, Any],
 ) -> Mapping[str, Any]:
-    if current is None or _row_score(candidate) > _row_score(current):
+    tier_priority = {
+        "ACTIONABLE": 3,
+        "PROBE": 2,
+        "WATCH": 1,
+        "UNCLASSIFIED": 0,
+    }
+    candidate_priority = (
+        tier_priority.get(str(candidate.get("action_tier") or ""), -1),
+        *_row_score(candidate),
+    )
+    current_priority = (
+        tier_priority.get(str((current or {}).get("action_tier") or ""), -1),
+        *_row_score(current or {}),
+    )
+    if current is None or candidate_priority > current_priority:
         return candidate
     return current
 
@@ -231,15 +355,40 @@ def _metric_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _action_tier_summaries(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get("action_tier") or _action_tier(row))].append(row)
+    order = ("ACTIONABLE", "PROBE", "WATCH", "UNCLASSIFIED")
+    return [
+        {
+            "actionTier": tier,
+            "actionTierLabel": _ACTION_TIER_LABELS[tier],
+            **_metric_summary(grouped.get(tier, [])),
+        }
+        for tier in order
+    ]
+
+
 def _ranking_item(
     row: Mapping[str, Any],
     horizon_field: str,
 ) -> dict[str, Any]:
+    strategies = list(row.get("strategies") or [])
+    action_tier = str(row.get("action_tier") or _action_tier(row))
     return {
         "runDate": _as_iso_date(row.get("run_date")),
         "symbol": str(row.get("symbol") or ""),
         "name": str(row.get("name") or ""),
-        "strategies": list(row.get("strategies") or []),
+        "strategies": strategies,
+        "strategyLabels": [_strategy_label(value) for value in strategies],
+        "actionTier": action_tier,
+        "actionTierLabel": _ACTION_TIER_LABELS.get(
+            action_tier,
+            action_tier,
+        ),
         "score": _as_float(row.get("total_score")),
         "entryDate": _as_iso_date(row.get("entry_date")),
         "entryClose": _as_float(row.get("entry_close")),
@@ -289,6 +438,7 @@ def build_weekly_report(
         if not run_date or not symbol:
             continue
         row["normalised_strategy"] = strategy
+        row["action_tier"] = _action_tier(row)
         key = (run_date, symbol, strategy)
         strategy_dedup[key] = _prefer_row(strategy_dedup.get(key), row)
         strategies_by_signal[(run_date, symbol)].add(strategy)
@@ -319,7 +469,9 @@ def build_weekly_report(
         group = list(strategy_groups[strategy])
         by_strategy.append({
             "strategy": strategy,
+            "strategyLabel": _strategy_label(strategy),
             **_metric_summary(group),
+            "byActionTier": _action_tier_summaries(group),
         })
 
     by_date = []
@@ -331,13 +483,21 @@ def build_weekly_report(
         by_date.append({
             "runDate": run_date,
             **_metric_summary(date_groups[run_date]),
+            "byActionTier": _action_tier_summaries(date_groups[run_date]),
         })
 
+    actionable_rows = [
+        row for row in unique_rows
+        if row.get("action_tier") == "ACTIONABLE"
+    ]
     best: dict[str, list[dict[str, Any]]] = {}
     worst: dict[str, list[dict[str, Any]]] = {}
+    all_candidate_best: dict[str, list[dict[str, Any]]] = {}
+    all_candidate_worst: dict[str, list[dict[str, Any]]] = {}
     for label, field in _HORIZONS:
         matured = [
-            row for row in unique_rows if _as_float(row.get(field)) is not None
+            row for row in actionable_rows
+            if _as_float(row.get(field)) is not None
         ]
         descending = sorted(
             matured,
@@ -350,6 +510,22 @@ def build_weekly_report(
         ]
         worst[label] = [
             _ranking_item(row, field) for row in ascending[:top_n]
+        ]
+        all_matured = [
+            row for row in unique_rows
+            if _as_float(row.get(field)) is not None
+        ]
+        all_descending = sorted(
+            all_matured,
+            key=lambda row: _as_float(row.get(field)) or 0.0,
+            reverse=True,
+        )
+        all_candidate_best[label] = [
+            _ranking_item(row, field) for row in all_descending[:top_n]
+        ]
+        all_candidate_worst[label] = [
+            _ranking_item(row, field)
+            for row in reversed(all_descending[-top_n:])
         ]
 
     return {
@@ -366,13 +542,20 @@ def build_weekly_report(
         "strategySignalsAfterDedup": len(strategy_dedup),
         "uniqueSignals": len(unique_rows),
         "duplicatesRemoved": len(materialised) - len(unique_rows),
-        "overall": _metric_summary(unique_rows),
+        "headlineBasis": "FORMAL_ACTIONABLE_ONLY",
+        "headlineBasisLabel": "只統計正式進場候選",
+        "overall": _metric_summary(actionable_rows),
+        "allCandidates": _metric_summary(unique_rows),
+        "byActionTier": _action_tier_summaries(unique_rows),
         "byStrategy": by_strategy,
         "byDate": by_date,
         "best": best,
         "worst": worst,
+        "allCandidateBest": all_candidate_best,
+        "allCandidateWorst": all_candidate_worst,
         "notes": [
-            "報酬以雷達當日收盤價為訊號基準，不等於使用者實際成交損益。",
+            "主績效只統計正式進場候選；小部位試單與等待觀察分開顯示。",
+            "本報表仍以雷達當日收盤價為訊號基準，不等於使用者實際成交損益。",
             "各期間勝率只使用已具備該期間報酬的成熟樣本；空值不列為失敗。",
             "同日同股跨策略或重複執行雷達時，整體統計只保留一筆。",
             "MFE與MAE是資料庫目前可取得期間，不保證每筆都已滿20個交易日。",
@@ -403,6 +586,7 @@ def _execution_return(
     fills: Sequence[Mapping[str, Any]],
     price: float,
     maximum_fill_index: int,
+    exits: Sequence[Mapping[str, Any]] = (),
 ) -> float | None:
     active = [
         fill for fill in fills if int(fill["index"]) <= maximum_fill_index
@@ -418,7 +602,25 @@ def _execution_return(
     )
     if capital <= 0 or shares <= 0:
         return None
-    net_proceeds = shares * price * SELL_PROCEEDS_FACTOR
+    realised_ratio = 0.0
+    realised_proceeds = 0.0
+    for exit_item in exits:
+        if int(exit_item["index"]) > maximum_fill_index:
+            continue
+        share_ratio = max(0.0, min(float(exit_item["share_ratio"]), 1.0))
+        share_ratio = min(share_ratio, 1.0 - realised_ratio)
+        realised_proceeds += (
+            shares
+            * share_ratio
+            * float(exit_item["price"])
+            * SELL_PROCEEDS_FACTOR
+        )
+        realised_ratio += share_ratio
+    remaining_ratio = max(0.0, 1.0 - realised_ratio)
+    net_proceeds = (
+        realised_proceeds
+        + shares * remaining_ratio * price * SELL_PROCEEDS_FACTOR
+    )
     return round((net_proceeds / capital - 1) * 100, 4)
 
 
@@ -430,6 +632,14 @@ def _execution_cost_model() -> dict[str, Any]:
         "confirmationEntrySlippageBps": CONFIRMATION_ENTRY_SLIPPAGE_BPS,
         "exitSlippageBps": EXIT_SLIPPAGE_BPS,
         "wickTouchFillRatio": WICK_TOUCH_FILL_RATIO,
+        "takeProfit1R": TAKE_PROFIT_1_R,
+        "takeProfit1ShareRatio": TAKE_PROFIT_1_RATIO,
+        "takeProfit2R": TAKE_PROFIT_2_R,
+        "takeProfit2ShareRatio": TAKE_PROFIT_2_RATIO,
+        "trailingDistanceR": TRAILING_DISTANCE_R,
+        "dailyBarOrdering": (
+            "prior-session trailing stop before current-session profit targets"
+        ),
         "broker": "Cathay e-order 28% fee, ordinary stock",
         "executionModelRevision": EXECUTION_MODEL_REVISION,
     }
@@ -478,6 +688,8 @@ def simulate_signal_execution(
         "exit_date": None,
         "exit_price": None,
         "exit_reason": None,
+        "exit_ledger": [],
+        "profit_management": {},
         "return_d1": None,
         "return_d3": None,
         "return_d5": None,
@@ -489,7 +701,9 @@ def simulate_signal_execution(
             snapshot.get("factorModelRevision") or ""
         ),
         "execution_model_revision": EXECUTION_MODEL_REVISION,
-        "fill_assumption": "SUPPORT_PROXY_WICK_PARTIAL_CLOSE_CONFIRMATION",
+        "fill_assumption": (
+            "SUPPORT_PROXY_WICK_PARTIAL_CLOSE_CONFIRMATION_PROFIT_TRAIL"
+        ),
         "cost_model": _execution_cost_model(),
         "evaluated_through": (
             ordered[-1].get("trade_date") if ordered else None
@@ -677,24 +891,221 @@ def simulate_signal_execution(
     )
     weighted_entry = cost / shares if shares > 0 else None
 
-    exit_index: int | None = None
-    exit_price: float | None = None
-    exit_date: Any = None
+    exits: list[dict[str, Any]] = []
+    remaining_share_ratio = 1.0
+    target1_hit = False
+    target2_hit = False
+    trailing_stop: float | None = None
+    peak_after_target1: float | None = None
+    final_exit_index: int | None = None
     status = "FILLED"
     reason = "已依V12.4可執行劇本成交"
-    if failure_close_index is not None:
+
+    atr = _as_float(snapshot.get("atr14")) or _as_float(snapshot.get("atr"))
+    risk_unit = (
+        weighted_entry - failure_price
+        if weighted_entry is not None and failure_price > 0
+        else 0.0
+    )
+    if risk_unit <= 0 and weighted_entry is not None:
+        risk_unit = max(atr or 0.0, weighted_entry * 0.03)
+    target1_price = (
+        weighted_entry + TAKE_PROFIT_1_R * risk_unit
+        if weighted_entry is not None and risk_unit > 0
+        else None
+    )
+    target2_price = (
+        weighted_entry + TAKE_PROFIT_2_R * risk_unit
+        if weighted_entry is not None and risk_unit > 0
+        else None
+    )
+    total_entry_shares = sum(
+        float(fill["percent"])
+        / (float(fill["price"]) * BUY_COST_FACTOR)
+        for fill in fills
+        if float(fill["price"]) > 0
+    )
+    break_even_price = (
+        cost / total_entry_shares / SELL_PROCEEDS_FACTOR
+        if total_entry_shares > 0
+        else weighted_entry
+    )
+    management_start_index = max(
+        entry_window_sessions,
+        max(int(fill["index"]) for fill in fills) + 1,
+    )
+
+    def append_exit(
+        index: int,
+        raw_price: float,
+        share_ratio: float,
+        exit_reason: str,
+    ) -> None:
+        nonlocal remaining_share_ratio, final_exit_index
+        ratio = max(0.0, min(share_ratio, remaining_share_ratio))
+        if ratio <= 0 or raw_price <= 0:
+            return
+        executed_price = raw_price * (1 - EXIT_SLIPPAGE_BPS / 10_000)
+        exits.append({
+            "index": index,
+            "date": _as_iso_date(ordered[index].get("trade_date")),
+            "price": round(executed_price, 4),
+            "share_ratio": round(ratio, 6),
+            "reason": exit_reason,
+        })
+        remaining_share_ratio = max(0.0, remaining_share_ratio - ratio)
+        if remaining_share_ratio <= 1e-9:
+            remaining_share_ratio = 0.0
+            final_exit_index = index
+
+    # Profit management starts only after the complete entry window and the
+    # last fill.  A stop calculated from today's high can therefore take effect
+    # no earlier than the next session, avoiding optimistic daily-bar ordering.
+    management_end = (
+        failure_close_index
+        if failure_close_index is not None
+        else len(ordered)
+    )
+    if target1_price is not None and target2_price is not None:
+        for index in range(management_start_index, management_end):
+            bar = ordered[index]
+            open_price = _bar_number(bar, "open")
+            high = _bar_number(bar, "high")
+            low = _bar_number(bar, "low")
+            if None in (open_price, high, low):
+                continue
+            assert open_price is not None and high is not None and low is not None
+
+            # The prior session's trailing level is checked before today's high.
+            if trailing_stop is not None and low <= trailing_stop:
+                raw_exit = open_price if open_price <= trailing_stop else trailing_stop
+                append_exit(
+                    index,
+                    raw_exit,
+                    remaining_share_ratio,
+                    "TRAILING_STOP",
+                )
+                break
+
+            if not target1_hit and high >= target1_price:
+                append_exit(
+                    index,
+                    target1_price,
+                    TAKE_PROFIT_1_RATIO,
+                    "TAKE_PROFIT_1",
+                )
+                target1_hit = True
+            if (
+                target1_hit
+                and not target2_hit
+                and remaining_share_ratio > 0
+                and high >= target2_price
+            ):
+                append_exit(
+                    index,
+                    target2_price,
+                    TAKE_PROFIT_2_RATIO,
+                    "TAKE_PROFIT_2",
+                )
+                target2_hit = True
+            if target1_hit and remaining_share_ratio > 0:
+                peak_after_target1 = max(peak_after_target1 or high, high)
+                trailing_stop = max(
+                    break_even_price or 0.0,
+                    peak_after_target1 - TRAILING_DISTANCE_R * risk_unit,
+                )
+
+    # The close-confirmed failure rule remains authoritative for any shares
+    # that have not already been sold by profit management.
+    pending_failure_exit = False
+    if remaining_share_ratio > 0 and failure_close_index is not None:
         next_index = failure_close_index + 1
         if next_index < len(ordered):
             next_open = _bar_number(ordered[next_index], "open")
             if next_open is not None:
-                exit_index = next_index
-                exit_price = next_open * (1 - EXIT_SLIPPAGE_BPS / 10_000)
-                exit_date = ordered[next_index].get("trade_date")
-                status = "EXITED"
-                reason = "收盤跌破失敗條件，隔日開盤退出"
+                append_exit(
+                    next_index,
+                    next_open,
+                    remaining_share_ratio,
+                    "CLOSE_FAILURE",
+                )
+        if remaining_share_ratio > 0:
+            pending_failure_exit = True
+
+    has_partial_profit = any(
+        item["reason"] in {"TAKE_PROFIT_1", "TAKE_PROFIT_2"}
+        for item in exits
+    )
+    final_reason = exits[-1]["reason"] if exits else None
+    if final_exit_index is not None:
+        status = "EXITED"
+        if final_reason == "TRAILING_STOP" and has_partial_profit:
+            exit_reason = "PARTIAL_PROFIT_TRAILING_STOP"
+            reason = "已分批停利，剩餘部位依移動停損退出"
+        elif final_reason == "CLOSE_FAILURE" and has_partial_profit:
+            exit_reason = "PARTIAL_PROFIT_CLOSE_FAILURE"
+            reason = "已分批停利，剩餘部位於失敗條件後退出"
+        elif final_reason == "CLOSE_FAILURE":
+            exit_reason = "CLOSE_FAILURE"
+            reason = "收盤跌破失敗條件，隔日開盤退出"
         else:
-            status = "FILLED_PENDING_EXIT"
-            reason = "已收盤跌破失敗條件，等待下一交易日開盤價"
+            exit_reason = str(final_reason or "PROFIT_MANAGEMENT")
+            reason = "已依分批停利規則退出"
+    elif pending_failure_exit:
+        status = "FILLED_PENDING_EXIT"
+        exit_reason = (
+            "PENDING_CLOSE_FAILURE"
+            if has_partial_profit
+            else None
+        )
+        reason = "已收盤跌破失敗條件，等待下一交易日開盤價"
+    elif has_partial_profit:
+        exit_reason = "PARTIAL_PROFIT"
+        reason = "已分批停利，剩餘部位續抱並以移動停損管理"
+    else:
+        exit_reason = None
+
+    exited_ratio = sum(float(item["share_ratio"]) for item in exits)
+    average_exit_price = (
+        sum(
+            float(item["price"]) * float(item["share_ratio"])
+            for item in exits
+        ) / exited_ratio
+        if exited_ratio > 0
+        else None
+    )
+    last_exit = exits[-1] if exits else None
+    profit_management = {
+        "enabled": True,
+        "riskUnit": round(risk_unit, 4),
+        "failurePrice": round(failure_price, 4) if failure_price > 0 else None,
+        "managementStartDate": (
+            _as_iso_date(ordered[management_start_index].get("trade_date"))
+            if management_start_index < len(ordered)
+            else None
+        ),
+        "target1": {
+            "rMultiple": TAKE_PROFIT_1_R,
+            "price": round(target1_price, 4) if target1_price else None,
+            "shareRatio": TAKE_PROFIT_1_RATIO,
+            "hit": target1_hit,
+        },
+        "target2": {
+            "rMultiple": TAKE_PROFIT_2_R,
+            "price": round(target2_price, 4) if target2_price else None,
+            "shareRatio": TAKE_PROFIT_2_RATIO,
+            "hit": target2_hit,
+        },
+        "trailingStop": {
+            "distanceR": TRAILING_DISTANCE_R,
+            "lastLevel": round(trailing_stop, 4) if trailing_stop else None,
+            "active": target1_hit and remaining_share_ratio > 0,
+        },
+        "remainingShareRatio": round(remaining_share_ratio, 6),
+        "dailyBarOrdering": (
+            "前一交易日形成的移動停損，才可於下一交易日觸發"
+        ),
+    }
 
     result.update(
         execution_status=status,
@@ -730,9 +1141,14 @@ def simulate_signal_execution(
             round(cost / planned_position * 100, 4)
             if planned_position > 0 else 0.0
         ),
-        exit_date=exit_date,
-        exit_price=round(exit_price, 4) if exit_price is not None else None,
-        exit_reason=("CLOSE_FAILURE" if exit_index is not None else None),
+        exit_date=last_exit.get("date") if last_exit else None,
+        exit_price=(
+            round(average_exit_price, 4)
+            if average_exit_price is not None else None
+        ),
+        exit_reason=exit_reason,
+        exit_ledger=exits,
+        profit_management=profit_management,
     )
 
     horizon_fields = {
@@ -744,8 +1160,13 @@ def simulate_signal_execution(
     }
     for horizon, field in horizon_fields.items():
         target_index = first_index + horizon
-        if exit_index is not None and exit_index <= target_index:
-            result[field] = _execution_return(fills, exit_price, exit_index)
+        if final_exit_index is not None and final_exit_index <= target_index:
+            result[field] = _execution_return(
+                fills,
+                float(exits[-1]["price"]),
+                final_exit_index,
+                exits,
+            )
         elif target_index < len(ordered):
             target_close = _bar_number(ordered[target_index], "close")
             if target_close is not None:
@@ -753,9 +1174,14 @@ def simulate_signal_execution(
                     fills,
                     target_close * (1 - EXIT_SLIPPAGE_BPS / 10_000),
                     target_index,
+                    exits,
                 )
 
-    window_end = exit_index if exit_index is not None else len(ordered) - 1
+    window_end = (
+        final_exit_index
+        if final_exit_index is not None
+        else len(ordered) - 1
+    )
     favorable: list[float] = []
     adverse: list[float] = []
     # The daily bar cannot tell whether its high/low occurred before or after
@@ -769,6 +1195,7 @@ def simulate_signal_execution(
                 fills,
                 high * (1 - EXIT_SLIPPAGE_BPS / 10_000),
                 index,
+                exits,
             )
             if value is not None:
                 favorable.append(value)
@@ -777,11 +1204,17 @@ def simulate_signal_execution(
                 fills,
                 low * (1 - EXIT_SLIPPAGE_BPS / 10_000),
                 index,
+                exits,
             )
             if value is not None:
                 adverse.append(value)
-    if exit_index is not None and exit_price is not None:
-        exit_return = _execution_return(fills, exit_price, exit_index)
+    if final_exit_index is not None and exits:
+        exit_return = _execution_return(
+            fills,
+            float(exits[-1]["price"]),
+            final_exit_index,
+            exits,
+        )
         if exit_return is not None:
             favorable.append(exit_return)
             adverse.append(exit_return)
@@ -889,7 +1322,7 @@ async def update_signal_execution_performance(
                 (
                     signal["radar_run_id"],
                     signal["symbol"],
-                    signal["strategy"],
+                    _canonical_execution_strategy(signal["strategy"]),
                     signal_date,
                     simulation["execution_status"],
                     simulation["status_reason"],
@@ -907,6 +1340,12 @@ async def update_signal_execution_performance(
                     simulation["exit_date"],
                     simulation["exit_price"],
                     simulation["exit_reason"],
+                    json.dumps(
+                        simulation["exit_ledger"], ensure_ascii=False
+                    ),
+                    json.dumps(
+                        simulation["profit_management"], ensure_ascii=False
+                    ),
                     simulation["return_d1"],
                     simulation["return_d3"],
                     simulation["return_d5"],
@@ -940,6 +1379,7 @@ async def update_signal_execution_performance(
                 entry_date, weighted_entry_price, filled_position_percent,
                 planned_position_percent, fill_ratio_percent,
                 exit_date, exit_price, exit_reason,
+                exit_ledger, profit_management,
                 return_d1, return_d3, return_d5, return_d10, return_d20,
                 max_favorable_percent, max_adverse_percent,
                 evaluated_through, label_version, accuracy_engine,
@@ -949,10 +1389,13 @@ async def update_signal_execution_performance(
                 calculated_at
             ) VALUES(
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-                $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
-                $29,$30,$31,$32,$33::jsonb,$34,$35,$36,$37,$38,NOW()
+                $16,$17,$18,$19,$20,$21::jsonb,$22::jsonb,$23,$24,$25,
+                $26,$27,$28,$29,$30,$31,$32,$33,$34,$35::jsonb,$36,
+                $37,$38,$39,$40,NOW()
             )
             ON CONFLICT(radar_run_id, symbol) DO UPDATE SET
+                strategy=EXCLUDED.strategy,
+                signal_date=EXCLUDED.signal_date,
                 execution_status=EXCLUDED.execution_status,
                 status_reason=EXCLUDED.status_reason,
                 aggressive_fill_date=EXCLUDED.aggressive_fill_date,
@@ -969,6 +1412,8 @@ async def update_signal_execution_performance(
                 exit_date=EXCLUDED.exit_date,
                 exit_price=EXCLUDED.exit_price,
                 exit_reason=EXCLUDED.exit_reason,
+                exit_ledger=EXCLUDED.exit_ledger,
+                profit_management=EXCLUDED.profit_management,
                 return_d1=EXCLUDED.return_d1,
                 return_d3=EXCLUDED.return_d3,
                 return_d5=EXCLUDED.return_d5,
@@ -1009,16 +1454,42 @@ async def execution_performance_summary(
 ) -> dict[str, Any]:
     """Return performance only for plans that would really have filled."""
     requested = str(strategy or "").strip().lower()
-    resolved = requested
-    if resolved and not resolved.startswith("v12_"):
-        resolved = f"v12_{resolved}"
+    resolved = _normalise_strategy(requested) if requested else ""
     async with stock_database.acquire() as connection:
         await _ensure_execution_schema(connection)
         conditions: list[str] = []
         args: list[Any] = []
         if resolved:
             args.append(resolved)
-            conditions.append(f"LOWER(e.strategy)=${len(args)}")
+            parameter = f"${len(args)}"
+            conditions.append(f"""
+                (
+                  REGEXP_REPLACE(
+                    LOWER(COALESCE(
+                      NULLIF(c.snapshot->>'strategy', ''),
+                      NULLIF(e.strategy, ''),
+                      ''
+                    )),
+                    '^v12_',
+                    ''
+                  )={parameter}
+                  OR EXISTS (
+                    SELECT 1
+                    FROM JSONB_ARRAY_ELEMENTS_TEXT(
+                      CASE
+                        WHEN JSONB_TYPEOF(c.snapshot->'strategies')='array'
+                        THEN c.snapshot->'strategies'
+                        ELSE '[]'::jsonb
+                      END
+                    ) AS matched_strategy(value)
+                    WHERE REGEXP_REPLACE(
+                      LOWER(matched_strategy.value),
+                      '^v12_',
+                      ''
+                    )={parameter}
+                  )
+                )
+            """)
         requested_engine = str(accuracy_engine or "").strip()
         if requested_engine:
             args.append(requested_engine)
@@ -1034,10 +1505,7 @@ async def execution_performance_summary(
                 f"c.snapshot->>'factorModelRevision', '')=${len(args)}"
             )
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        distinct_keys = (
-            "e.signal_date, e.symbol, e.strategy"
-            if resolved else "e.signal_date, e.symbol"
-        )
+        distinct_keys = "e.signal_date, e.symbol"
         row = await connection.fetchrow(
             f"""
             WITH dedup AS (
@@ -1059,7 +1527,25 @@ async def execution_performance_summary(
                   'FILLED','FILLED_PENDING_EXIT','EXITED'
                 )
               ) AS filled,
-              COUNT(*) FILTER (WHERE execution_status='EXITED') AS stopped,
+              COUNT(*) FILTER (WHERE execution_status='EXITED') AS exited,
+              COUNT(*) FILTER (
+                WHERE exit_reason IN (
+                  'CLOSE_FAILURE','PARTIAL_PROFIT_CLOSE_FAILURE'
+                )
+              ) AS stopped,
+              COUNT(*) FILTER (
+                WHERE exit_reason='PARTIAL_PROFIT_TRAILING_STOP'
+              ) AS trailing_exits,
+              COUNT(*) FILTER (
+                WHERE COALESCE(
+                  profit_management->'target1'->>'hit', 'false'
+                )='true'
+              ) AS first_profit_taken,
+              COUNT(*) FILTER (
+                WHERE COALESCE(
+                  profit_management->'target2'->>'hit', 'false'
+                )='true'
+              ) AS second_profit_taken,
               COUNT(*) FILTER (
                 WHERE execution_status IN (
                   'FILLED','FILLED_PENDING_EXIT','EXITED'
@@ -1116,6 +1602,7 @@ async def execution_performance_summary(
         "ok": True,
         "strategy": requested or None,
         "resolvedStrategy": resolved or None,
+        "strategyLabel": _strategy_label(resolved) if resolved else None,
         "accuracyEngine": requested_engine or None,
         "factorModelRevision": requested_factor_model or None,
         "summary": summary,
@@ -1125,6 +1612,8 @@ async def execution_performance_summary(
             "碰到激進區間仍須有承接代理訊號；只有影線碰價只算部分成交。",
             "確認買點以確認日收盤附近加滑價成交，不回填較早的盤中觸價。",
             "不追價、未觸價與成交前失效不列為虧損交易。",
+            "進場期結束後，以1R停利50%、2R停利25%，其餘採1R移動停損。",
+            "移動停損只使用前一交易日已知高點，避免日K先後順序偷看。",
             "收盤確認失敗後，以次一交易日開盤價退出。",
             "所有報酬均已套用買進1.000399、賣出0.996601與設定滑價。",
         ],
@@ -1165,17 +1654,49 @@ async def execution_strategy_priors(
         await _ensure_execution_schema(connection)
         rows = await connection.fetch(
             f"""
-            WITH dedup AS (
-              SELECT DISTINCT ON (e.signal_date, e.symbol, e.strategy) e.*
+            WITH base AS (
+              SELECT e.*,
+                     c.total_score,
+                     CASE
+                       WHEN JSONB_TYPEOF(c.snapshot->'strategies')='array'
+                         AND JSONB_ARRAY_LENGTH(c.snapshot->'strategies') > 0
+                       THEN c.snapshot->'strategies'
+                       ELSE JSONB_BUILD_ARRAY(
+                         REGEXP_REPLACE(
+                           LOWER(COALESCE(
+                             NULLIF(c.snapshot->>'strategy', ''),
+                             NULLIF(e.strategy, ''),
+                             'combined'
+                           )),
+                           '^v12_',
+                           ''
+                         )
+                       )
+                     END AS matched_strategies
               FROM signal_execution_performance e
               JOIN radar_candidates c
                 ON c.radar_run_id=e.radar_run_id AND c.symbol=e.symbol
               {engine_where}
-              ORDER BY e.signal_date, e.symbol, e.strategy,
-                       c.total_score DESC NULLS LAST,
-                       e.radar_run_id DESC
+            ), expanded AS (
+              SELECT base.*,
+                     REGEXP_REPLACE(
+                       LOWER(strategy_value.value),
+                       '^v12_',
+                       ''
+                     ) AS strategy_key
+              FROM base
+              CROSS JOIN LATERAL JSONB_ARRAY_ELEMENTS_TEXT(
+                base.matched_strategies
+              ) AS strategy_value(value)
+            ), dedup AS (
+              SELECT DISTINCT ON (signal_date, symbol, strategy_key) expanded.*
+              FROM expanded
+              WHERE strategy_key <> ''
+              ORDER BY signal_date, symbol, strategy_key,
+                       total_score DESC NULLS LAST,
+                       radar_run_id DESC
             )
-            SELECT LOWER(strategy) AS strategy,
+            SELECT strategy_key AS strategy,
                    COUNT(return_d5) AS samples_d5,
                    COUNT(return_d10) AS samples_d10,
                    AVG(return_d5) AS avg_d5,
@@ -1184,8 +1705,10 @@ async def execution_strategy_priors(
                             WHEN return_d5 > 0 THEN 1.0 ELSE 0.0 END)*100
                      AS win_d5
             FROM dedup
-            WHERE execution_status IN ('FILLED','EXITED')
-            GROUP BY LOWER(strategy)
+            WHERE execution_status IN (
+              'FILLED','FILLED_PENDING_EXIT','EXITED'
+            )
+            GROUP BY strategy_key
             """,
             *prior_args,
         )
@@ -1447,6 +1970,7 @@ async def weekly_performance_report(
               s.name,
               c.rank,
               c.total_score,
+              c.snapshot,
               p.entry_date,
               p.entry_close,
               p.return_d1,

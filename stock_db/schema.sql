@@ -150,7 +150,9 @@ ALTER TABLE signal_execution_performance
     ADD COLUMN IF NOT EXISTS action_code VARCHAR(40),
     ADD COLUMN IF NOT EXISTS market_regime VARCHAR(24),
     ADD COLUMN IF NOT EXISTS industry VARCHAR(80),
-    ADD COLUMN IF NOT EXISTS factor_confidence NUMERIC(10,4);
+    ADD COLUMN IF NOT EXISTS factor_confidence NUMERIC(10,4),
+    ADD COLUMN IF NOT EXISTS exit_ledger JSONB NOT NULL DEFAULT '[]'::JSONB,
+    ADD COLUMN IF NOT EXISTS profit_management JSONB NOT NULL DEFAULT '{}'::JSONB;
 
 CREATE TABLE IF NOT EXISTS database_jobs (
     id BIGSERIAL PRIMARY KEY,

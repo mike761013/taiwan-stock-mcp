@@ -204,7 +204,13 @@ class V12Config:
     market_weak_breadth_pct: float = 45.0
     market_strong_breadth_pct: float = 60.0
     market_weak_score_penalty: float = 4.0
-    market_weak_breakout_min_quality: float = 75.0
+    market_weak_risk_strategy_penalty: float = 4.0
+    market_weak_early_strategy_penalty: float = 2.0
+    market_weak_breakout_min_quality: float = 80.0
+    market_weak_reversal_min_quality: float = 78.0
+    market_weak_early_min_quality: float = 72.0
+    market_weak_leader_relative_breadth_pct: float = 15.0
+    market_weak_early_relative_breadth_pct: float = 0.0
     sector_relative_breadth_threshold_pct: float = 15.0
     sector_strong_score_bonus: float = 2.0
     sector_weak_score_penalty: float = 3.0
@@ -1538,11 +1544,25 @@ def apply_market_context(
         if isinstance(industries, Mapping) and industry
         else None
     )
+    strategy = str(item.get("strategy") or "").strip().lower()
+    risky_weak_strategies = {
+        "breakout",
+        "reversal_reclaim",
+        "reversal_continuation",
+    }
 
     if regime == "WEAK":
         adjustment -= config.market_weak_score_penalty
         warnings.append("整體市場寬度偏弱，後勢分數保守扣分")
+        if strategy in risky_weak_strategies:
+            adjustment -= config.market_weak_risk_strategy_penalty
+            warnings.append("弱勢盤中的突破／反轉型態另加風險折扣")
+        elif strategy == "early_stage":
+            adjustment -= config.market_weak_early_strategy_penalty
+            warnings.append("弱勢盤中的多頭初升段另加風險折扣")
 
+    relative: float | None = None
+    median_change: float | None = None
     if isinstance(sector, Mapping):
         relative = _number(sector, "relativeBreadthPercent")
         median_change = _number(sector, "medianFiveDayChangePercent")
@@ -1555,16 +1575,67 @@ def apply_market_context(
             warnings.append("所屬產業廣度明顯落後市場")
 
     qualification = dict(item.get("forwardQualification") or {})
-    if (
-        regime == "WEAK"
-        and str(item.get("strategy") or "") == "breakout"
-        and _number(item, "predictive_quality_score")
-        < config.market_weak_breakout_min_quality
-    ):
-        qualification["qualified"] = False
-        failed = list(qualification.get("failedRules") or [])
-        failed.append("弱勢市場中的突破品質不足，只列觀察")
-        qualification["failedRules"] = failed
+    weak_market_gate: dict[str, Any] | None = None
+    if regime == "WEAK" and strategy in {
+        "breakout",
+        "reversal_reclaim",
+        "reversal_continuation",
+        "early_stage",
+    }:
+        quality = _number(item, "predictive_quality_score")
+        if strategy == "breakout":
+            minimum_quality = config.market_weak_breakout_min_quality
+            minimum_relative = (
+                config.market_weak_leader_relative_breadth_pct
+            )
+            label = "放量突破"
+        elif strategy in {"reversal_reclaim", "reversal_continuation"}:
+            minimum_quality = config.market_weak_reversal_min_quality
+            minimum_relative = (
+                config.market_weak_leader_relative_breadth_pct
+            )
+            label = "反轉型態"
+        else:
+            minimum_quality = config.market_weak_early_min_quality
+            minimum_relative = (
+                config.market_weak_early_relative_breadth_pct
+            )
+            label = "多頭初升段"
+        sector_supported = bool(
+            relative is not None
+            and median_change is not None
+            and relative >= minimum_relative
+            and median_change > 0
+        )
+        gate_passed = quality >= minimum_quality and sector_supported
+        weak_market_gate = {
+            "applied": True,
+            "passed": gate_passed,
+            "strategy": strategy,
+            "quality": round(quality, 2),
+            "minimumQuality": minimum_quality,
+            "sectorSupported": sector_supported,
+            "relativeBreadthPercent": (
+                round(relative, 2) if relative is not None else None
+            ),
+            "minimumRelativeBreadthPercent": minimum_relative,
+            "sectorMedianFiveDayChangePercent": (
+                round(median_change, 2)
+                if median_change is not None else None
+            ),
+        }
+        if not gate_passed:
+            qualification["qualified"] = False
+            failed = list(qualification.get("failedRules") or [])
+            failure_text = (
+                f"弱勢市場的{label}須同時達品質{minimum_quality:.0f}分"
+                f"及產業相對廣度{minimum_relative:+.0f}%，否則只列觀察"
+            )
+            if failure_text not in failed:
+                failed.append(failure_text)
+            qualification["failedRules"] = failed
+        else:
+            reasons.append(f"弱勢盤仍通過{label}的高品質強產業門檻")
 
     bullish_score = _clamp(_number(item, "bullish_score") + adjustment)
     execution_score = _clamp(_number(item, "execution_score") + adjustment)
@@ -1579,6 +1650,7 @@ def apply_market_context(
         "ma5AboveMA20Percent": context.get("ma5AboveMA20Percent"),
         "industry": industry or None,
         "industryContext": dict(sector) if isinstance(sector, Mapping) else None,
+        "weakMarketGate": weak_market_gate,
         "scoreAdjustment": round(adjustment, 2),
     }
     item.update(

@@ -154,7 +154,7 @@ class V12ForwardPersistenceTests(unittest.TestCase):
         }
         updated = apply_market_context(candidate, context, config)
         self.assertEqual(context["regime"], "WEAK")
-        self.assertEqual(updated["bullish_score"], 76.0)
+        self.assertEqual(updated["bullish_score"], 72.0)
         self.assertFalse(updated["forwardQualified"])
 
 

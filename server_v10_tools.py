@@ -533,7 +533,7 @@ def register_v10_tools(mcp: Any) -> None:
         limit: int = DEFAULT_PERFORMANCE_UPDATE_LIMIT,
         entry_window_sessions: int = 3,
     ) -> dict:
-        """依激進低接、確認買點、分批及收盤失敗條件更新真實可執行績效。"""
+        """更新雙買點、成本、分批停利、移動停損及失敗退出的可執行績效。"""
         return await update_signal_execution_performance(
             limit=limit,
             entry_window_sessions=entry_window_sessions,
@@ -631,7 +631,7 @@ def register_v10_tools(mcp: Any) -> None:
         accuracy_engine: str | None = None,
         factor_model_revision: str | None = V12_4_FACTOR_MODEL,
     ) -> dict:
-        """只統計可執行淨績效；預設隔離目前V12.4完整因子模型。"""
+        """查可執行淨績效；支援快照內所有命中策略及中文策略標籤。"""
         return await execution_performance_summary(
             strategy,
             accuracy_engine,
@@ -644,7 +644,7 @@ def register_v10_tools(mcp: Any) -> None:
         version: str = V12_VERSION,
         top_n: int = 10,
     ) -> dict:
-        """依日期與雷達版本產生週報，空值不計失敗且同日同股去重。"""
+        """產生分層週報；主績效只計正式進場，試單與觀察另列。"""
         return await weekly_performance_report(
             start_date=start_date,
             end_date=end_date,
@@ -668,7 +668,7 @@ def register_v10_tools(mcp: Any) -> None:
         limit_each: int = 5,
         minimum_score: float = 0,
     ) -> dict:
-        """單次快照驗證資料庫、V12四策略、合併雷達及寫入功能。"""
+        """單次快照驗證資料庫、V12六策略、合併雷達及寫入功能。"""
         return await validate_v12_release_core(limit_each, minimum_score)
 
     @mcp.tool()

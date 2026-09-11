@@ -20,6 +20,8 @@ def _row(
     d1=None,
     d3=None,
     d5=None,
+    action_code="BUY_ZONE",
+    forward_qualified=True,
 ):
     return {
         "radar_run_id": run_id,
@@ -37,6 +39,11 @@ def _row(
         "return_d20": None,
         "max_favorable_percent": 8,
         "max_adverse_percent": -4,
+        "snapshot": {
+            "actionCode": action_code,
+            "forwardQualified": forward_qualified,
+            "strategy": strategy,
+        },
     }
 
 
@@ -141,6 +148,61 @@ class WeeklyPerformanceReportTests(unittest.TestCase):
         self.assertEqual(d5["pending"], 1)
         self.assertEqual(d5["averagePercent"], 4.0)
         self.assertEqual(d5["winRatePercent"], 100.0)
+
+    def test_headline_excludes_probe_and_watch_candidates(self):
+        rows = [
+            _row(
+                run_id=1,
+                run_date=date(2026, 7, 31),
+                strategy="v12_pullback",
+                symbol="1111",
+                name="正式候選",
+                score=80,
+                d1=2,
+            ),
+            _row(
+                run_id=2,
+                run_date=date(2026, 7, 31),
+                strategy="v12_trend_support_probe",
+                symbol="2222",
+                name="試單候選",
+                score=78,
+                d1=-3,
+                action_code="PROBE_ENTRY",
+            ),
+            _row(
+                run_id=3,
+                run_date=date(2026, 7, 31),
+                strategy="v12_breakout",
+                symbol="3333",
+                name="觀察候選",
+                score=76,
+                d1=-4,
+                action_code="WAIT_PULLBACK",
+                forward_qualified=False,
+            ),
+        ]
+
+        report = build_weekly_report(
+            rows,
+            version="V12",
+            start_date=date(2026, 7, 27),
+            end_date=date(2026, 7, 31),
+        )
+
+        self.assertEqual(report["headlineBasis"], "FORMAL_ACTIONABLE_ONLY")
+        self.assertEqual(report["overall"]["signals"], 1)
+        self.assertEqual(report["overall"]["d1"]["averagePercent"], 2.0)
+        self.assertEqual(report["allCandidates"]["signals"], 3)
+        self.assertEqual(report["allCandidates"]["d1"]["averagePercent"], -1.6667)
+        tiers = {
+            item["actionTier"]: item["signals"]
+            for item in report["byActionTier"]
+        }
+        self.assertEqual(
+            tiers,
+            {"ACTIONABLE": 1, "PROBE": 1, "WATCH": 1, "UNCLASSIFIED": 0},
+        )
 
     def test_version_filter_targets_real_v12_strategy_names(self):
         clause = _version_where(_normalise_version("v12"))
