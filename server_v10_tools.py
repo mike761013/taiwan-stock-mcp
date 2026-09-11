@@ -17,6 +17,7 @@ from stock_db.performance import (
     DEFAULT_PERFORMANCE_UPDATE_LIMIT,
     execution_performance_summary,
     performance_summary,
+    repair_v12_radar_run_dates,
     update_signal_execution_performance,
     update_signal_performance,
     weekly_performance_report,
@@ -649,6 +650,17 @@ def register_v10_tools(mcp: Any) -> None:
             end_date=end_date,
             version=version,
             top_n=top_n,
+        )
+
+    @mcp.tool()
+    async def repair_v12_radar_dates(
+        target_trade_date: str,
+        apply: bool = False,
+    ) -> dict:
+        """修正延後補跑時誤用執行日的V12雷達日期；預設只預覽。"""
+        return await repair_v12_radar_run_dates(
+            target_trade_date=target_trade_date,
+            apply=apply,
         )
 
     @mcp.tool()

@@ -468,7 +468,11 @@ async def _save_v12_strategy(
     return await stock_database_service.save_radar_result(
         strategy=f"v12_{strategy}",
         candidates=candidates,
-        run_date=date.today(),
+        # A delayed close backfill must remain attached to the market session
+        # that produced the signal.  Using the wall-clock execution date here
+        # makes a 9/10 replay performed on 9/11 look like a 9/11 signal and
+        # shifts every performance horizon by one session.
+        run_date=latest_trade_date or date.today(),
         universe_count=universe_count,
         configuration={
             "minimumScore": minimum_score,
@@ -906,7 +910,7 @@ async def run_full_bullish_radar_v12(
         combined_record = await stock_database_service.save_radar_result(
             strategy="v12_combined",
             candidates=displayed_candidates,
-            run_date=date.today(),
+            run_date=latest_trade_date or date.today(),
             universe_count=universe_count,
             configuration={
                 "minimumScore": minimum_score,

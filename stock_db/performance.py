@@ -1484,3 +1484,78 @@ async def weekly_performance_report(
         if row["run_date"] is not None
     })
     return report
+
+
+async def repair_v12_radar_run_dates(
+    target_trade_date: str | date,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Repair delayed V12 radar runs saved under their execution date.
+
+    Only V12 rows whose immutable configuration explicitly names the requested
+    ``latestTradeDate`` are eligible.  Derived performance rows are removed in
+    the same transaction so the normal updater can rebuild them from the
+    corrected signal date.
+    """
+    parsed_target = _parse_date(target_trade_date, "target_trade_date")
+    if parsed_target is None:
+        raise ValueError("target_trade_date is required")
+
+    async with stock_database.acquire() as connection:
+        async with connection.transaction():
+            rows = await connection.fetch(
+                f"""
+                SELECT id, run_date, strategy, candidate_count
+                FROM radar_runs r
+                WHERE {_version_where("V12")}
+                  AND r.configuration->>'latestTradeDate'=$1
+                  AND r.run_date<>$2
+                ORDER BY id
+                FOR UPDATE
+                """,
+                parsed_target.isoformat(),
+                parsed_target,
+            )
+            run_ids = [int(row["id"]) for row in rows]
+            deleted_legacy = 0
+            deleted_execution = 0
+            if apply and run_ids:
+                execution_result = await connection.execute(
+                    """
+                    DELETE FROM signal_execution_performance
+                    WHERE radar_run_id=ANY($1::bigint[])
+                    """,
+                    run_ids,
+                )
+                legacy_result = await connection.execute(
+                    """
+                    DELETE FROM signal_performance
+                    WHERE radar_run_id=ANY($1::bigint[])
+                    """,
+                    run_ids,
+                )
+                await connection.execute(
+                    """
+                    UPDATE radar_runs
+                    SET run_date=$1
+                    WHERE id=ANY($2::bigint[])
+                    """,
+                    parsed_target,
+                    run_ids,
+                )
+                deleted_execution = int(execution_result.rsplit(" ", 1)[-1])
+                deleted_legacy = int(legacy_result.rsplit(" ", 1)[-1])
+
+    return {
+        "ok": True,
+        "applied": bool(apply),
+        "targetTradeDate": parsed_target.isoformat(),
+        "matchedRunCount": len(run_ids),
+        "runIds": run_ids,
+        "previousRunDates": sorted({
+            _as_iso_date(row["run_date"]) for row in rows
+        }),
+        "deletedLegacyPerformanceRows": deleted_legacy,
+        "deletedExecutionPerformanceRows": deleted_execution,
+        "requiresPerformanceRebuild": bool(apply and run_ids),
+    }

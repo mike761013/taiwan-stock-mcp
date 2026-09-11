@@ -1,4 +1,5 @@
 import asyncio
+from datetime import date
 
 from stock_db import radar
 from stock_db.v12 import (
@@ -275,6 +276,36 @@ def test_full_v12_radar_initialises_high_price_rejection_tracking(
     assert result["ok"] is True
     assert result["candidateCount"] == 0
     assert result["excludedHighPriceCount"] == 0
+
+
+def test_v12_strategy_save_uses_market_trade_date(monkeypatch):
+    captured = {}
+
+    async def fake_save_radar_result(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        radar.stock_database_service,
+        "save_radar_result",
+        fake_save_radar_result,
+    )
+    trade_date = date(2026, 9, 10)
+
+    asyncio.run(
+        radar._save_v12_strategy(
+            "pullback",
+            [],
+            1941,
+            trade_date,
+            45,
+            20,
+            radar.load_v12_config(),
+            {},
+        )
+    )
+
+    assert captured["run_date"] == trade_date
 
 
 def test_formal_actionable_candidate_beats_higher_scoring_probe_duplicate():
