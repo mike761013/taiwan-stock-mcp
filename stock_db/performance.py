@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
@@ -21,6 +22,7 @@ _HORIZONS = (
     ("d20", "return_d20"),
 )
 _ALLOWED_REPORT_VERSIONS = {"V12", "V11", "ALL"}
+_REPORT_VERSION_ALIASES = {"V12.4": "V12"}
 _V12_ONLY_STRATEGY_ALIASES = {
     "reversal_reclaim": "v12_reversal_reclaim",
 }
@@ -90,6 +92,8 @@ TRAILING_DISTANCE_R = max(
     float(os.getenv("V12_TRAILING_DISTANCE_R", "1.0")),
 )
 EXECUTION_MODEL_REVISION = "V12.4-NET-EXECUTION-2"
+_execution_schema_ready = False
+_execution_schema_lock = asyncio.Lock()
 
 _EXECUTION_TERMINAL_STATUSES = {"NO_TRADE", "CANCELLED", "EXITED"}
 _EXECUTION_FILLED_STATUSES = {
@@ -183,8 +187,11 @@ def _parse_date(value: str | date | None, field_name: str) -> date | None:
 
 def _normalise_version(version: str | None) -> str:
     normalised = str(version or "V12").strip().upper()
+    normalised = _REPORT_VERSION_ALIASES.get(normalised, normalised)
     if normalised not in _ALLOWED_REPORT_VERSIONS:
-        allowed = ", ".join(sorted(_ALLOWED_REPORT_VERSIONS))
+        allowed = ", ".join(
+            sorted(_ALLOWED_REPORT_VERSIONS | set(_REPORT_VERSION_ALIASES))
+        )
         raise ValueError(f"version 必須是 {allowed} 其中之一")
     return normalised
 
@@ -1227,7 +1234,14 @@ def simulate_signal_execution(
 
 
 async def _ensure_execution_schema(connection: Any) -> None:
-    await connection.execute(_EXECUTION_TABLE_SQL)
+    global _execution_schema_ready
+    if _execution_schema_ready:
+        return
+    async with _execution_schema_lock:
+        if _execution_schema_ready:
+            return
+        await connection.execute(_EXECUTION_TABLE_SQL)
+        _execution_schema_ready = True
 
 
 async def update_signal_execution_performance(

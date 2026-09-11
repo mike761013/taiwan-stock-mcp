@@ -209,6 +209,9 @@ class WeeklyPerformanceReportTests(unittest.TestCase):
         self.assertIn("v12_", clause)
         self.assertIn("postgres-v12", clause)
 
+    def test_public_v12_4_label_maps_to_v12_report_family(self):
+        self.assertEqual(_normalise_version("V12.4"), "V12")
+
     def test_date_validation_uses_iso_format(self):
         self.assertEqual(
             _parse_date("2026-07-31", "start_date"),
