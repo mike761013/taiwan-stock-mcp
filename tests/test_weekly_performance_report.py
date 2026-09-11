@@ -22,8 +22,9 @@ def _row(
     d5=None,
     action_code="BUY_ZONE",
     forward_qualified=True,
+    matched_strategies=None,
 ):
-    return {
+    row = {
         "radar_run_id": run_id,
         "run_date": run_date,
         "strategy": strategy,
@@ -45,6 +46,9 @@ def _row(
             "strategy": strategy,
         },
     }
+    if matched_strategies is not None:
+        row["snapshot"]["strategies"] = matched_strategies
+    return row
 
 
 class WeeklyPerformanceReportTests(unittest.TestCase):
@@ -203,6 +207,57 @@ class WeeklyPerformanceReportTests(unittest.TestCase):
             tiers,
             {"ACTIONABLE": 1, "PROBE": 1, "WATCH": 1, "UNCLASSIFIED": 0},
         )
+
+    def test_complete_factor_combined_decision_overrides_prefilter_buy(self):
+        rows = [
+            _row(
+                run_id=1,
+                run_date=date(2026, 7, 31),
+                strategy="v12_breakout",
+                symbol="1111",
+                name="測試股",
+                score=90,
+                d1=-2,
+            ),
+            _row(
+                run_id=2,
+                run_date=date(2026, 7, 31),
+                strategy="v12_combined",
+                symbol="1111",
+                name="測試股",
+                score=75,
+                d1=-2,
+                action_code="WAIT_PULLBACK",
+                forward_qualified=False,
+                matched_strategies=["breakout"],
+            ),
+        ]
+
+        report = build_weekly_report(
+            rows,
+            version="V12.4",
+            start_date=date(2026, 7, 27),
+            end_date=date(2026, 7, 31),
+        )
+
+        self.assertEqual(report["version"], "V12.4")
+        self.assertEqual(report["overall"]["signals"], 0)
+        self.assertEqual(report["allCandidates"]["signals"], 1)
+        tiers = {
+            item["actionTier"]: item["signals"]
+            for item in report["byActionTier"]
+        }
+        self.assertEqual(tiers["WATCH"], 1)
+        breakout = next(
+            item for item in report["byStrategy"]
+            if item["strategy"] == "breakout"
+        )
+        breakout_tiers = {
+            item["actionTier"]: item["signals"]
+            for item in breakout["byActionTier"]
+        }
+        self.assertEqual(breakout_tiers["ACTIONABLE"], 0)
+        self.assertEqual(breakout_tiers["WATCH"], 1)
 
     def test_version_filter_targets_real_v12_strategy_names(self):
         clause = _version_where(_normalise_version("v12"))

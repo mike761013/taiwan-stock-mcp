@@ -451,18 +451,53 @@ def build_weekly_report(
         strategies_by_signal[(run_date, symbol)].add(strategy)
 
     overall_dedup: dict[tuple[str, str], Mapping[str, Any]] = {}
-    strategy_groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    combined_dedup: dict[tuple[str, str], Mapping[str, Any]] = {}
     for (run_date, symbol, strategy), row in strategy_dedup.items():
-        strategy_groups[strategy].append(row)
         overall_key = (run_date, symbol)
         overall_dedup[overall_key] = _prefer_row(
             overall_dedup.get(overall_key), row
         )
+        if strategy == "combined":
+            current = combined_dedup.get(overall_key)
+            if (
+                current is None
+                or int(row.get("radar_run_id") or 0)
+                > int(current.get("radar_run_id") or 0)
+            ):
+                combined_dedup[overall_key] = row
+
+    # The combined row has passed complete-factor enrichment and is therefore
+    # authoritative over the earlier per-strategy prefilter saved by the same
+    # full-radar run.  Without this override a preliminary BUY_ZONE can replace
+    # a final WATCH decision merely because it has the more optimistic tier.
+    overall_dedup.update(combined_dedup)
 
     unique_rows: list[dict[str, Any]] = []
     for key, selected in overall_dedup.items():
         item = dict(selected)
-        item["strategies"] = sorted(strategies_by_signal[key])
+        snapshot = _mapping(item.get("snapshot"))
+        explicit_strategies = snapshot.get("strategies")
+        if (
+            isinstance(explicit_strategies, Sequence)
+            and not isinstance(explicit_strategies, (str, bytes))
+            and explicit_strategies
+        ):
+            strategies = _snapshot_strategies(snapshot)
+        else:
+            strategies = sorted(
+                strategy
+                for strategy in strategies_by_signal[key]
+                if strategy != "combined"
+            )
+        if not strategies:
+            strategies = [
+                _normalise_strategy(item.get("normalised_strategy"))
+            ]
+        item["strategies"] = sorted({
+            strategy for strategy in strategies
+            if strategy and strategy not in {"combined", "unknown"}
+        }) or ["combined"]
+        item["has_combined_snapshot"] = key in combined_dedup
         unique_rows.append(item)
     unique_rows.sort(
         key=lambda row: (
@@ -470,6 +505,13 @@ def build_weekly_report(
             str(row.get("symbol") or ""),
         )
     )
+
+    strategy_groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in unique_rows:
+        for strategy in row.get("strategies") or []:
+            strategy_groups[str(strategy)].append(row)
+        if row.get("has_combined_snapshot"):
+            strategy_groups["combined"].append(row)
 
     by_strategy = []
     for strategy in sorted(strategy_groups):
@@ -1925,7 +1967,13 @@ async def weekly_performance_report(
     top_n: int = 10,
 ) -> dict[str, Any]:
     """Return a date-scoped, version-filtered radar performance report."""
-    normalised_version = _normalise_version(version)
+    requested_version = str(version or "V12").strip().upper()
+    normalised_version = _normalise_version(requested_version)
+    display_version = (
+        requested_version
+        if requested_version in _REPORT_VERSION_ALIASES
+        else normalised_version
+    )
     parsed_start = _parse_date(start_date, "start_date")
     parsed_end = _parse_date(end_date, "end_date")
     top_n = max(1, min(int(top_n), 20))
@@ -1944,7 +1992,7 @@ async def weekly_performance_report(
         if latest_run_date is None:
             return {
                 "ok": True,
-                "version": normalised_version,
+                "version": display_version,
                 "dateRange": None,
                 "latestMarketDate": _as_iso_date(latest_market_date),
                 "radarRuns": 0,
@@ -2009,7 +2057,7 @@ async def weekly_performance_report(
 
     report = build_weekly_report(
         rows,
-        version=normalised_version,
+        version=display_version,
         start_date=parsed_start,
         end_date=parsed_end,
         top_n=top_n,
