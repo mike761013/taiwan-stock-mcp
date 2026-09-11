@@ -177,6 +177,8 @@ def test_execution_takes_profit_in_stages_then_uses_next_day_trailing_stop():
 
     assert result["execution_status"] == "EXITED"
     assert result["exit_reason"] == "PARTIAL_PROFIT_TRAILING_STOP"
+    assert result["exit_date"] == date(2026, 8, 8)
+    assert result["exit_ledger"][-1]["date"] == "2026-08-08"
     assert [item["reason"] for item in result["exit_ledger"]] == [
         "TAKE_PROFIT_1",
         "TAKE_PROFIT_2",

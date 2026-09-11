@@ -1141,7 +1141,10 @@ def simulate_signal_execution(
             round(cost / planned_position * 100, 4)
             if planned_position > 0 else 0.0
         ),
-        exit_date=last_exit.get("date") if last_exit else None,
+        exit_date=(
+            ordered[int(last_exit["index"])].get("trade_date")
+            if last_exit else None
+        ),
         exit_price=(
             round(average_exit_price, 4)
             if average_exit_price is not None else None
