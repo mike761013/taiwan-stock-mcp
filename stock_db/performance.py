@@ -1723,6 +1723,11 @@ async def simulated_open_positions(
             WITH dedup AS (
               SELECT DISTINCT ON (e.signal_date, e.symbol)
                 e.*, c.total_score, s.name,
+                (
+                  SELECT MAX(d.trade_date)
+                  FROM daily_bars d
+                  WHERE d.symbol=e.symbol
+                ) AS latest_symbol_date,
                 COALESCE(
                   NULLIF(
                     e.profit_management->>'remainingShareRatio', ''
@@ -1753,10 +1758,25 @@ async def simulated_open_positions(
             *args,
         )
 
+    current_rows = []
+    stale_rows = []
+    for record in rows:
+        stored_row = dict(record)
+        evaluated = stored_row.get("evaluated_through")
+        latest_symbol_date = stored_row.get("latest_symbol_date")
+        if (
+            isinstance(evaluated, date)
+            and isinstance(latest_symbol_date, date)
+            and evaluated >= latest_symbol_date
+        ):
+            current_rows.append(stored_row)
+        else:
+            stale_rows.append(stored_row)
+
     grouped: dict[str, dict[str, Any]] = {}
     latest_evaluated: date | None = None
     pending_exit_lots = 0
-    for record in rows:
+    for record in current_rows:
         row = dict(record)
         symbol = str(row.get("symbol") or "")
         remaining_ratio = _as_float(row.get("remaining_share_ratio")) or 0.0
@@ -1855,12 +1875,27 @@ async def simulated_open_positions(
         "factorModelRevision": requested_factor_model or None,
         "evaluatedThrough": _as_iso_date(latest_evaluated),
         "rawOpenRecords": int(raw_open_records or 0),
-        "openLots": len(rows),
+        "deduplicatedStoredOpenLots": len(rows),
+        "openLots": len(current_rows),
         "distinctStocks": len(positions),
         "pendingExitLots": pending_exit_lots,
+        "staleOpenLots": len(stale_rows),
+        "staleLots": [
+            {
+                "symbol": str(row.get("symbol") or ""),
+                "name": str(row.get("name") or ""),
+                "signalDate": _as_iso_date(row.get("signal_date")),
+                "entryDate": _as_iso_date(row.get("entry_date")),
+                "status": str(row.get("execution_status") or ""),
+                "evaluatedThrough": _as_iso_date(row.get("evaluated_through")),
+                "latestSymbolDate": _as_iso_date(row.get("latest_symbol_date")),
+            }
+            for row in stale_rows
+        ],
         "positions": positions,
         "notes": [
             "同一訊號日與股票只保留總分最高的一筆，避免重複雷達膨脹庫存。",
+            "只有評估日至少涵蓋該股票最新日K的批次才列為目前模擬庫存；過期未更新批次另列staleLots。",
             "不同訊號日視為獨立模擬批次；模型未設定固定本金，因此部位以百分比呈現，不換算張數。",
             "成本已另列國泰電子下單買進手續費後成本；尚未完全退出的分批停利批次只計剩餘部位。",
         ],

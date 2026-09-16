@@ -575,6 +575,7 @@ def test_simulated_open_positions_deduplicates_and_groups_lots(monkeypatch):
                         "trailingStop": {"lastLevel": 1010, "active": True},
                     },
                     "evaluated_through": date(2026, 9, 16),
+                    "latest_symbol_date": date(2026, 9, 16),
                 },
                 {
                     "symbol": "2330",
@@ -594,6 +595,7 @@ def test_simulated_open_positions_deduplicates_and_groups_lots(monkeypatch):
                     "confirmation_fill_percent": Decimal("60"),
                     "profit_management": {},
                     "evaluated_through": date(2026, 9, 16),
+                    "latest_symbol_date": date(2026, 9, 16),
                 },
             ]
 
@@ -626,9 +628,11 @@ def test_simulated_open_positions_deduplicates_and_groups_lots(monkeypatch):
     assert connection.fetchval_call[1] == (performance.EXECUTION_MODEL_REVISION,)
     assert "DISTINCT ON (e.signal_date, e.symbol)" in connection.fetch_call[0]
     assert result["rawOpenRecords"] == 3
+    assert result["deduplicatedStoredOpenLots"] == 2
     assert result["openLots"] == 2
     assert result["distinctStocks"] == 1
     assert result["pendingExitLots"] == 1
+    assert result["staleOpenLots"] == 0
     assert result["evaluatedThrough"] == "2026-09-16"
     position = result["positions"][0]
     assert position["lotCount"] == 2
