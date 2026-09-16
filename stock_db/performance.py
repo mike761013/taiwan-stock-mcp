@@ -1723,11 +1723,8 @@ async def simulated_open_positions(
             WITH dedup AS (
               SELECT DISTINCT ON (e.signal_date, e.symbol)
                 e.*, c.total_score, s.name,
-                (
-                  SELECT MAX(d.trade_date)
-                  FROM daily_bars d
-                  WHERE d.symbol=e.symbol
-                ) AS latest_symbol_date,
+                latest_bar.trade_date AS latest_symbol_date,
+                latest_bar.close AS latest_close,
                 COALESCE(
                   NULLIF(
                     e.profit_management->>'remainingShareRatio', ''
@@ -1743,6 +1740,13 @@ async def simulated_open_positions(
               JOIN radar_candidates c
                 ON c.radar_run_id=e.radar_run_id AND c.symbol=e.symbol
               JOIN securities s ON s.symbol=e.symbol
+              LEFT JOIN LATERAL (
+                SELECT d.trade_date, d.close
+                FROM daily_bars d
+                WHERE d.symbol=e.symbol
+                ORDER BY d.trade_date DESC
+                LIMIT 1
+              ) latest_bar ON TRUE
               WHERE e.execution_model_revision=$1
                 {factor_condition}
               ORDER BY e.signal_date, e.symbol,
@@ -1842,6 +1846,10 @@ async def simulated_open_positions(
             {
                 "symbol": symbol,
                 "name": str(row.get("name") or ""),
+                "latestTradeDate": _as_iso_date(
+                    row.get("latest_symbol_date")
+                ),
+                "latestClose": _as_float(row.get("latest_close")),
                 "lots": [],
                 "remainingModelPositionPercent": 0.0,
                 "_remainingCapital": 0.0,
@@ -1862,9 +1870,34 @@ async def simulated_open_positions(
         stock["remainingModelPositionPercent"] = round(
             float(stock["remainingModelPositionPercent"]), 4
         )
-        stock["weightedEntryCostWithBuyFee"] = (
+        weighted_cost = (
             round(remaining_capital / remaining_shares, 4)
             if remaining_shares > 0
+            else None
+        )
+        stock["weightedEntryCostWithBuyFee"] = weighted_cost
+        latest_close = _as_float(stock.get("latestClose"))
+        stock["latestClose"] = (
+            round(latest_close, 4) if latest_close is not None else None
+        )
+        stock["priceVsCostPercent"] = (
+            round((latest_close / weighted_cost - 1) * 100, 2)
+            if latest_close is not None and weighted_cost
+            else None
+        )
+        stock["estimatedNetReturnIfSoldPercent"] = (
+            round(
+                (
+                    latest_close
+                    * (1 - EXIT_SLIPPAGE_BPS / 10_000)
+                    * SELL_PROCEEDS_FACTOR
+                    / weighted_cost
+                    - 1
+                )
+                * 100,
+                2,
+            )
+            if latest_close is not None and weighted_cost
             else None
         )
         positions.append(stock)
@@ -1898,6 +1931,7 @@ async def simulated_open_positions(
             "只有評估日至少涵蓋該股票最新日K的批次才列為目前模擬庫存；過期未更新批次另列staleLots。",
             "不同訊號日視為獨立模擬批次；模型未設定固定本金，因此部位以百分比呈現，不換算張數。",
             "成本已另列國泰電子下單買進手續費後成本；尚未完全退出的分批停利批次只計剩餘部位。",
+            "收盤損益另列未扣賣出成本的價差，以及依國泰賣出成本與5bps滑價估算的立即賣出淨報酬。",
         ],
     }
 

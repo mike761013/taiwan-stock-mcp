@@ -576,6 +576,7 @@ def test_simulated_open_positions_deduplicates_and_groups_lots(monkeypatch):
                     },
                     "evaluated_through": date(2026, 9, 16),
                     "latest_symbol_date": date(2026, 9, 16),
+                    "latest_close": Decimal("1100"),
                 },
                 {
                     "symbol": "2330",
@@ -596,6 +597,7 @@ def test_simulated_open_positions_deduplicates_and_groups_lots(monkeypatch):
                     "profit_management": {},
                     "evaluated_through": date(2026, 9, 16),
                     "latest_symbol_date": date(2026, 9, 16),
+                    "latest_close": Decimal("1100"),
                 },
             ]
 
@@ -627,6 +629,7 @@ def test_simulated_open_positions_deduplicates_and_groups_lots(monkeypatch):
 
     assert connection.fetchval_call[1] == (performance.EXECUTION_MODEL_REVISION,)
     assert "DISTINCT ON (e.signal_date, e.symbol)" in connection.fetch_call[0]
+    assert "LEFT JOIN LATERAL" in connection.fetch_call[0]
     assert result["rawOpenRecords"] == 3
     assert result["deduplicatedStoredOpenLots"] == 2
     assert result["openLots"] == 2
@@ -637,6 +640,10 @@ def test_simulated_open_positions_deduplicates_and_groups_lots(monkeypatch):
     position = result["positions"][0]
     assert position["lotCount"] == 2
     assert position["remainingModelPositionPercent"] == 80.0
+    assert position["latestTradeDate"] == "2026-09-16"
+    assert position["latestClose"] == 1100.0
+    assert position["priceVsCostPercent"] == 8.34
+    assert position["estimatedNetReturnIfSoldPercent"] == 7.92
     assert position["lots"][0]["remainingShareRatioPercent"] == 50.0
     assert position["lots"][0]["remainingModelPositionPercent"] == 20.0
     assert position["lots"][0]["entryCostWithBuyFee"] == 1000.399
