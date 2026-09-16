@@ -1679,6 +1679,194 @@ async def execution_performance_summary(
     }
 
 
+async def simulated_open_positions(
+    factor_model_revision: str | None = None,
+) -> dict[str, Any]:
+    """Return deduplicated V12 simulated lots that still have exposure.
+
+    Execution rows are deduplicated with the same signal-date/symbol rule used
+    by :func:`execution_performance_summary`.  Different signal dates remain
+    separate lots because the execution backtest evaluates them independently.
+    Position values are model percentages; the simulator has no fixed capital
+    base and therefore cannot truthfully manufacture share or lot counts.
+    """
+    requested_factor_model = str(factor_model_revision or "").strip()
+    args: list[Any] = [EXECUTION_MODEL_REVISION]
+    factor_condition = ""
+    if requested_factor_model:
+        args.append(requested_factor_model)
+        factor_condition = (
+            "AND COALESCE(NULLIF(e.factor_model_revision, ''), "
+            "c.snapshot->>'factorModelRevision', '')=$2"
+        )
+
+    async with stock_database.acquire() as connection:
+        await _ensure_execution_schema(connection)
+        raw_open_records = await connection.fetchval(
+            f"""
+            SELECT COUNT(*)
+            FROM signal_execution_performance e
+            JOIN radar_candidates c
+              ON c.radar_run_id=e.radar_run_id AND c.symbol=e.symbol
+            WHERE e.execution_model_revision=$1
+              {factor_condition}
+              AND e.execution_status IN ('FILLED','FILLED_PENDING_EXIT')
+              AND COALESCE(
+                NULLIF(e.profit_management->>'remainingShareRatio','')::numeric,
+                1
+              ) > 0
+            """,
+            *args,
+        )
+        rows = await connection.fetch(
+            f"""
+            WITH dedup AS (
+              SELECT DISTINCT ON (e.signal_date, e.symbol)
+                e.*, c.total_score, s.name,
+                COALESCE(
+                  NULLIF(
+                    e.profit_management->>'remainingShareRatio', ''
+                  )::numeric,
+                  CASE
+                    WHEN e.execution_status IN (
+                      'FILLED','FILLED_PENDING_EXIT'
+                    ) THEN 1
+                    ELSE 0
+                  END
+                ) AS remaining_share_ratio
+              FROM signal_execution_performance e
+              JOIN radar_candidates c
+                ON c.radar_run_id=e.radar_run_id AND c.symbol=e.symbol
+              JOIN securities s ON s.symbol=e.symbol
+              WHERE e.execution_model_revision=$1
+                {factor_condition}
+              ORDER BY e.signal_date, e.symbol,
+                       c.total_score DESC NULLS LAST,
+                       e.radar_run_id DESC
+            )
+            SELECT *
+            FROM dedup
+            WHERE execution_status IN ('FILLED','FILLED_PENDING_EXIT')
+              AND remaining_share_ratio > 0
+            ORDER BY symbol, signal_date, entry_date
+            """,
+            *args,
+        )
+
+    grouped: dict[str, dict[str, Any]] = {}
+    latest_evaluated: date | None = None
+    pending_exit_lots = 0
+    for record in rows:
+        row = dict(record)
+        symbol = str(row.get("symbol") or "")
+        remaining_ratio = _as_float(row.get("remaining_share_ratio")) or 0.0
+        filled_position = _as_float(row.get("filled_position_percent")) or 0.0
+        remaining_position = filled_position * remaining_ratio
+        entry_price = _as_float(row.get("weighted_entry_price"))
+        entry_cost = entry_price * BUY_COST_FACTOR if entry_price else None
+        status = str(row.get("execution_status") or "")
+        if status == "FILLED_PENDING_EXIT":
+            pending_exit_lots += 1
+
+        evaluated = row.get("evaluated_through")
+        if isinstance(evaluated, date):
+            latest_evaluated = max(latest_evaluated or evaluated, evaluated)
+
+        profit_management = _mapping(row.get("profit_management"))
+        target1 = _mapping(profit_management.get("target1"))
+        target2 = _mapping(profit_management.get("target2"))
+        trailing = _mapping(profit_management.get("trailingStop"))
+        lot = {
+            "signalDate": _as_iso_date(row.get("signal_date")),
+            "entryDate": _as_iso_date(row.get("entry_date")),
+            "status": status,
+            "statusReason": row.get("status_reason"),
+            "entryPrice": round(entry_price, 4) if entry_price else None,
+            "entryCostWithBuyFee": (
+                round(entry_cost, 4) if entry_cost else None
+            ),
+            "filledPositionPercent": round(filled_position, 4),
+            "remainingShareRatioPercent": round(remaining_ratio * 100, 2),
+            "remainingModelPositionPercent": round(remaining_position, 4),
+            "aggressiveFill": {
+                "date": _as_iso_date(row.get("aggressive_fill_date")),
+                "price": _as_float(row.get("aggressive_fill_price")),
+                "positionPercent": _as_float(
+                    row.get("aggressive_fill_percent")
+                ) or 0.0,
+            },
+            "confirmationFill": {
+                "date": _as_iso_date(row.get("confirmation_fill_date")),
+                "price": _as_float(row.get("confirmation_fill_price")),
+                "positionPercent": _as_float(
+                    row.get("confirmation_fill_percent")
+                ) or 0.0,
+            },
+            "failurePrice": _as_float(profit_management.get("failurePrice")),
+            "target1": {
+                "price": _as_float(target1.get("price")),
+                "hit": bool(target1.get("hit")),
+            },
+            "target2": {
+                "price": _as_float(target2.get("price")),
+                "hit": bool(target2.get("hit")),
+            },
+            "trailingStop": {
+                "level": _as_float(trailing.get("lastLevel")),
+                "active": bool(trailing.get("active")),
+            },
+            "evaluatedThrough": _as_iso_date(evaluated),
+        }
+        stock = grouped.setdefault(
+            symbol,
+            {
+                "symbol": symbol,
+                "name": str(row.get("name") or ""),
+                "lots": [],
+                "remainingModelPositionPercent": 0.0,
+                "_remainingCapital": 0.0,
+                "_remainingShares": 0.0,
+            },
+        )
+        stock["lots"].append(lot)
+        stock["remainingModelPositionPercent"] += remaining_position
+        if entry_cost and entry_cost > 0:
+            stock["_remainingCapital"] += remaining_position
+            stock["_remainingShares"] += remaining_position / entry_cost
+
+    positions: list[dict[str, Any]] = []
+    for stock in grouped.values():
+        remaining_shares = float(stock.pop("_remainingShares"))
+        remaining_capital = float(stock.pop("_remainingCapital"))
+        stock["lotCount"] = len(stock["lots"])
+        stock["remainingModelPositionPercent"] = round(
+            float(stock["remainingModelPositionPercent"]), 4
+        )
+        stock["weightedEntryCostWithBuyFee"] = (
+            round(remaining_capital / remaining_shares, 4)
+            if remaining_shares > 0
+            else None
+        )
+        positions.append(stock)
+
+    return {
+        "ok": True,
+        "executionModelRevision": EXECUTION_MODEL_REVISION,
+        "factorModelRevision": requested_factor_model or None,
+        "evaluatedThrough": _as_iso_date(latest_evaluated),
+        "rawOpenRecords": int(raw_open_records or 0),
+        "openLots": len(rows),
+        "distinctStocks": len(positions),
+        "pendingExitLots": pending_exit_lots,
+        "positions": positions,
+        "notes": [
+            "同一訊號日與股票只保留總分最高的一筆，避免重複雷達膨脹庫存。",
+            "不同訊號日視為獨立模擬批次；模型未設定固定本金，因此部位以百分比呈現，不換算張數。",
+            "成本已另列國泰電子下單買進手續費後成本；尚未完全退出的分批停利批次只計剩餘部位。",
+        ],
+    }
+
+
 async def execution_strategy_priors(
     minimum_samples: int = 30,
     full_confidence_samples: int = 120,

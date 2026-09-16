@@ -18,6 +18,7 @@ from stock_db.performance import (
     execution_performance_summary,
     performance_summary,
     repair_v12_radar_run_dates,
+    simulated_open_positions,
     update_signal_execution_performance,
     update_signal_performance,
     weekly_performance_report,
@@ -637,6 +638,14 @@ def register_v10_tools(mcp: Any) -> None:
             accuracy_engine,
             factor_model_revision,
         )
+
+    @mcp.tool()
+    async def get_v12_simulated_positions(
+        factor_model_revision: str | None = None,
+    ) -> dict:
+        """查詢仍持有的V12模擬庫存、去重批次、成本與剩餘部位。"""
+        return await simulated_open_positions(factor_model_revision)
+
     @mcp.tool()
     async def get_radar_weekly_report(
         start_date: str | None = None,

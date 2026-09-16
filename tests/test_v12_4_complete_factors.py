@@ -1,5 +1,6 @@
 import asyncio
 from datetime import date, datetime
+from decimal import Decimal
 
 import pytest
 
@@ -536,3 +537,102 @@ def test_execution_summary_matches_every_strategy_in_combined_snapshot(monkeypat
     assert result["resolvedStrategy"] == "breakout"
     assert result["strategyLabel"] == "放量突破"
     assert result["summary"]["entry_rate_percent"] == 33.33
+
+
+def test_simulated_open_positions_deduplicates_and_groups_lots(monkeypatch):
+    class FakeConnection:
+        def __init__(self):
+            self.fetchval_call = None
+            self.fetch_call = None
+
+        async def fetchval(self, query, *args):
+            self.fetchval_call = (query, args)
+            return 3
+
+        async def fetch(self, query, *args):
+            self.fetch_call = (query, args)
+            return [
+                {
+                    "symbol": "2330",
+                    "name": "台積電",
+                    "signal_date": date(2026, 9, 10),
+                    "entry_date": date(2026, 9, 11),
+                    "execution_status": "FILLED",
+                    "status_reason": "已分批停利",
+                    "weighted_entry_price": Decimal("1000"),
+                    "filled_position_percent": Decimal("40"),
+                    "remaining_share_ratio": Decimal("0.5"),
+                    "aggressive_fill_date": date(2026, 9, 11),
+                    "aggressive_fill_price": Decimal("1000"),
+                    "aggressive_fill_percent": Decimal("40"),
+                    "confirmation_fill_date": None,
+                    "confirmation_fill_price": None,
+                    "confirmation_fill_percent": Decimal("0"),
+                    "profit_management": {
+                        "failurePrice": 970,
+                        "target1": {"price": 1030, "hit": True},
+                        "target2": {"price": 1060, "hit": False},
+                        "trailingStop": {"lastLevel": 1010, "active": True},
+                    },
+                    "evaluated_through": date(2026, 9, 16),
+                },
+                {
+                    "symbol": "2330",
+                    "name": "台積電",
+                    "signal_date": date(2026, 9, 12),
+                    "entry_date": date(2026, 9, 14),
+                    "execution_status": "FILLED_PENDING_EXIT",
+                    "status_reason": "等待隔日開盤退出",
+                    "weighted_entry_price": Decimal("1020"),
+                    "filled_position_percent": Decimal("60"),
+                    "remaining_share_ratio": Decimal("1"),
+                    "aggressive_fill_date": None,
+                    "aggressive_fill_price": None,
+                    "aggressive_fill_percent": Decimal("0"),
+                    "confirmation_fill_date": date(2026, 9, 14),
+                    "confirmation_fill_price": Decimal("1020"),
+                    "confirmation_fill_percent": Decimal("60"),
+                    "profit_management": {},
+                    "evaluated_through": date(2026, 9, 16),
+                },
+            ]
+
+    class Acquire:
+        def __init__(self, connection):
+            self.connection = connection
+
+        async def __aenter__(self):
+            return self.connection
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeDatabase:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def acquire(self):
+            return Acquire(self.connection)
+
+    async def schema_ready(connection):
+        return None
+
+    connection = FakeConnection()
+    monkeypatch.setattr(performance, "stock_database", FakeDatabase(connection))
+    monkeypatch.setattr(performance, "_ensure_execution_schema", schema_ready)
+
+    result = asyncio.run(performance.simulated_open_positions())
+
+    assert connection.fetchval_call[1] == (performance.EXECUTION_MODEL_REVISION,)
+    assert "DISTINCT ON (e.signal_date, e.symbol)" in connection.fetch_call[0]
+    assert result["rawOpenRecords"] == 3
+    assert result["openLots"] == 2
+    assert result["distinctStocks"] == 1
+    assert result["pendingExitLots"] == 1
+    assert result["evaluatedThrough"] == "2026-09-16"
+    position = result["positions"][0]
+    assert position["lotCount"] == 2
+    assert position["remainingModelPositionPercent"] == 80.0
+    assert position["lots"][0]["remainingShareRatioPercent"] == 50.0
+    assert position["lots"][0]["remainingModelPositionPercent"] == 20.0
+    assert position["lots"][0]["entryCostWithBuyFee"] == 1000.399
