@@ -1,0 +1,57 @@
+name: Record 6505 sale 2026-09-18
+
+on:
+  push:
+    branches:
+      - codex/record-6505-sale-20260918
+    paths:
+      - .github/workflows/record-6505-sale-20260918.yml
+
+permissions:
+  contents: read
+
+jobs:
+  record-sale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      STOCK_DB_ENABLED: "true"
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install database driver
+        run: python -m pip install "asyncpg>=0.29,<1"
+      - name: Record idempotent portfolio sale
+        shell: bash
+        run: |
+          python - <<'PY'
+          import asyncio
+          import json
+          from stock_db.portfolio import portfolio_ledger
+          from stock_db.connection import stock_database
+
+          async def main():
+              result = await portfolio_ledger.record_trade(
+                  symbol="6505",
+                  side="SELL",
+                  quantity=300,
+                  price=86.1,
+                  trade_date="2026-09-18",
+                  account_type="CASH",
+                  asset_type="STOCK",
+                  lot_type="REGULAR",
+                  tax_treatment="AUTO",
+                  client_reference="user-sale-6505-20260918-300-86.1",
+                  source="user_reported",
+                  notes="使用者於2026-09-18回報賣出台塑化300股，每股86.1元。",
+                  metadata={"reportedByUser": True, "recordedVia": "one_time_github_action"},
+              )
+              print(json.dumps(result, ensure_ascii=False, default=str))
+              await stock_database.close()
+
+          asyncio.run(main())
+          PY
