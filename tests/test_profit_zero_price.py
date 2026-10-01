@@ -68,7 +68,14 @@ def test_fully_sold_fifo_lots_in_same_cycle_still_contribute_profit():
     assert cycles[("3094", "MARGIN", "STOCK", "REGULAR")]["realizedNetPnl"] == 100
 
 
-def test_no_booked_profit_or_profit_protected_even_at_zero_is_explicit():
-    assert calculate_realized_profit_zero_price(400, Decimal("20000"), Decimal("0")) is None
+def test_no_booked_pnl_uses_normal_break_even_and_protected_profit_is_explicit():
+    assert calculate_realized_profit_zero_price(400, Decimal("20000"), Decimal("0")) == calculate_net_break_even_price(400, Decimal("20000"))
     assert calculate_realized_profit_zero_price(400, Decimal("20000"), Decimal("21000")) is None
     assert calculate_realized_profit_zero_price(400, Decimal("20000"), Decimal("20000")) == 0
+
+
+def test_realized_loss_raises_zero_price_and_is_recovered_after_costs():
+    cost, loss = Decimal("20000"), Decimal("-1000")
+    zero = calculate_realized_profit_zero_price(400, cost, loss)
+    assert zero > calculate_net_break_even_price(400, cost)
+    assert abs(zero * 400 * Decimal("0.996601") - cost + loss) < Decimal("1e-20")

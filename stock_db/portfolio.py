@@ -108,8 +108,8 @@ def calculate_realized_profit_zero_price(
     asset_type: str = "STOCK",
     account_type: str = "CASH",
 ) -> Decimal | None:
-    """Price where loss on the remainder consumes this cycle's booked profit."""
-    if realized_net_pnl <= 0 or cost_basis + accrued_interest < realized_net_pnl:
+    """Price where recorded cycle P/L plus the remaining position nets to zero."""
+    if cost_basis + accrued_interest < realized_net_pnl:
         return None
     return calculate_net_break_even_price(
         quantity, cost_basis - realized_net_pnl, accrued_interest,
@@ -1145,6 +1145,10 @@ class PortfolioLedger:
                 "cycleRealizedNetPnl": float(_money(realized_net_pnl)),
                 "cycleSoldQuantity": cycle.get("soldQuantity", 0),
                 "cycleStartDate": cycle.get("startDate"),
+                "totalPnlZeroPrice": (
+                    float(_money(realized_zero_price))
+                    if realized_zero_price is not None else None
+                ),
                 "realizedProfitZeroPrice": (
                     float(_money(realized_zero_price))
                     if realized_zero_price is not None else None
@@ -1221,9 +1225,10 @@ class PortfolioLedger:
                     "理論價格未按交易跳動單位調整。"
                 ),
                 "realizedProfitZeroBasis": (
-                    "本輪持股自最近一次清倉後重新買進起，累計已實現淨獲利"
+                    "本輪持股自最近一次清倉後重新買進起，累計已實現淨損益"
                     "扣抵剩餘FIFO含買費成本與融資利息，再計一般賣出費稅。"
-                    "無已實現淨獲利或即使股價為零仍保有獲利時，此欄為空。"
+                    "獲利降低歸零價，虧損提高歸零價；未實現任何損益時等同剩餘持股損平價。"
+                    "即使股價為零仍保有總獲利時，此欄為空。"
                 ),
             },
             "planRule": (
