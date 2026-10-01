@@ -79,3 +79,12 @@ def test_realized_loss_raises_zero_price_and_is_recovered_after_costs():
     zero = calculate_realized_profit_zero_price(400, cost, loss)
     assert zero > calculate_net_break_even_price(400, cost)
     assert abs(zero * 400 * Decimal("0.996601") - cost + loss) < Decimal("1e-20")
+
+
+def test_zero_price_display_always_rounds_up_to_one_decimal():
+    from stock_db.portfolio import display_zero_price
+    assert display_zero_price(Decimal("42.6635")) == Decimal("42.7")
+    assert display_zero_price(Decimal("24.2612")) == Decimal("24.3")
+    assert display_zero_price(Decimal("78.5249")) == Decimal("78.6")
+    assert display_zero_price(Decimal("42.7")) == Decimal("42.7")
+    assert display_zero_price(Decimal("0")) == Decimal("0.0")

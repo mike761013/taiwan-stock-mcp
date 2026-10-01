@@ -11,7 +11,7 @@ import asyncio
 import json
 from collections import defaultdict
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -77,6 +77,11 @@ def _parse_date(value: date | str, field: str) -> date:
 
 def _money(value: Decimal) -> Decimal:
     return value.quantize(MONEY_QUANTUM)
+
+
+def display_zero_price(value: Decimal) -> Decimal:
+    """Round a theoretical zero-P/L price upward to one decimal for display."""
+    return value.quantize(Decimal("0.1"), rounding=ROUND_CEILING)
 
 
 def calculate_net_break_even_price(
@@ -1146,11 +1151,11 @@ class PortfolioLedger:
                 "cycleSoldQuantity": cycle.get("soldQuantity", 0),
                 "cycleStartDate": cycle.get("startDate"),
                 "totalPnlZeroPrice": (
-                    float(_money(realized_zero_price))
+                    float(display_zero_price(realized_zero_price))
                     if realized_zero_price is not None else None
                 ),
                 "realizedProfitZeroPrice": (
-                    float(_money(realized_zero_price))
+                    float(display_zero_price(realized_zero_price))
                     if realized_zero_price is not None else None
                 ),
                 "realizedProfitCushionPercent": (
@@ -1229,6 +1234,7 @@ class PortfolioLedger:
                     "扣抵剩餘FIFO含買費成本與融資利息，再計一般賣出費稅。"
                     "獲利降低歸零價，虧損提高歸零價；未實現任何損益時等同剩餘持股損平價。"
                     "即使股價為零仍保有總獲利時，此欄為空。"
+                    "歸零價無條件進位至小數第一位，內部計算保留完整精度。"
                 ),
             },
             "planRule": (
