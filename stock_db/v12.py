@@ -164,6 +164,10 @@ class V12Config:
     # with structure, candle quality, trend slope and support quality instead.
     bullish_raw_score_weight: float = 0.55
     bullish_quality_score_weight: float = 0.45
+    strength_ranking_enabled: bool = True
+    ranking_strength_weight: float = 0.65
+    strength_min_score: float = 65.0
+
     ranking_bullish_weight: float = 0.75
     ranking_execution_weight: float = 0.25
     consensus_bonus_per_extra_strategy: float = 2.0

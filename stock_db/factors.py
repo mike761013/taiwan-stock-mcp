@@ -31,6 +31,7 @@ from .advanced_factors import (
     score_sector_driver,
 )
 from .connection import stock_database
+from .strength import STRENGTH_FACTOR_MODEL
 
 
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
@@ -45,7 +46,7 @@ TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 _REMOTE_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
 # Kept as an internal compatibility name; public output is one release only.
 V12_3_ACCURACY_ENGINE = "V12.4"
-V12_4_FACTOR_MODEL = "V12.4-COMPLETE-FACTORS-2"
+V12_4_FACTOR_MODEL = STRENGTH_FACTOR_MODEL
 DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS = 7
 
 FACTOR_SCHEMA_SQL = """

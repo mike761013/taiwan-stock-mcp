@@ -119,5 +119,8 @@
   "factor_minimum_confidence": 60,
   "factor_api_concurrency": 3,
   "factor_prefilter_limit": 40,
-  "historical_retention_years": 5
+  "historical_retention_years": 5,
+  "strength_ranking_enabled": true,
+  "ranking_strength_weight": 0.65,
+  "strength_min_score": 65.0
 }

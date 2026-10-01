@@ -7,6 +7,8 @@ from typing import Any
 
 from .connection import stock_database
 from .factors import V12_4_FACTOR_MODEL, enrich_candidates_v12_3
+from .strength import (STRENGTH_MODEL_REVISION, apply_strength_ranking,
+                       build_strength_profiles, strength_boards)
 from .performance import execution_strategy_priors
 from .service import stock_database_service
 from .v12 import (
@@ -18,6 +20,7 @@ from .v12 import (
     apply_execution_prior,
     apply_market_context,
     build_market_context,
+    build_v12_candidate,
     explain_v12_row,
     find_v12_near_misses,
     load_v12_config,
@@ -334,6 +337,7 @@ _V12_SNAPSHOT_QUERY = f"""
                MAX(close) FILTER (WHERE reverse_rank = 11) AS close10,
                MAX(close) FILTER (WHERE reverse_rank = 21) AS close20,
                MAX(high) FILTER (WHERE reverse_rank <= 20) AS high20,
+               MAX(high) FILTER (WHERE reverse_rank BETWEEN 2 AND 21) AS prior_high20,
                MIN(low) FILTER (WHERE reverse_rank <= 20) AS low20,
                MAX(high) FILTER (WHERE reverse_rank <= 60) AS high60,
                MIN(low) FILTER (WHERE reverse_rank <= 60) AS low60
@@ -351,7 +355,7 @@ _V12_SNAPSHOT_QUERY = f"""
            p.prev_open, p.prev_high, p.prev_low, p.prev_close, p.prev_volume,
            p.prev2_low, p.prev2_close,
            p.close5, p.close10, p.close20,
-           p.high20, p.low20, p.high60, p.low60,
+           p.high20, p.prior_high20, p.low20, p.high60, p.low60,
            pi.prev_ma5, pi.prev_ma10, pi.prev_ma20, pi.prev_ma60,
            a.atr14
     FROM daily_indicators i
@@ -445,7 +449,10 @@ async def explain_database_stock_v12(symbol: str) -> dict[str, Any]:
             "universeCount": universe_count,
             "error": "SYMBOL_NOT_IN_LATEST_SNAPSHOT",
         }
-    explanation = explain_v12_row(row, load_v12_config())
+    config = load_v12_config()
+    explanation = explain_v12_row(row, config)
+    explanation["strengthProfile"] = build_strength_profiles(rows, config).get(normalized)
+    explanation["strengthModelRevision"] = STRENGTH_MODEL_REVISION
     explanation.update(
         {
             "latestTradeDate": latest_trade_date,
@@ -502,6 +509,7 @@ async def screen_database_market_v12(
     rows, universe_count, latest_trade_date = await _fetch_v12_snapshot()
     near_miss_observations = find_v12_near_misses(rows, config, limit=10)
     market_context = build_market_context(rows, config)
+    strength_profiles = build_strength_profiles(rows, config)
     priors = (
         await execution_strategy_priors(
             minimum_samples=config.execution_prior_min_samples,
@@ -516,7 +524,7 @@ async def screen_database_market_v12(
         rows=rows,
         strategy=strategy,
         minimum_score=minimum_score,
-        limit=200,
+        limit=max(200, len(rows)),
         config=config,
     )
     raw_candidates = [
@@ -527,6 +535,7 @@ async def screen_database_market_v12(
         )
         for candidate in raw_candidates
     ]
+    raw_candidates = [apply_strength_ranking(c, strength_profiles, config) for c in raw_candidates]
     raw_candidates.sort(
         key=lambda item: (
             float(item.get("ranking_score") or 0),
@@ -542,6 +551,7 @@ async def screen_database_market_v12(
         market_context,
         config,
     )
+    raw_candidates = [apply_strength_ranking(c, strength_profiles, config) for c in raw_candidates]
     raw_candidates.sort(
         key=lambda item: (
             float(item.get("ranking_score") or 0),
@@ -633,6 +643,7 @@ async def screen_database_market_v12(
         "highPriceStrongResults": high_price_results,
         "record": saved,
         "executionPriors": priors,
+        **strength_boards(candidates),
         "source": "PostgreSQL V12",
     }
 
@@ -649,6 +660,7 @@ async def run_full_bullish_radar_v12(
     rows, universe_count, latest_trade_date = await _fetch_v12_snapshot()
     near_miss_observations = find_v12_near_misses(rows, config, limit=10)
     market_context = build_market_context(rows, config)
+    strength_profiles = build_strength_profiles(rows, config)
     priors = (
         await execution_strategy_priors(
             minimum_samples=config.execution_prior_min_samples,
@@ -669,7 +681,7 @@ async def run_full_bullish_radar_v12(
             rows=rows,
             strategy=strategy,
             minimum_score=minimum_score,
-            limit=200,
+            limit=max(200, len(rows)),
             config=config,
         )
         raw_candidates = [
@@ -680,6 +692,7 @@ async def run_full_bullish_radar_v12(
             )
             for candidate in raw_candidates
         ]
+        raw_candidates = [apply_strength_ranking(c, strength_profiles, config) for c in raw_candidates]
         raw_candidates.sort(
             key=lambda item: (
                 float(item.get("ranking_score") or 0),
@@ -823,6 +836,7 @@ async def run_full_bullish_radar_v12(
         market_context,
         config,
     )
+    enriched_merged = [apply_strength_ranking(c, strength_profiles, config) for c in enriched_merged]
     ranked = sorted(
         enriched_merged,
         key=lambda item: (
@@ -966,6 +980,8 @@ async def run_full_bullish_radar_v12(
         "record": combined_record,
         "executionPriors": priors,
         "rankingMethod": {
+            "strengthWeight": config.ranking_strength_weight,
+            "strengthModelRevision": STRENGTH_MODEL_REVISION,
             "bullishWeight": config.ranking_bullish_weight,
             "executionWeight": config.ranking_execution_weight,
             "top10Excludes": [
@@ -980,5 +996,30 @@ async def run_full_bullish_radar_v12(
             "watchlistRetainsUnconfirmedAndOverheatedSignals": True,
             "probeLayerExcludedFromFormalTop10": True,
         },
+        **strength_boards(displayed_candidates),
         "source": "PostgreSQL V12",
     }
+
+
+async def preview_database_strength_v12(limit: int = 10) -> dict[str, Any]:
+    """Read-only verification: no saved radar runs or external factor refresh."""
+    limit = max(1, min(int(limit), 50))
+    config = load_v12_config()
+    rows, universe_count, latest_trade_date = await _fetch_v12_snapshot()
+    profiles = build_strength_profiles(rows, config)
+    candidates = []
+    for row in rows:
+        matches = [candidate for strategy in V12_STRATEGIES
+                   if (candidate := build_v12_candidate(row, strategy, config)) is not None]
+        if matches:
+            candidate = max(matches, key=_candidate_rank_score)
+            candidate["strategies"] = [c["strategy"] for c in matches]
+            candidates.append(apply_strength_ranking(candidate, profiles, config))
+    tiers = split_v12_price_tiers(candidates, config)
+    accepted = tiers["main"] + tiers["highPrice"][:config.high_price_limit]
+    return {"ok": True, "version": V12_VERSION,
+            "latestTradeDate": latest_trade_date, "universeCount": universe_count,
+            "snapshotCount": len(rows), "saved": False,
+            "factorEnrichmentApplied": False,
+            "note": "唯讀強勢篩選預覽；完整因子與正式買點仍以指令執行正式雷達。",
+            **strength_boards(accepted, limit)}

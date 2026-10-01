@@ -32,6 +32,7 @@ from stock_db.pipeline import (
 )
 from stock_db.radar import (
     explain_database_stock_v12,
+    preview_database_strength_v12,
     run_full_bullish_radar,
     run_full_bullish_radar_v12 as run_full_bullish_radar_v12_core,
     screen_database_market,
@@ -44,6 +45,7 @@ from stock_db.v12 import (
     load_v12_config,
     validate_v12_candidates,
 )
+from stock_db.strength import STRENGTH_MODEL_REVISION
 from stock_db.service import stock_database_service
 from stock_db.portfolio import PortfolioLedgerError, portfolio_ledger
 
@@ -501,8 +503,15 @@ def register_v10_tools(mcp: Any) -> None:
             "version": V12_VERSION,
             "accuracyEngine": V12_ACCURACY_ENGINE,
             "strategies": list(V12_STRATEGIES),
+            "factorModelRevision": V12_4_FACTOR_MODEL,
+            "strengthModelRevision": STRENGTH_MODEL_REVISION,
             "config": config.public_dict(),
         }
+
+    @mcp.tool()
+    async def get_v12_strength_preview(limit: int = 10) -> dict:
+        """唯讀驗證強勢篩選、啟動與續攻排名；不保存正式雷達或刷新外部因子。"""
+        return await preview_database_strength_v12(limit)
 
     @mcp.tool()
     async def explain_stock_v12(symbol: str) -> dict:
