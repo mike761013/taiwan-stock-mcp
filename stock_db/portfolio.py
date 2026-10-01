@@ -100,6 +100,53 @@ def calculate_net_break_even_price(
     )
 
 
+def calculate_realized_profit_zero_price(
+    quantity: int,
+    cost_basis: Decimal,
+    realized_net_pnl: Decimal,
+    accrued_interest: Decimal = Decimal("0"),
+    asset_type: str = "STOCK",
+    account_type: str = "CASH",
+) -> Decimal | None:
+    """Price where loss on the remainder consumes this cycle's booked profit."""
+    if realized_net_pnl <= 0 or cost_basis + accrued_interest < realized_net_pnl:
+        return None
+    return calculate_net_break_even_price(
+        quantity, cost_basis - realized_net_pnl, accrued_interest,
+        asset_type, account_type,
+    )
+
+
+def current_position_cycles(
+    transactions: Sequence[Mapping[str, Any]],
+) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+    """Sum actual recorded net P/L since the latest flat-to-open transition.
+
+    Scope is symbol/account/asset/lot type. A new position after a full exit
+    starts a new cycle; an intraday buy/sell while shares remain does not.
+    """
+    cycles: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for trade in sorted(transactions, key=lambda t: (str(t["trade_date"]), int(t["id"]))):
+        if trade.get("voided_at") is not None:
+            continue
+        key = tuple(str(trade[field]) for field in (
+            "symbol", "account_type", "asset_type", "lot_type",
+        ))
+        cycle = cycles.get(key)
+        if cycle is None or (cycle["quantity"] == 0 and trade["side"] == "BUY"):
+            cycle = {"quantity": 0, "soldQuantity": 0,
+                     "realizedNetPnl": Decimal("0"),
+                     "startDate": str(trade["trade_date"])}
+            cycles[key] = cycle
+        if trade["side"] == "BUY":
+            cycle["quantity"] += int(trade["quantity"])
+        elif trade["side"] == "SELL":
+            cycle["quantity"] -= int(trade["quantity"])
+            cycle["soldQuantity"] += int(trade["quantity"])
+            cycle["realizedNetPnl"] += Decimal(str(trade.get("realized_pnl") or 0))
+    return cycles
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Decimal):
         return float(value)
@@ -907,6 +954,19 @@ class PortfolioLedger:
                     through,
                 )
             market = {str(row["symbol"]): dict(row) for row in market_rows}
+            cycle_transactions = []
+            if symbols:
+                cycle_transactions = await connection.fetch(
+                    """
+                    SELECT id,symbol,trade_date,side,quantity,account_type,
+                           asset_type,lot_type,realized_pnl
+                    FROM portfolio_transactions
+                    WHERE symbol=ANY($1::varchar[]) AND trade_date<=$2
+                      AND voided_at IS NULL
+                    ORDER BY trade_date,id
+                    """,
+                    symbols, through,
+                )
 
             transaction_ids = [int(lot["id"]) for lot in lots]
             plan_rows = []
@@ -1006,6 +1066,7 @@ class PortfolioLedger:
             })
             group["originalPlans"].extend(_json_safe(linked_plans))
 
+        cycles = current_position_cycles(cycle_transactions)
         positions: list[dict[str, Any]] = []
         for key, group in grouped.items():
             latest = market.get(key[0]) or {}
@@ -1053,6 +1114,12 @@ class PortfolioLedger:
                 quantity_open, cost_basis, accrued_interest,
                 asset_type=key[2], account_type=key[1],
             )
+            cycle = cycles.get(key) or {}
+            realized_net_pnl = cycle.get("realizedNetPnl", Decimal("0"))
+            realized_zero_price = calculate_realized_profit_zero_price(
+                quantity_open, cost_basis, realized_net_pnl, accrued_interest,
+                asset_type=key[2], account_type=key[1],
+            )
             profit_cushion_percent = (
                 (latest_close - break_even_price) / latest_close * 100
                 if latest_close is not None and latest_close > 0
@@ -1075,6 +1142,22 @@ class PortfolioLedger:
                 "rawPurchaseAmount": float(_money(raw_amount)),
                 "costBasisIncludingBuyFee": float(_money(cost_basis)),
                 "accruedMarginInterest": float(_money(accrued_interest)),
+                "cycleRealizedNetPnl": float(_money(realized_net_pnl)),
+                "cycleSoldQuantity": cycle.get("soldQuantity", 0),
+                "cycleStartDate": cycle.get("startDate"),
+                "realizedProfitZeroPrice": (
+                    float(_money(realized_zero_price))
+                    if realized_zero_price is not None else None
+                ),
+                "realizedProfitCushionPercent": (
+                    round(float((latest_close - realized_zero_price) / latest_close * 100), 4)
+                    if latest_close is not None and latest_close > 0
+                    and realized_zero_price is not None else None
+                ),
+                "totalCycleEstimatedNetPnl": (
+                    float(_money(realized_net_pnl + net_pnl))
+                    if net_pnl is not None else None
+                ),
                 "netBreakEvenPrice": (
                     float(_money(break_even_price))
                     if break_even_price is not None else None
@@ -1136,6 +1219,11 @@ class PortfolioLedger:
                     "剩餘FIFO庫存含買費成本與截至查詢日融資利息，"
                     "除以股數及一般賣出淨收款係數；不抵扣歷史已實現損益。"
                     "理論價格未按交易跳動單位調整。"
+                ),
+                "realizedProfitZeroBasis": (
+                    "本輪持股自最近一次清倉後重新買進起，累計已實現淨獲利"
+                    "扣抵剩餘FIFO含買費成本與融資利息，再計一般賣出費稅。"
+                    "無已實現淨獲利或即使股價為零仍保有獲利時，此欄為空。"
                 ),
             },
             "planRule": (
