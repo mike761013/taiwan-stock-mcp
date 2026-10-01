@@ -79,6 +79,27 @@ def _money(value: Decimal) -> Decimal:
     return value.quantize(MONEY_QUANTUM)
 
 
+def calculate_net_break_even_price(
+    quantity: int,
+    cost_basis: Decimal,
+    accrued_interest: Decimal = Decimal("0"),
+    asset_type: str = "STOCK",
+    account_type: str = "CASH",
+) -> Decimal | None:
+    """Open long-position price that leaves zero P/L after normal exit costs.
+
+    Cost basis already includes allocated buy fees. Historical realized P/L
+    is not credited against the remaining FIFO inventory. This is a theoretical
+    price, not rounded to an exchange tick or an assumed same-day tax discount.
+    """
+    if quantity <= 0 or account_type == "SHORT":
+        return None
+    tax_rate = ETF_TAX_RATE if asset_type == "ETF" else STOCK_TAX_RATE
+    return (cost_basis + accrued_interest) / (
+        Decimal(quantity) * (Decimal("1") - COMMISSION_RATE - tax_rate)
+    )
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Decimal):
         return float(value)
@@ -1028,6 +1049,15 @@ class PortfolioLedger:
                 if estimated_net_proceeds is not None
                 else None
             )
+            break_even_price = calculate_net_break_even_price(
+                quantity_open, cost_basis, accrued_interest,
+                asset_type=key[2], account_type=key[1],
+            )
+            profit_cushion_percent = (
+                (latest_close - break_even_price) / latest_close * 100
+                if latest_close is not None and latest_close > 0
+                and break_even_price is not None else None
+            )
             positions.append({
                 "symbol": key[0],
                 "accountType": key[1],
@@ -1045,6 +1075,14 @@ class PortfolioLedger:
                 "rawPurchaseAmount": float(_money(raw_amount)),
                 "costBasisIncludingBuyFee": float(_money(cost_basis)),
                 "accruedMarginInterest": float(_money(accrued_interest)),
+                "netBreakEvenPrice": (
+                    float(_money(break_even_price))
+                    if break_even_price is not None else None
+                ),
+                "profitCushionPercent": (
+                    round(float(profit_cushion_percent), 4)
+                    if profit_cushion_percent is not None else None
+                ),
                 "market": _json_safe(latest),
                 "currentMarketValue": (
                     float(_money(current_value))
@@ -1094,6 +1132,11 @@ class PortfolioLedger:
                 "stockDayTradeSellFactor": 0.998101,
                 "inventoryMatching": "same-day best realized P/L, then FIFO",
                 "lotDisplayOrder": "newest to oldest",
+                "netBreakEvenBasis": (
+                    "剩餘FIFO庫存含買費成本與截至查詢日融資利息，"
+                    "除以股數及一般賣出淨收款係數；不抵扣歷史已實現損益。"
+                    "理論價格未按交易跳動單位調整。"
+                ),
             },
             "planRule": (
                 "Entry conditions, defense, and hard stops are separate. "
