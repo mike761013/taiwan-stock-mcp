@@ -308,6 +308,18 @@ def register_v10_tools(mcp: Any) -> None:
         ))
 
     @mcp.tool()
+    async def correct_same_day_portfolio_cash_lot(
+        symbol: str, retained_buy_id: int, consumed_buy_id: int,
+        expected_quantity: int, reason: str,
+    ) -> dict:
+        """依使用者或券商確認，更正同日期同股數現股批次配對；保留交易與更正稽核。"""
+        return await _portfolio_call(portfolio_ledger.correct_same_day_cash_lot(
+            symbol=symbol, retained_buy_id=retained_buy_id,
+            consumed_buy_id=consumed_buy_id, expected_quantity=expected_quantity,
+            reason=reason,
+        ))
+
+    @mcp.tool()
     async def void_latest_portfolio_trade(
         transaction_id: int,
         reason: str,

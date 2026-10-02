@@ -40,6 +40,20 @@ class PortfolioLedgerError(ValueError):
     """User-correctable portfolio input or consistency error."""
 
 
+def corrected_cash_lot_allocation(allocation: Mapping[str, Any], buy: Mapping[str, Any]) -> dict[str, Any]:
+    """Reprice a broker-confirmed buy-lot match without changing sale proceeds."""
+    if buy["account_type"] != "CASH" or Decimal(str(allocation["margin_interest"])) != 0:
+        raise PortfolioLedgerError("lot correction supports cash allocations only")
+    quantity = int(allocation["quantity"])
+    cost = _money((Decimal(str(buy["price"])) +
+                   Decimal(str(buy["commission"])) / int(buy["quantity"])) * quantity)
+    result = dict(allocation)
+    result.update(buy_transaction_id=int(buy["id"]), buy_cost=cost,
+                  matching_rule="USER_CONFIRMED_LOT",
+                  realized_pnl=_money(Decimal(str(allocation["sell_proceeds"])) - cost))
+    return result
+
+
 def _decimal(value: Any, field: str, *, allow_none: bool = False) -> Decimal | None:
     if value is None or value == "":
         if allow_none:
@@ -1309,6 +1323,67 @@ class PortfolioLedger:
             "allocations": _json_safe([dict(row) for row in allocations]),
             "plans": _json_safe([dict(row) for row in plans]),
         }
+
+    async def correct_same_day_cash_lot(
+        self, *, symbol: str, retained_buy_id: int, consumed_buy_id: int,
+        expected_quantity: int, reason: str,
+    ) -> dict[str, Any]:
+        """Correct fully swapped equal-sized same-date cash lots with an audit trail.
+
+        Actual trades, fees, dates and cash flows are preserved. Only sale-to-buy
+        attribution and derived realized P/L change. Refuse partial/ambiguous lots.
+        """
+        await self._ensure_schema()
+        if not reason.strip() or retained_buy_id == consumed_buy_id or expected_quantity <= 0:
+            raise PortfolioLedgerError("distinct buy IDs, quantity and correction reason required")
+        async with self.database.acquire() as connection:
+            async with connection.transaction():
+                rows = await connection.fetch(
+                    "SELECT * FROM portfolio_transactions WHERE symbol=$1 AND voided_at IS NULL ORDER BY id FOR UPDATE",
+                    symbol.strip().upper(),
+                )
+                buys = {int(r["id"]): dict(r) for r in rows if r["side"] == "BUY"}
+                keep, used = buys.get(retained_buy_id), buys.get(consumed_buy_id)
+                if not keep or not used:
+                    raise PortfolioLedgerError("buy IDs do not belong to this active symbol")
+                fields = ("trade_date", "quantity", "account_type", "asset_type", "lot_type")
+                if any(keep[f] != used[f] for f in fields) or keep["account_type"] != "CASH" or int(keep["quantity"]) != expected_quantity:
+                    raise PortfolioLedgerError("requires equal-sized same-date cash buy lots")
+                allocations = [dict(r) for r in await connection.fetch(
+                    "SELECT * FROM portfolio_lot_allocations WHERE buy_transaction_id=ANY($1::bigint[]) ORDER BY sell_transaction_id FOR UPDATE",
+                    [retained_buy_id, consumed_buy_id],
+                )]
+                keep_sold = sum(int(a["quantity"]) for a in allocations if a["buy_transaction_id"] == retained_buy_id)
+                used_sold = sum(int(a["quantity"]) for a in allocations if a["buy_transaction_id"] == consumed_buy_id)
+                if keep_sold == 0 and used_sold == expected_quantity:
+                    replay = True
+                elif keep_sold == expected_quantity and used_sold == 0:
+                    replay = False
+                    for original in allocations:
+                        corrected = corrected_cash_lot_allocation(original, used)
+                        audit = {"reason": reason.strip(), "retainedBuyId": retained_buy_id,
+                                 "consumedBuyId": consumed_buy_id,
+                                 "correctedAt": datetime.now(TAIPEI_TZ).isoformat(),
+                                 "originalAllocation": _json_safe(original)}
+                        await connection.execute(
+                            """UPDATE portfolio_lot_allocations SET buy_transaction_id=$1,
+                               buy_cost=$2,realized_pnl=$3,matching_rule=$4
+                               WHERE sell_transaction_id=$5 AND buy_transaction_id=$6""",
+                            consumed_buy_id, corrected["buy_cost"], corrected["realized_pnl"],
+                            corrected["matching_rule"], original["sell_transaction_id"], retained_buy_id,
+                        )
+                        await connection.execute(
+                            """UPDATE portfolio_transactions SET realized_pnl=(
+                               SELECT SUM(realized_pnl) FROM portfolio_lot_allocations WHERE sell_transaction_id=$1),
+                               metadata=jsonb_set(metadata,'{lotCorrections}',
+                                 COALESCE(metadata->'lotCorrections','[]'::jsonb) || $2::jsonb)
+                               WHERE id=$1""",
+                            original["sell_transaction_id"], json.dumps([audit], ensure_ascii=False),
+                        )
+                else:
+                    raise PortfolioLedgerError("expected one fully sold lot and one fully retained lot; no changes made")
+        return {"ok": True, "idempotentReplay": replay,
+                "position": await self.get_positions(symbol=symbol)}
 
     async def void_latest_trade(
         self,
