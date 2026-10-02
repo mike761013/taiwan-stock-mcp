@@ -488,6 +488,40 @@ class StockRepository:
                 WHERE id=$1
             """, job_id, status, processed, failed, error)
 
+    async def get_saved_radar_run(
+        self, *, run_id: int | None = None, run_date: date | None = None,
+        strategy: str = "v12_combined",
+    ) -> dict[str, Any]:
+        """Read a completed run and its saved snapshots without rerunning factors."""
+        async with self.database.acquire() as connection:
+            async with connection.transaction(readonly=True):
+                row = await connection.fetchrow("""
+                    SELECT * FROM radar_runs
+                    WHERE status='completed' AND strategy=$1
+                      AND ($2::bigint IS NULL OR id=$2)
+                      AND ($3::date IS NULL OR run_date=$3)
+                    ORDER BY run_date DESC,id DESC LIMIT 1
+                """, strategy, run_id, run_date)
+                if row is None:
+                    return {"ok": False, "error": "No matching completed radar run"}
+                rows = await connection.fetch("""
+                    SELECT snapshot FROM radar_candidates WHERE radar_run_id=$1
+                    ORDER BY rank,symbol
+                """, int(row["id"]))
+        candidates = []
+        for saved in rows:
+            snapshot = saved["snapshot"]
+            candidates.append(json.loads(snapshot) if isinstance(snapshot, str) else dict(snapshot))
+        run = dict(row)
+        configuration = run.get("configuration") or {}
+        run["configuration"] = json.loads(configuration) if isinstance(configuration, str) else dict(configuration)
+        for key, value in run.items():
+            if hasattr(value, "isoformat"):
+                run[key] = value.isoformat()
+        return {"ok": True, "saved": True, "rerun": False, "run": run,
+                "candidateCount": len(candidates), "candidates": candidates,
+                "complete": len(candidates) == int(run["candidate_count"])}
+
     async def save_radar_run(
         self, strategy: str, run_date: date, candidates: Sequence[dict[str, Any]],
         configuration: dict[str, Any] | None = None,

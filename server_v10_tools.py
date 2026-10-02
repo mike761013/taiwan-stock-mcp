@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from typing import Any
 
 from stock_db.maintenance import run_daily_maintenance
@@ -47,6 +48,7 @@ from stock_db.v12 import (
 )
 from stock_db.strength import STRENGTH_MODEL_REVISION
 from stock_db.service import stock_database_service
+from stock_db.repository import stock_repository
 from stock_db.portfolio import PortfolioLedgerError, portfolio_ledger
 
 
@@ -524,6 +526,16 @@ def register_v10_tools(mcp: Any) -> None:
     async def get_v12_strength_preview(limit: int = 10) -> dict:
         """唯讀驗證強勢篩選、啟動與續攻排名；不保存正式雷達或刷新外部因子。"""
         return await preview_database_strength_v12(limit)
+
+    @mcp.tool()
+    async def get_saved_v12_radar_result(
+        run_id: int | None = None, trade_date: str | None = None,
+    ) -> dict:
+        """唯讀取回已完成正式雷達與候選完整快照；不重跑、不新增紀錄、不更新因子。"""
+        day = date.fromisoformat(trade_date) if trade_date else None
+        return await stock_repository.get_saved_radar_run(
+            run_id=run_id, run_date=day, strategy="v12_combined",
+        )
 
     @mcp.tool()
     async def explain_stock_v12(symbol: str) -> dict:
