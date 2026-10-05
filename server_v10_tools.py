@@ -35,6 +35,7 @@ from stock_db.radar import (
     explain_database_stock_v12,
     preview_database_strength_v12,
     preview_database_prelaunch_v12,
+    prepare_database_prelaunch_v12,
     run_full_bullish_radar,
     run_full_bullish_radar_v12 as run_full_bullish_radar_v12_core,
     screen_database_market,
@@ -48,6 +49,7 @@ from stock_db.v12 import (
     validate_v12_candidates,
 )
 from stock_db.strength import STRENGTH_MODEL_REVISION
+from stock_db.prelaunch import PRELAUNCH_MODEL
 from stock_db.service import stock_database_service
 from stock_db.repository import stock_repository
 from stock_db.portfolio import PortfolioLedgerError, portfolio_ledger
@@ -520,18 +522,24 @@ def register_v10_tools(mcp: Any) -> None:
             "strategies": list(V12_STRATEGIES),
             "factorModelRevision": V12_4_FACTOR_MODEL,
             "strengthModelRevision": STRENGTH_MODEL_REVISION,
+            "prelaunchModelRevision": PRELAUNCH_MODEL,
             "config": config.public_dict(),
         }
 
     @mcp.tool()
     async def get_v12_strength_preview(limit: int = 10) -> dict:
-        """唯讀驗證強勢篩選、啟動與續攻排名；不保存正式雷達或刷新外部因子。"""
+        """唯讀驗證提前觀察與強勢篩選；不保存正式雷達或刷新外部因子。"""
         return await preview_database_strength_v12(limit)
 
     @mcp.tool()
     async def get_v12_prelaunch_preview(limit: int = 10) -> dict:
         """唯讀提前觀察：連續營收、籌碼累積、未延伸整理與首次入選績效；不重跑正式雷達。"""
         return await preview_database_prelaunch_v12(limit)
+
+    @mcp.tool()
+    async def prepare_v12_prelaunch_history(limit: int = 20) -> dict:
+        """補建量價整理候選的营收與逐日法人歷史；每日最多40資料集請求，重跑沿用快取，不跑正式雷達。"""
+        return await prepare_database_prelaunch_v12(limit)
 
     @mcp.tool()
     async def get_saved_v12_radar_result(
@@ -772,4 +780,3 @@ def register_v10_tools(mcp: Any) -> None:
             "statisticsBefore": before_stats,
             "statisticsAfter": after_stats,
         }
-

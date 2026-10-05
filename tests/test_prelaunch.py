@@ -129,6 +129,7 @@ def test_full_radar_persists_separate_watch_lane_and_combined_snapshot(monkeypat
     async def performance(*args): return {'samples':1}
     async def priors(**kwargs): return {}
     async def enrich(items,*args): return items
+    async def prepare(*args): return {'ok':True,'requestedDatasets':0}
     saved=[]
     async def save(**kwargs):
         saved.append(kwargs)
@@ -138,6 +139,7 @@ def test_full_radar_persists_separate_watch_lane_and_combined_snapshot(monkeypat
     monkeypatch.setattr(radar,'prelaunch_performance',performance)
     monkeypatch.setattr(radar,'execution_strategy_priors',priors)
     monkeypatch.setattr(radar,'enrich_candidates_v12_3',enrich)
+    monkeypatch.setattr(radar,'prepare_prelaunch_history',prepare)
     monkeypatch.setattr(radar,'build_strength_profiles',lambda *args:{row['symbol']:p})
     monkeypatch.setattr(radar,'screen_v12_rows',lambda **kwargs:([],{}))
     monkeypatch.setattr(radar.stock_database_service,'save_radar_result',save)
@@ -191,3 +193,67 @@ def test_tdcc_preserves_unselected_common_shares_without_extra_download(monkeypa
     selected,_=asyncio.run(af.fetch_tdcc_context(['1101'],date(2026,10,5)))
     assert set(selected)=={'1101'}
     assert {r[0] for r in saved}=={'1101','1102'}
+
+
+def test_revenue_backfill_calculates_yoy_from_prior_year_and_excludes_future_publication():
+    from stock_db.prelaunch_history import revenue_history
+    records=[dict(date='2025-09-01',revenue_year=2025,revenue_month=8,revenue=100),
+             dict(date='2026-09-01',create_time='2026-09-08',revenue_year=2026,revenue_month=8,revenue=125),
+             dict(date='2026-10-01',create_time='2026-10-10',revenue_year=2026,revenue_month=9,revenue=200)]
+    result=revenue_history(records,date(2026,10,5))
+    assert result[-1]['month']==date(2026,8,1) and result[-1]['yoy']==25
+    assert result[0]['yoy'] is None
+
+
+def test_bounded_backfill_reuses_attempts_and_has_global_daily_cap():
+    from stock_db.prelaunch_history import request_plan
+    ready=[({'symbol':str(1100+i)},{'missingInputs':['recentThreeConsecutiveRevenueMonths','fiveRecentInstitutionalSessions']}) for i in range(25)]
+    tasks,used=request_plan(ready,[],date(2026,10,5),100)
+    assert len(tasks)==40 and used==0
+    jobs=[{'trade_date':'2026-10-05','metadata':{'requestCount':40,'tasks':tasks}}]
+    assert request_plan(ready,jobs,date(2026,10,5),20)[0]==[]
+    next_day,used=request_plan(ready,jobs,date(2026,10,6),20)
+    assert len(next_day)==20 and all(t['dataset']=='TaiwanStockInstitutionalInvestorsBuySell' for t in next_day)
+
+
+def test_backfill_batches_do_not_get_stuck_on_already_prepared_leaders():
+    from stock_db.prelaunch_history import request_plan
+    ready=[({'symbol':str(1100+i)},{'missingInputs':[] if i<20 else ['recentThreeConsecutiveRevenueMonths']}) for i in range(25)]
+    tasks,_=request_plan(ready,[],date(2026,10,5),20)
+    assert {t['symbol'] for t in tasks}=={str(1120+i) for i in range(5)}
+
+
+def test_history_preparation_writes_compact_evidence_and_does_not_repeat_requests(monkeypatch):
+    from stock_db import prelaunch_history as history
+    row,_,p=base()
+    async def evidence(*args): return {}
+    jobs=[];queries=[];calls=[]
+    class Context:
+        async def __aenter__(self): return self
+        async def __aexit__(self,*args): return False
+        async def fetch(self,*args): return jobs
+        async def executemany(self,sql,rows):
+            assert "WHERE monthly_revenue.source='FinMind prelaunch history'" in sql
+            queries.append(('revenue',rows))
+        async def execute(self,sql,*args):
+            assert "jsonb_set" in sql and 'COALESCE(daily_factor_snapshots.features' in sql
+            queries.append(('chip',args))
+    async def start(kind,as_of,metadata):
+        jobs.append({'trade_date':as_of,'metadata':metadata});return 1
+    async def finish(*args): pass
+    async def provider(dataset,symbol,start,end):
+        calls.append(dataset)
+        if dataset=='TaiwanStockMonthRevenue':
+            return [dict(date=f'{y}-09-01',create_time=f'{y}-09-08',revenue_year=y,revenue_month=8,revenue=r)
+                    for y,r in [(2025,100),(2026,125)]]
+        return [dict(date=d,buy=100,sell=10) for d in ('2026-09-28','2026-09-29','2026-09-30','2026-10-01','2026-10-02')]
+    monkeypatch.setattr(history,'cached_evidence',evidence)
+    monkeypatch.setattr(history.stock_database,'acquire',lambda:Context())
+    monkeypatch.setattr(history.stock_repository,'start_job',start)
+    monkeypatch.setattr(history.stock_repository,'finish_job',finish)
+    monkeypatch.setattr(history,'_finmind_rows',provider)
+    result=asyncio.run(history.prepare_prelaunch_history([row],{row['symbol']:p},V12Config(),date(2026,10,5)))
+    assert result['requestedDatasets']==2 and result['institutionalSymbolsPrepared']==1
+    assert result['revenueRowsPrepared']==2 and len(queries)==2
+    again=asyncio.run(history.prepare_prelaunch_history([row],{row['symbol']:p},V12Config(),date(2026,10,5)))
+    assert again['requestedDatasets']==0 and len(calls)==2

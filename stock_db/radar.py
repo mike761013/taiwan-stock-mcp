@@ -12,6 +12,7 @@ from .strength import (STRENGTH_MODEL_REVISION, apply_strength_ranking,
 from .performance import execution_strategy_priors
 from .prelaunch import (PRELAUNCH_MODEL, cached_evidence, screen_prelaunch,
                        prelaunch_performance)
+from .prelaunch_history import prepare_prelaunch_history
 from .service import stock_database_service
 from .v12 import (
     V12_ACCURACY_ENGINE,
@@ -839,12 +840,17 @@ async def run_full_bullish_radar_v12(
         config,
     )
     enriched_merged = [apply_strength_ranking(c, strength_profiles, config) for c in enriched_merged]
+    history_preparation = (
+        await prepare_prelaunch_history(rows, strength_profiles, config, latest_trade_date)
+        if save_result else {'skipped': True, 'reason': '唯讀執行不補抓歷史'}
+    )
     # Independent full-universe lane. Read after ordinary enrichment so the
     # weekly ownership cache and daily chip evidence include this run's data.
     early_watch = screen_prelaunch(
         rows, await cached_evidence([str(r['symbol']) for r in rows], latest_trade_date),
         strength_profiles, config, limit_each,
     )
+    early_watch['historyPreparation'] = history_preparation
     ranked = sorted(
         enriched_merged,
         key=lambda item: (
@@ -1033,10 +1039,16 @@ async def preview_database_strength_v12(limit: int = 10) -> dict[str, Any]:
             candidates.append(apply_strength_ranking(candidate, profiles, config))
     tiers = split_v12_price_tiers(candidates, config)
     accepted = tiers["main"] + tiers["highPrice"][:config.high_price_limit]
+    early_watch = screen_prelaunch(
+        rows, await cached_evidence([str(r['symbol']) for r in rows], latest_trade_date),
+        profiles, config, limit,
+    )
     return {"ok": True, "version": V12_VERSION,
             "latestTradeDate": latest_trade_date, "universeCount": universe_count,
             "snapshotCount": len(rows), "saved": False,
             "factorEnrichmentApplied": False,
+            "prelaunchWatch": early_watch,
+            "prelaunchPerformance": await prelaunch_performance(latest_trade_date),
             "note": "唯讀強勢篩選預覽；完整因子與正式買點仍以指令執行正式雷達。",
             **strength_boards(accepted, limit)}
 
@@ -1052,3 +1064,14 @@ async def preview_database_prelaunch_v12(limit: int = 10) -> dict[str, Any]:
     return {'ok': True, 'latestTradeDate': str(as_of), 'saved': False,
             'universeCount': universe_count, 'prelaunchWatch': board,
             'prelaunchPerformance': await prelaunch_performance(as_of)}
+
+
+async def prepare_database_prelaunch_v12(limit: int = 20) -> dict[str, Any]:
+    """Bounded cache preparation, without running or saving a formal radar."""
+    rows, _, as_of = await _fetch_v12_snapshot()
+    config = load_v12_config()
+    preparation = await prepare_prelaunch_history(
+        rows, build_strength_profiles(rows, config), config, as_of, limit)
+    return {'ok': preparation['ok'], 'latestTradeDate': str(as_of),
+            'historyPreparation': preparation,
+            'preview': await preview_database_prelaunch_v12(10)}
