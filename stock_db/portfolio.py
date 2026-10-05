@@ -145,7 +145,11 @@ def current_position_cycles(
     starts a new cycle; an intraday buy/sell while shares remain does not.
     """
     cycles: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-    for trade in sorted(transactions, key=lambda t: (str(t["trade_date"]), int(t["id"]))):
+    # Preserve the holding cycle across same-session inventory replacement.
+    # Imports may record odd-lot FIFO sales before the day's regular buy.
+    for trade in sorted(transactions, key=lambda t: (
+        str(t["trade_date"]), 0 if t["side"] == "BUY" else 1, int(t["id"])
+    )):
         if trade.get("voided_at") is not None:
             continue
         key = tuple(str(trade[field]) for field in (
@@ -285,7 +289,11 @@ def allocate_sale(
             int(lot.get("transaction_id") or lot.get("id") or 0),
         ),
     )
-    ordered = [*same_day_lots, *fifo_lots]
+    ordered = (
+        sorted(eligible, key=lambda lot: (
+            lot["trade_date"], int(lot.get("transaction_id") or lot.get("id") or 0)
+        )) if treatment == "NORMAL" else [*same_day_lots, *fifo_lots]
+    )
     available = sum(lot["remaining_quantity"] for lot in ordered)
     if available < int(quantity):
         raise PortfolioLedgerError(
@@ -338,7 +346,7 @@ def allocate_sale(
             ),
             "quantity": allocated_quantity,
             "matchingRule": (
-                "BROKER_SAME_DAY_BEST_PNL" if same_day else "FIFO"
+                "BROKER_SAME_DAY_BEST_PNL" if same_day and treatment != "NORMAL" else "FIFO"
             ),
             "buyCost": _money(buy_cost),
             "sellGross": _money(sell_gross),
