@@ -718,9 +718,12 @@ async def fetch_tdcc_context(symbols: Sequence[str], trade_date: date) -> tuple[
     try:
         await ensure_advanced_schema()
         rows = []
-        for symbol, value in selected.items():
+        # The downloaded CSV already covers the market. Preserve all ordinary
+        # shares, so next week's early screen has history even for stocks that
+        # have never appeared in the momentum shortlist. No additional request.
+        for symbol, value in (cached_data or {}).items():
             day = parse_roc_date(value.get("snapshotDate"))
-            if day:
+            if day and day <= trade_date and re.fullmatch(r"[1-9][0-9]{3}", symbol):
                 rows.append((symbol, day, value.get("under100LotsPercent"), value.get("over400LotsPercent"), value.get("holderCount")))
         async with stock_database.acquire() as connection:
             if rows:
@@ -1354,3 +1357,4 @@ async def portfolio_risk_map(candidates: Sequence[Mapping[str, Any]], themes: Ma
             "reason": "只扣除集中與高相關風險，不因低相關額外灌分",
         }
     return output
+

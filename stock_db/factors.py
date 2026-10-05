@@ -530,6 +530,14 @@ async def _chip_factor(symbol: str, trade_date: date) -> tuple[float | None, dic
         if first_ratio is not None and foreign_ratio is not None:
             foreign_delta = foreign_ratio - first_ratio
 
+    institutional_daily: dict[str, float] = {}
+    for record in institutional:
+        day = str(record.get("date") or "")[:10]
+        if day and start.isoformat() <= day <= trade_date.isoformat():
+            institutional_daily[day] = institutional_daily.get(day, 0.0) + (
+                (_float(_pick(record, "buy", "Buy"), 0.0) or 0.0)
+                - (_float(_pick(record, "sell", "Sell"), 0.0) or 0.0)
+            )
     institutional_net = 0.0
     for row in institutional[-40:]:
         institutional_net += (_float(_pick(row, "buy", "Buy"), 0.0) or 0.0) - (_float(_pick(row, "sell", "Sell"), 0.0) or 0.0)
@@ -616,6 +624,11 @@ async def _chip_factor(symbol: str, trade_date: date) -> tuple[float | None, dic
     score = sum(value * weight for value, weight, _ in components) / available_weight
     return round(_clamp(score), 2), {
         "institutionalNetShares": round(institutional_net),
+        "institutionalDailyNetShares": [
+            {"date": day, "netShares": round(net)}
+            for day, net in sorted(institutional_daily.items())
+        ],
+        "institutionalAsOfDate": max(institutional_daily, default=None),
         "institutionalNetToIssuedPercent": (
             round(institutional_to_issued_pct, 4)
             if institutional_to_issued_pct is not None else None
@@ -1395,3 +1408,4 @@ async def enrich_candidates_v12_3(
         except RuntimeError:
             pass
     return output
+

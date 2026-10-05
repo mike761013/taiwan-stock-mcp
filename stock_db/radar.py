@@ -10,6 +10,8 @@ from .factors import V12_4_FACTOR_MODEL, enrich_candidates_v12_3
 from .strength import (STRENGTH_MODEL_REVISION, apply_strength_ranking,
                        build_strength_profiles, strength_boards)
 from .performance import execution_strategy_priors
+from .prelaunch import (PRELAUNCH_MODEL, cached_evidence, screen_prelaunch,
+                       prelaunch_performance)
 from .service import stock_database_service
 from .v12 import (
     V12_ACCURACY_ENGINE,
@@ -837,6 +839,12 @@ async def run_full_bullish_radar_v12(
         config,
     )
     enriched_merged = [apply_strength_ranking(c, strength_profiles, config) for c in enriched_merged]
+    # Independent full-universe lane. Read after ordinary enrichment so the
+    # weekly ownership cache and daily chip evidence include this run's data.
+    early_watch = screen_prelaunch(
+        rows, await cached_evidence([str(r['symbol']) for r in rows], latest_trade_date),
+        strength_profiles, config, limit_each,
+    )
     ranked = sorted(
         enriched_merged,
         key=lambda item: (
@@ -921,6 +929,11 @@ async def run_full_bullish_radar_v12(
 
     combined_record = None
     if save_result:
+        early_watch['record'] = await stock_database_service.save_radar_result(
+            strategy='prelaunch_watch', candidates=early_watch['candidates'],
+            run_date=latest_trade_date, universe_count=universe_count,
+            configuration={'modelRevision': PRELAUNCH_MODEL, 'observationOnly': True},
+        )
         combined_record = await stock_database_service.save_radar_result(
             strategy="v12_combined",
             candidates=displayed_candidates,
@@ -934,6 +947,7 @@ async def run_full_bullish_radar_v12(
                 "latestTradeDate": str(latest_trade_date) if latest_trade_date else None,
                 "v12": config.public_dict(),
                 "marketContext": market_context,
+                "prelaunchWatch": early_watch,
             },
         )
 
@@ -979,6 +993,8 @@ async def run_full_bullish_radar_v12(
         "byStrategy": grouped,
         "record": combined_record,
         "executionPriors": priors,
+        "prelaunchWatch": early_watch,
+        "prelaunchPerformance": await prelaunch_performance(latest_trade_date),
         "rankingMethod": {
             "strengthWeight": config.ranking_strength_weight,
             "strengthModelRevision": STRENGTH_MODEL_REVISION,
@@ -1023,3 +1039,16 @@ async def preview_database_strength_v12(limit: int = 10) -> dict[str, Any]:
             "factorEnrichmentApplied": False,
             "note": "唯讀強勢篩選預覽；完整因子與正式買點仍以指令執行正式雷達。",
             **strength_boards(accepted, limit)}
+
+
+async def preview_database_prelaunch_v12(limit: int = 10) -> dict[str, Any]:
+    """Inspect cached early evidence and prospective outcomes without writes."""
+    rows, universe_count, as_of = await _fetch_v12_snapshot()
+    config = load_v12_config()
+    board = screen_prelaunch(
+        rows, await cached_evidence([str(r['symbol']) for r in rows], as_of),
+        build_strength_profiles(rows, config), config, max(1, min(int(limit), 50)),
+    )
+    return {'ok': True, 'latestTradeDate': str(as_of), 'saved': False,
+            'universeCount': universe_count, 'prelaunchWatch': board,
+            'prelaunchPerformance': await prelaunch_performance(as_of)}

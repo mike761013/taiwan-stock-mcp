@@ -2131,6 +2131,10 @@ def _build_dual_entry_plan(
     rounded_hard_stop = round_tw_price(hard_stop)
     rounded_no_chase = round_tw_price(no_chase)
     confirmation_available = rounded_confirmation <= rounded_no_chase
+    confirmation_executable = (
+        rounded_defense < rounded_confirmation <= round_tw_price(maximum_buy)
+        and confirmation_available
+    )
 
     return {
         "aggressiveEntry": {
@@ -2150,15 +2154,17 @@ def _build_dual_entry_plan(
             "price": rounded_confirmation,
             "positionPercent": confirmation_percent,
             "availableBelowNoChase": confirmation_available,
+            "availableBelowMaximumBuy": rounded_confirmation <= round_tw_price(maximum_buy),
+            "executable": confirmation_executable,
             "conditions": [
                 f"站回{rounded_confirmation}且維持在盤中均價之上",
                 confirmation_detail,
-                f"成交價不得高於不追價線{rounded_no_chase}",
+                f"成交價不得高於可買上限{round_tw_price(maximum_buy)}，且須高於失敗價{rounded_defense}",
             ],
             "actionWhenUnavailable": (
                 None
-                if confirmation_available
-                else "確認價已高於不追價線，不追價；等待重新回測"
+                if confirmation_executable
+                else "確認價不在失敗價與可買上限之間，確認單取消；等待新訊號，不調高追價上限"
             ),
         },
         "positionPlan": {
@@ -2802,6 +2808,13 @@ def validate_v12_candidates(
         confirmation_available = bool(
             confirmation.get("availableBelowNoChase")
         )
+        expected_executable = (failure_price < confirmation_price <= maximum_buy
+                               and confirmation_available)
+        if "executable" in confirmation and bool(confirmation["executable"]) != expected_executable:
+            issues.append({"code": "CONFIRMATION_EXECUTABILITY_MISMATCH",
+                           "symbol": symbol, "path": path,
+                           "confirmationPrice": confirmation_price,
+                           "maximumBuyPrice": maximum_buy})
         if confirmation_available != (confirmation_price <= no_chase):
             issues.append(
                 {
@@ -2861,3 +2874,4 @@ def screen_v12_rows(
         "patternRejected": pattern_rejected,
         "scoreRejected": score_rejected,
     }
+

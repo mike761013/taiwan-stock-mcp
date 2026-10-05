@@ -434,6 +434,12 @@ def test_execution_prior_is_capped_and_keeps_scores_separate():
 
 
 def test_full_radar_top10_excludes_wait_and_do_not_chase(monkeypatch):
+    async def evidence(*args):
+        return {}
+    async def observation_performance(*args):
+        return {'samples': 0}
+    monkeypatch.setattr(radar, 'cached_evidence', evidence)
+    monkeypatch.setattr(radar, 'prelaunch_performance', observation_performance)
     async def snapshot():
         return [{"symbol": "source"}], 2, date(2026, 8, 14)
 

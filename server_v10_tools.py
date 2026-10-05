@@ -34,6 +34,7 @@ from stock_db.pipeline import (
 from stock_db.radar import (
     explain_database_stock_v12,
     preview_database_strength_v12,
+    preview_database_prelaunch_v12,
     run_full_bullish_radar,
     run_full_bullish_radar_v12 as run_full_bullish_radar_v12_core,
     screen_database_market,
@@ -528,6 +529,11 @@ def register_v10_tools(mcp: Any) -> None:
         return await preview_database_strength_v12(limit)
 
     @mcp.tool()
+    async def get_v12_prelaunch_preview(limit: int = 10) -> dict:
+        """唯讀提前觀察：連續營收、籌碼累積、未延伸整理與首次入選績效；不重跑正式雷達。"""
+        return await preview_database_prelaunch_v12(limit)
+
+    @mcp.tool()
     async def get_saved_v12_radar_result(
         run_id: int | None = None, trade_date: str | None = None,
     ) -> dict:
@@ -766,3 +772,4 @@ def register_v10_tools(mcp: Any) -> None:
             "statisticsBefore": before_stats,
             "statisticsAfter": after_stats,
         }
+

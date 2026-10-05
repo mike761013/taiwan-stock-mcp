@@ -91,7 +91,7 @@ TRAILING_DISTANCE_R = max(
     0.25,
     float(os.getenv("V12_TRAILING_DISTANCE_R", "1.0")),
 )
-EXECUTION_MODEL_REVISION = "V12.4-NET-EXECUTION-2"
+EXECUTION_MODEL_REVISION = "V12.4-NET-EXECUTION-3"
 _execution_schema_ready = False
 _execution_schema_lock = asyncio.Lock()
 
@@ -788,9 +788,12 @@ def simulate_signal_execution(
         ) or 0.0
     confirmation_available = bool(
         confirmation.get("availableBelowNoChase")
-    )
+    ) and bool(confirmation.get("executable", True))
     failure_price = _as_float(failure.get("price")) or 0.0
     no_chase = _as_float(plan.get("noChasePrice")) or float("inf")
+    maximum_buy = _as_float(plan.get("maximumBuyPrice")) or no_chase
+    confirmation_available = (confirmation_available
+                              and failure_price < confirmation_price <= maximum_buy)
     planned_position = aggressive_pct + (
         confirmation_pct if confirmation_available else 0.0
     )
@@ -897,11 +900,12 @@ def simulate_signal_execution(
                 and high >= confirmation_price
                 and close >= confirmation_price
                 and close <= no_chase
+                and close <= maximum_buy
             ):
                 fill_price = close * (
                     1 + CONFIRMATION_ENTRY_SLIPPAGE_BPS / 10_000
                 )
-                if fill_price <= no_chase:
+                if fill_price <= min(no_chase, maximum_buy):
                     fills.append(
                         {
                             "kind": "confirmation",
@@ -2405,3 +2409,4 @@ async def repair_v12_radar_run_dates(
         "deletedExecutionPerformanceRows": deleted_execution,
         "requiresPerformanceRebuild": bool(apply and run_ids),
     }
+
