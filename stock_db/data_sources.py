@@ -124,7 +124,8 @@ async def fetch_security_master() -> list[dict[str, Any]]:
                 "name": name or symbol,
                 "market": market,
                 "industry": str(
-                    row.get("產業別") or row.get("Industry") or ""
+                    row.get("產業別") or row.get("SecuritiesIndustryCode")
+                    or row.get("Industry") or ""
                 ).strip() or None,
                 "is_active": True,
             }

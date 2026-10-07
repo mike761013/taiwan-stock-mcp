@@ -105,3 +105,14 @@ def test_close_finalization_adds_one_batch_without_running_radar(monkeypatch):
     result=asyncio.run(maintenance.run_daily_maintenance(run_radar=False,update_performance=False))
     assert result['completed'] and result['historyPreparation']['requestedDatasets']==8
     assert calls==[{'limit':30}]
+
+
+def test_tpex_official_industry_code_is_not_discarded(monkeypatch):
+    from stock_db import data_sources
+    async def fetch(url):
+        if url==data_sources.TPEX_SECURITIES_URL:
+            return [{'SecuritiesCompanyCode':'1240','CompanyAbbreviation':'茂生農經','SecuritiesIndustryCode':'33'}]
+        return [{'公司代號':'1101','公司簡稱':'台泥','產業別':'01'}]
+    monkeypatch.setattr(data_sources,'_get_json',fetch)
+    rows=asyncio.run(data_sources.fetch_security_master())
+    assert {r['symbol']:r['industry'] for r in rows}=={'1101':'01','1240':'33'}
