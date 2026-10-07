@@ -13,6 +13,7 @@ from .performance import execution_strategy_priors
 from .prelaunch import (PRELAUNCH_MODEL, cached_evidence, screen_prelaunch,
                        prelaunch_performance)
 from .prelaunch_history import prepare_prelaunch_history
+from .market_history import prepare_market_history
 from .service import stock_database_service
 from .v12 import (
     V12_ACCURACY_ENGINE,
@@ -841,7 +842,7 @@ async def run_full_bullish_radar_v12(
     )
     enriched_merged = [apply_strength_ranking(c, strength_profiles, config) for c in enriched_merged]
     history_preparation = (
-        await prepare_prelaunch_history(rows, strength_profiles, config, latest_trade_date)
+        await prepare_market_history(limit=30)
         if save_result else {'skipped': True, 'reason': '唯讀執行不補抓歷史'}
     )
     # Independent full-universe lane. Read after ordinary enrichment so the
@@ -1070,8 +1071,7 @@ async def prepare_database_prelaunch_v12(limit: int = 20) -> dict[str, Any]:
     """Bounded cache preparation, without running or saving a formal radar."""
     rows, _, as_of = await _fetch_v12_snapshot()
     config = load_v12_config()
-    preparation = await prepare_prelaunch_history(
-        rows, build_strength_profiles(rows, config), config, as_of, limit)
+    preparation = await prepare_market_history(limit=limit)
     return {'ok': preparation['ok'], 'latestTradeDate': str(as_of),
             'historyPreparation': preparation,
             'preview': await preview_database_prelaunch_v12(10)}

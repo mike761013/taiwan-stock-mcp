@@ -16,6 +16,7 @@ from .factors import (
 )
 from .radar import run_full_bullish_radar_v12
 from .portfolio import portfolio_ledger
+from .market_history import prepare_market_history
 
 # Compatibility name kept for older tests/imports and third-party callers.
 run_full_bullish_radar = run_full_bullish_radar_v12
@@ -95,6 +96,11 @@ async def run_daily_maintenance(
             "ok": False,
             "error": f"{type(exc).__name__}: {exc}",
         }
+    if not run_radar:
+        try:
+            result['historyPreparation'] = await prepare_market_history(limit=30)
+        except Exception as exc:
+            result['historyPreparation'] = {'ok':False, 'error':f'{type(exc).__name__}: {exc}'}
     if run_radar:
         try:
             result["radar"] = await run_full_bullish_radar(

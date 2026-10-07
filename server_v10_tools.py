@@ -7,6 +7,7 @@ from datetime import date
 from typing import Any
 
 from stock_db.maintenance import run_daily_maintenance
+from stock_db.market_history import history_status, prepare_market_history
 from stock_db.factors import (
     DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS,
     V12_4_FACTOR_MODEL,
@@ -538,8 +539,18 @@ def register_v10_tools(mcp: Any) -> None:
 
     @mcp.tool()
     async def prepare_v12_prelaunch_history(limit: int = 20) -> dict:
-        """補建量價整理候選的营收與逐日法人歷史；每日最多40資料集請求，重跑沿用快取，不跑正式雷達。"""
+        """續傳全市場營收與法人歷史、留存每週持股；每日最多40請求，不重跑正式雷達。"""
         return await prepare_database_prelaunch_v12(limit)
+
+    @mcp.tool()
+    async def prepare_v12_market_history(limit: int = 30) -> dict:
+        """全市場歷史回補一批：持久佇列、官方法人批次、營收快取、每週持股、共用40請求上限。"""
+        return await prepare_market_history(limit)
+
+    @mcp.tool()
+    async def get_v12_market_history_status() -> dict:
+        """查看全市場歷史覆盖與近期失敗，不抓外部資料、不重跑雷達。"""
+        return await history_status()
 
     @mcp.tool()
     async def get_saved_v12_radar_result(

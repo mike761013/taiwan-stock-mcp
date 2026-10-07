@@ -129,7 +129,7 @@ def test_full_radar_persists_separate_watch_lane_and_combined_snapshot(monkeypat
     async def performance(*args): return {'samples':1}
     async def priors(**kwargs): return {}
     async def enrich(items,*args): return items
-    async def prepare(*args): return {'ok':True,'requestedDatasets':0}
+    async def prepare(*args, **kwargs): return {'ok':True,'requestedDatasets':0}
     saved=[]
     async def save(**kwargs):
         saved.append(kwargs)
@@ -139,7 +139,7 @@ def test_full_radar_persists_separate_watch_lane_and_combined_snapshot(monkeypat
     monkeypatch.setattr(radar,'prelaunch_performance',performance)
     monkeypatch.setattr(radar,'execution_strategy_priors',priors)
     monkeypatch.setattr(radar,'enrich_candidates_v12_3',enrich)
-    monkeypatch.setattr(radar,'prepare_prelaunch_history',prepare)
+    monkeypatch.setattr(radar,'prepare_market_history',prepare)
     monkeypatch.setattr(radar,'build_strength_profiles',lambda *args:{row['symbol']:p})
     monkeypatch.setattr(radar,'screen_v12_rows',lambda **kwargs:([],{}))
     monkeypatch.setattr(radar.stock_database_service,'save_radar_result',save)
