@@ -77,14 +77,14 @@ def test_cached_bulk_institutional_evidence_preserves_other_factor_features(monk
                 return [{'symbol':'1101','trade_date':date(2026,10,7),'features':{
                     'event':{'hardRisk':True},'chip':{'tdccScore':60,'institutionalDailyNetShares':[
                         {'date':'2026-10-06','netShares':99}]}}}]
-            return [{'symbol':'1101','trade_date':date(2026,10,6),'net_shares':-20},
-                    {'symbol':'1101','trade_date':date(2026,10,7),'net_shares':100}]
+            return [{'symbol':'1101','trade_date':date(2026,10,6),'net_shares':-20,'source':'TWSE official daily'},
+                    {'symbol':'1101','trade_date':date(2026,10,7),'net_shares':100,'source':'TWSE official daily'}]
     monkeypatch.setattr(prelaunch.stock_database,'acquire',lambda:Context())
     e=asyncio.run(prelaunch.cached_evidence(['1101'],date(2026,10,7)))['1101']
     assert e['features']['event']['hardRisk'] is True
     assert e['features']['chip']['tdccScore']==60
     assert e['features']['chip']['institutionalDailyNetShares']==[
-        {'date':'2026-10-06','netShares':-20},{'date':'2026-10-07','netShares':100}]
+        {'date':'2026-10-06','netShares':-20,'source':'TWSE official daily'},{'date':'2026-10-07','netShares':100,'source':'TWSE official daily'}]
 
 
 def test_close_finalization_adds_one_batch_without_running_radar(monkeypatch):

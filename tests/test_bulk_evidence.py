@@ -24,3 +24,14 @@ def test_ownership_stale_and_impossible_percentages_rejected():
     csv=head+"".join(f"20261002,{s},1,1,1,80\n20261002,{s},12,1,1,70\n" for s in range(1000,2000))
     with pytest.raises(ValueError):validate_ownership(csv,date(2026,9,24))
     with pytest.raises(ValueError):validate_ownership(csv,date(2026,10,2))
+
+
+def test_supplement_requires_all_five_categories_and_only_requested_dates():
+    from stock_db.bulk_evidence import supplemental_institutional_rows
+    names=["Foreign_Investor","Foreign_Dealer_Self","Investment_Trust","Dealer_self","Dealer_Hedging"]
+    raw=[dict(stock_id="2355",date="2026-10-08",name=n,buy=100,sell=20) for n in names]
+    assert supplemental_institutional_rows(raw,"2355",["2026-10-08"])==[("2355",date(2026,10,8),400)]
+    assert supplemental_institutional_rows(raw[:-1],"2355",["2026-10-08"])==[]
+    assert supplemental_institutional_rows(raw,"2355",["2026-10-07"])==[]
+    raw.append(dict(stock_id="2355",date="2026-10-08",name="Total",buy=99999,sell=0))
+    assert supplemental_institutional_rows(raw,"2355",["2026-10-08"])[0][-1]==400

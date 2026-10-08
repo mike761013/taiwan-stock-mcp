@@ -139,3 +139,66 @@ async def bootstrap_market_evidence(revenue_months=3, ownership_weeks=3):
             "ownershipRowsPrepared":len(ownership_rows),"ownershipArchiveVerification":verification,
             "ownershipProvenance":"TDCC official CSV archived by wirelessr; current week cross-checked before historical import",
             "errors":errors,"coverage":await history_status()}
+
+
+async def market_evidence_gaps():
+    from .prelaunch import cached_evidence, day
+    async with stock_database.acquire() as c:
+        as_of=await c.fetchval("SELECT MAX(trade_date) FROM daily_bars")
+        securities=[dict(r) for r in await c.fetch("SELECT symbol,name,market FROM securities WHERE is_active AND symbol ~ '^[1-9][0-9]{3}$' AND UPPER(market) IN ('TWSE','TPEX','OTC') ORDER BY symbol")]
+        dates=[str(r["trade_date"]) for r in await c.fetch("SELECT DISTINCT trade_date FROM daily_bars WHERE trade_date<=$1 ORDER BY trade_date DESC LIMIT 5",as_of)]
+    evidence=await cached_evidence([r["symbol"] for r in securities],as_of)
+    gaps=[]
+    for row in securities:
+        e=evidence[row["symbol"]]; missing=[]
+        months=[day(r["revenue_month"]) for r in e["revenues"][:3]]
+        if not (len(months)==3 and all(months) and all(r.get("yearly_change_percent") is not None for r in e["revenues"][:3]) and all((months[i].year*12+months[i].month)-(months[i+1].year*12+months[i+1].month)==1 for i in (0,1)) and (as_of-months[0]).days<=80): missing.append("revenue")
+        weeks=[day(r["snapshot_date"]) for r in e["ownership"][:3]]
+        if not (len(weeks)==3 and all(weeks) and 0<=(as_of-weeks[0]).days<=10 and all(5<=(weeks[i]-weeks[i+1]).days<=9 for i in (0,1))):missing.append("ownership")
+        existing={str(r["date"]):r.get("netShares") for r in e.get("features",{}).get("chip",{}).get("institutionalDailyNetShares",[])}
+        missing_dates=[d for d in dates if existing.get(d) is None]
+        if missing_dates:missing.append("institutional")
+        if missing:gaps.append({**row,"missing":missing,"revenueMonths":[str(d) for d in months],"ownershipDates":[str(d) for d in weeks],"institutionalMissingDates":missing_dates})
+    return {"ok":True,"asOfDate":str(as_of),"gaps":gaps}
+
+
+def supplemental_institutional_rows(raw, symbol, required_dates):
+    # Aggregate only explicitly published investor categories; never invent zeros.
+    categories={}
+    for row in raw:
+        if str(row.get("stock_id"))!=symbol or str(row.get("date")) not in required_dates:continue
+        name=str(row.get("name") or "")
+        if not name:continue
+        buy,sell=row.get("buy"),row.get("sell")
+        if buy is None or sell is None:continue
+        categories.setdefault(str(row["date"]),{})[name]=int(buy)-int(sell)
+    required={"Foreign_Investor","Foreign_Dealer_Self","Investment_Trust","Dealer_self","Dealer_Hedging"}
+    output=[]
+    for d,values in categories.items():
+        if required<=set(values):
+            output.append((symbol,date.fromisoformat(d),sum(values[k] for k in required)))
+    return output
+
+
+async def supplement_institutional_gaps(limit=50, excluded_symbols=None):
+    from datetime import timedelta
+    from .factors import _finmind_rows
+    gaps=await market_evidence_gaps();as_of=date.fromisoformat(gaps["asOfDate"])
+    targets=[g for g in gaps["gaps"] if "institutional" in g["missing"] and g["symbol"] not in set(excluded_symbols or [])][:max(1,min(int(limit),100))]
+    if not targets:return {"ok":True,"requestedSymbols":0,"remainingSymbols":0}
+    semaphore=asyncio.Semaphore(3);errors=[];rows=[]
+    async def fetch(g):
+        async with semaphore:
+            try:
+                raw=await asyncio.wait_for(_finmind_rows("TaiwanStockInstitutionalInvestorsBuySell",g["symbol"],as_of-timedelta(days=12),as_of),timeout=45)
+                parsed=supplemental_institutional_rows(raw,g["symbol"],g["institutionalMissingDates"])
+                if not parsed:errors.append({"symbol":g["symbol"],"error":"No complete published investor categories for missing dates"})
+                return parsed
+            except Exception as exc:
+                errors.append({"symbol":g["symbol"],"error":str(exc)[:200]});return []
+    rows=[r for batch in await asyncio.gather(*(fetch(g) for g in targets)) for r in batch]
+    async with stock_database.acquire() as c:
+        if rows:await c.executemany("INSERT INTO institutional_daily_history(symbol,trade_date,net_shares,source) VALUES($1,$2,$3,'FinMind category-complete supplement') ON CONFLICT(symbol,trade_date) DO NOTHING",rows)
+    remaining=await market_evidence_gaps()
+    return {"ok":not errors,"requestedSymbols":len(targets),"rowsPrepared":len(rows),"errors":errors,
+            "remainingSymbols":sum("institutional" in g["missing"] for g in remaining["gaps"]),"coverage":await history_status()}

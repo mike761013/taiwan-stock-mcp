@@ -68,7 +68,7 @@ async def cached_evidence(symbols: list[str], as_of: date) -> dict[str, dict]:
         ''', symbols, as_of)
         has_history = await connection.fetchval("SELECT to_regclass('institutional_daily_history')")
         institutional = await connection.fetch('''
-            SELECT symbol,trade_date,net_shares FROM institutional_daily_history
+            SELECT symbol,trade_date,net_shares,source FROM institutional_daily_history
             WHERE symbol=ANY($1::varchar[]) AND trade_date <= $2
               AND trade_date >= $2 - INTERVAL '14 days'
             ORDER BY symbol,trade_date
@@ -85,10 +85,11 @@ async def cached_evidence(symbols: list[str], as_of: date) -> dict[str, dict]:
         target = result[str(record['symbol'])]
         chip = target['features'].setdefault('chip', {})
         existing = {str(r['date']):r for r in chip.get('institutionalDailyNetShares', [])}
-        existing[str(record['trade_date'])] = {'date':str(record['trade_date']), 'netShares':record['net_shares']}
+        existing[str(record['trade_date'])] = {'date':str(record['trade_date']), 'netShares':record['net_shares'], 'source':record['source']}
         chip['institutionalDailyNetShares'] = [existing[d] for d in sorted(existing)]
         chip['institutionalAsOfDate'] = max(existing)
-        chip['institutionalHistorySource'] = 'Official market-wide daily history'
+        chip['institutionalHistorySources'] = sorted({r.get('source') for r in existing.values() if r.get('source')})
+        chip['institutionalHistorySource'] = 'Market-wide history; per-row sources disclosed'
     return result
 
 

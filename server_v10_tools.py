@@ -8,7 +8,7 @@ from typing import Any
 
 from stock_db.maintenance import run_daily_maintenance
 from stock_db.market_history import history_status, prepare_market_history
-from stock_db.bulk_evidence import bootstrap_market_evidence
+from stock_db.bulk_evidence import bootstrap_market_evidence, market_evidence_gaps, supplement_institutional_gaps
 from stock_db.factors import (
     DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS,
     V12_4_FACTOR_MODEL,
@@ -567,6 +567,16 @@ def register_v10_tools(mcp: Any) -> None:
     async def bootstrap_v12_market_evidence(revenue_months: int = 3, ownership_weeks: int = 3) -> dict:
         """明確要求的大批初次回補：官方整批營收與核對過的集保歷史，不占逐檔日更新40次預算，不重跑雷達。"""
         return await bootstrap_market_evidence(revenue_months, ownership_weeks)
+
+    @mcp.tool()
+    async def get_v12_market_evidence_gaps() -> dict:
+        """列出全市場仍缺營收、持股週快照、訊號日前五交易日法人的股票與缺漏日期。"""
+        return await market_evidence_gaps()
+
+    @mcp.tool()
+    async def supplement_v12_institutional_gaps(limit: int = 50, excluded_symbols: list[str] | None = None) -> dict:
+        """明確要求的首次法人缺漏回補；只寫已公布且類別齊全的缺漏日期，不覆寫官方值。"""
+        return await supplement_institutional_gaps(limit, excluded_symbols)
 
     @mcp.tool()
     async def get_v12_market_history_status() -> dict:
