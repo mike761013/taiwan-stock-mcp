@@ -8,6 +8,7 @@ from typing import Any
 
 from stock_db.maintenance import run_daily_maintenance
 from stock_db.market_history import history_status, prepare_market_history
+from stock_db.bulk_evidence import bootstrap_market_evidence
 from stock_db.factors import (
     DEFAULT_FUNDAMENTAL_REFRESH_INTERVAL_DAYS,
     V12_4_FACTOR_MODEL,
@@ -561,6 +562,11 @@ def register_v10_tools(mcp: Any) -> None:
     async def prepare_v12_market_history(limit: int = 30, retry_failed_institutional: bool = False) -> dict:
         """全市場歷史回補一批：持久佇列、官方法人批次、營收快取、每週持股、共用40請求上限。"""
         return await prepare_market_history(limit, retry_failed_institutional=retry_failed_institutional)
+
+    @mcp.tool()
+    async def bootstrap_v12_market_evidence(revenue_months: int = 3, ownership_weeks: int = 3) -> dict:
+        """明確要求的大批初次回補：官方整批營收與核對過的集保歷史，不占逐檔日更新40次預算，不重跑雷達。"""
+        return await bootstrap_market_evidence(revenue_months, ownership_weeks)
 
     @mcp.tool()
     async def get_v12_market_history_status() -> dict:
