@@ -14,6 +14,8 @@ from .prelaunch import (PRELAUNCH_MODEL, cached_evidence, screen_prelaunch,
                        prelaunch_performance)
 from .prelaunch_history import prepare_prelaunch_history
 from .market_history import prepare_market_history
+from .formal_quality import (FORMAL_MODEL_REVISION, apply_formal_quality,
+                             merge_formal_evidence, prioritize_activation)
 from .service import stock_database_service
 from .v12 import (
     V12_ACCURACY_ENGINE,
@@ -47,6 +49,10 @@ _COMMON_STOCK_UNIVERSE_COUNT_QUERY = f"""
 
 
 def _is_probe_candidate(candidate: dict[str, Any]) -> bool:
+    if candidate.get("formalModelRevision") and not (candidate.get("formalQualification") or {}).get("qualified"):
+        return False
+    if candidate.get("actionCode") == "WAIT_ACTIVATION":
+        return False
     strategies = {
         str(value).strip()
         for value in candidate.get("strategies") or []
@@ -66,7 +72,16 @@ def _is_formal_actionable(candidate: dict[str, Any]) -> bool:
         str(candidate.get("actionCode") or "")
         in V12_ACTIONABLE_STATUS_CODES
         and bool(candidate.get("forwardQualified", True))
+        and (not candidate.get("formalModelRevision")
+             or bool((candidate.get("formalQualification") or {}).get("qualified")))
     )
+
+
+async def _apply_formal_gates(candidates, as_of, config):
+    symbols = [str(c.get("symbol")) for c in candidates]
+    evidence = await cached_evidence(symbols, as_of) if stock_database.config.enabled and symbols else {}
+    return [apply_formal_quality(c, merge_formal_evidence(c, evidence.get(str(c.get("symbol")), {})), config)
+            for c in candidates]
 
 
 def _candidate_bucket(candidate: dict[str, Any]) -> int:
@@ -491,6 +506,7 @@ async def _save_v12_strategy(
             "engine": "postgres-v12",
             "accuracyEngine": V12_ACCURACY_ENGINE,
             "latestTradeDate": str(latest_trade_date) if latest_trade_date else None,
+            "formalModelRevision": FORMAL_MODEL_REVISION,
             "v12": config.public_dict(),
             "marketContext": market_context or {},
         },
@@ -539,9 +555,10 @@ async def screen_database_market_v12(
         )
         for candidate in raw_candidates
     ]
-    raw_candidates = [apply_strength_ranking(c, strength_profiles, config) for c in raw_candidates]
+    raw_candidates = [prioritize_activation(apply_strength_ranking(c, strength_profiles, config), config) for c in raw_candidates]
     raw_candidates.sort(
         key=lambda item: (
+            bool(item.get("activationTechnicalReady")),
             float(item.get("ranking_score") or 0),
             float(item.get("bullish_score") or 0),
         ),
@@ -556,6 +573,7 @@ async def screen_database_market_v12(
         config,
     )
     raw_candidates = [apply_strength_ranking(c, strength_profiles, config) for c in raw_candidates]
+    raw_candidates = await _apply_formal_gates(raw_candidates, latest_trade_date, config)
     raw_candidates.sort(
         key=lambda item: (
             float(item.get("ranking_score") or 0),
@@ -612,6 +630,7 @@ async def screen_database_market_v12(
         "version": V12_VERSION,
         "accuracyEngine": V12_ACCURACY_ENGINE,
         "strategy": strategy,
+        "formalModelRevision": FORMAL_MODEL_REVISION,
         "candidateCount": len(candidates),
         "rawCandidateCount": len(raw_candidates),
         "mainCandidateCount": len(primary_results),
@@ -696,9 +715,10 @@ async def run_full_bullish_radar_v12(
             )
             for candidate in raw_candidates
         ]
-        raw_candidates = [apply_strength_ranking(c, strength_profiles, config) for c in raw_candidates]
+        raw_candidates = [prioritize_activation(apply_strength_ranking(c, strength_profiles, config), config) for c in raw_candidates]
         raw_candidates.sort(
             key=lambda item: (
+                bool(item.get("activationTechnicalReady")),
                 float(item.get("ranking_score") or 0),
                 float(item.get("bullish_score") or 0),
             ),
@@ -734,10 +754,19 @@ async def run_full_bullish_radar_v12(
         for rank, candidate in enumerate(high_price_results, start=1):
             candidate["highPriceRank"] = rank
         record = None
+        # Per-strategy rows are technical prefilters, not enriched formal
+        # decisions. Only the combined enriched snapshot can qualify here.
+        diagnostic_candidates = [
+                {**c, "forwardQualified": False, "actionCode": "WAIT_ACTIVATION",
+                 "action": "技術候選（完整因子待確認）",
+                 "formalModelRevision": FORMAL_MODEL_REVISION,
+                 "formalQualification": {"qualified": False, "phase": "TECHNICAL_PREFILTER_ONLY"}}
+                for c in candidates
+            ]
         if save_result:
             record = await _save_v12_strategy(
                 strategy,
-                candidates,
+                diagnostic_candidates,
                 universe_count,
                 latest_trade_date,
                 minimum_score,
@@ -754,16 +783,17 @@ async def run_full_bullish_radar_v12(
             "mainCandidateCount": len(primary_results),
             "highPriceCandidateCount": len(high_price_results),
             "excludedHighPriceCount": len(tiers["rejectedHighPrice"]),
-            "actionableCandidateCount": len(strategy_actionable),
-            "probeCandidateCount": len(strategy_probes),
-            "watchCandidateCount": len(strategy_watch),
+            "selectionPhase": "TECHNICAL_PREFILTER_ONLY",
+            "actionableCandidateCount": 0,
+            "probeCandidateCount": 0,
+            "watchCandidateCount": len(diagnostic_candidates),
             "universeCount": universe_count,
             "latestTradeDate": latest_trade_date,
             "rejectionSummary": rejection_summary,
-            "results": candidates,
-            "actionableResults": strategy_actionable,
-            "probeResults": strategy_probes,
-            "watchResults": strategy_watch,
+            "results": diagnostic_candidates,
+            "actionableResults": [],
+            "probeResults": [],
+            "watchResults": diagnostic_candidates,
             "primaryResults": primary_results,
             "highPriceStrongResults": high_price_results,
             "nearMissObservations": (
@@ -806,6 +836,7 @@ async def run_full_bullish_radar_v12(
     preliminary = sorted(
         merged.values(),
         key=lambda item: (
+            bool(item.get("activationTechnicalReady")),
             float(item.get("ranking_score") or item.get("total_score") or 0),
             float(item.get("bullish_score") or item.get("total_score") or 0),
         ),
@@ -842,9 +873,10 @@ async def run_full_bullish_radar_v12(
     )
     enriched_merged = [apply_strength_ranking(c, strength_profiles, config) for c in enriched_merged]
     history_preparation = (
-        await prepare_market_history(limit=30)
+        await prepare_market_history(limit=30, retry_failed_institutional=True)
         if save_result else {'skipped': True, 'reason': '唯讀執行不補抓歷史'}
     )
+    enriched_merged = await _apply_formal_gates(enriched_merged, latest_trade_date, config)
     # Independent full-universe lane. Read after ordinary enrichment so the
     # weekly ownership cache and daily chip evidence include this run's data.
     early_watch = screen_prelaunch(
@@ -952,6 +984,7 @@ async def run_full_bullish_radar_v12(
                 "engine": "postgres-v12",
                 "accuracyEngine": V12_ACCURACY_ENGINE,
                 "latestTradeDate": str(latest_trade_date) if latest_trade_date else None,
+                "formalModelRevision": FORMAL_MODEL_REVISION,
                 "v12": config.public_dict(),
                 "marketContext": market_context,
                 "prelaunchWatch": early_watch,
@@ -962,6 +995,7 @@ async def run_full_bullish_radar_v12(
         "ok": True,
         "version": V12_VERSION,
         "accuracyEngine": V12_ACCURACY_ENGINE,
+        "formalModelRevision": FORMAL_MODEL_REVISION,
         "strategies": list(V12_STRATEGIES),
         "candidateCount": len(displayed_candidates),
         "rawCandidateCount": len(ranked),
@@ -1052,6 +1086,37 @@ async def preview_database_strength_v12(limit: int = 10) -> dict[str, Any]:
             "prelaunchPerformance": await prelaunch_performance(latest_trade_date),
             "note": "唯讀強勢篩選預覽；完整因子與正式買點仍以指令執行正式雷達。",
             **strength_boards(accepted, limit)}
+
+
+async def preview_database_formal_quality_v12(limit: int = 10) -> dict[str, Any]:
+    """Cached gate inspection only; no external requests or saved signals."""
+    from collections import Counter
+    rows, universe_count, as_of = await _fetch_v12_snapshot()
+    config = load_v12_config()
+    profiles = build_strength_profiles(rows, config)
+    context = build_market_context(rows, config)
+    evidence = await cached_evidence([str(r["symbol"]) for r in rows], as_of)
+    selected, rejected = [], Counter()
+    for row in rows:
+        matches = [c for strategy in V12_STRATEGIES
+                   if (c := build_v12_candidate(row, strategy, config)) is not None]
+        if not matches:
+            continue
+        c = max(matches, key=lambda c: (_candidate_bucket(c), _candidate_rank_score(c)))
+        c["strategies"] = [m["strategy"] for m in matches]
+        c = apply_market_context(c, context, config)
+        c = apply_strength_ranking(c, profiles, config)
+        c = apply_formal_quality(c, evidence.get(str(c["symbol"]), {}), config)
+        rejected.update(c["formalQualification"]["failedRules"])
+        selected.append(c)
+    selected.sort(key=_candidate_rank_score, reverse=True)
+    formal = [c for c in selected if _is_formal_actionable(c)]
+    return {"ok": True, "saved": False, "latestTradeDate": str(as_of),
+            "formalModelRevision": FORMAL_MODEL_REVISION, "universeCount": universe_count,
+            "candidateCount": len(formal), "candidates": formal[:max(1,min(int(limit),50))],
+            "watchCandidates": [c for c in selected if c["actionCode"] == "WAIT_ACTIVATION"][:limit],
+            "rejectionCounts": dict(rejected), "fullFactorEnrichmentApplied": False,
+            "note": "只用既有快取檢查正式門檻；通過不等於完成完整因子正式雷達或績效驗證。"}
 
 
 async def preview_database_prelaunch_v12(limit: int = 10) -> dict[str, Any]:

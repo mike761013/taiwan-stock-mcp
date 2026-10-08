@@ -35,6 +35,7 @@ from stock_db.pipeline import (
 from stock_db.radar import (
     explain_database_stock_v12,
     preview_database_strength_v12,
+    preview_database_formal_quality_v12,
     preview_database_prelaunch_v12,
     prepare_database_prelaunch_v12,
     run_full_bullish_radar,
@@ -50,6 +51,7 @@ from stock_db.v12 import (
     validate_v12_candidates,
 )
 from stock_db.strength import STRENGTH_MODEL_REVISION
+from stock_db.formal_quality import FORMAL_MODEL_REVISION
 from stock_db.prelaunch import PRELAUNCH_MODEL
 from stock_db.service import stock_database_service
 from stock_db.repository import stock_repository
@@ -524,6 +526,7 @@ def register_v10_tools(mcp: Any) -> None:
             "factorModelRevision": V12_4_FACTOR_MODEL,
             "strengthModelRevision": STRENGTH_MODEL_REVISION,
             "prelaunchModelRevision": PRELAUNCH_MODEL,
+            "formalModelRevision": FORMAL_MODEL_REVISION,
             "config": config.public_dict(),
         }
 
@@ -531,6 +534,18 @@ def register_v10_tools(mcp: Any) -> None:
     async def get_v12_strength_preview(limit: int = 10) -> dict:
         """唯讀驗證提前觀察與強勢篩選；不保存正式雷達或刷新外部因子。"""
         return await preview_database_strength_v12(limit)
+
+    @mcp.tool()
+    async def get_v12_formal_quality_preview(limit: int = 10) -> dict:
+        """唯讀檢查新版正式門檻；只用現有快取，不新增雷達或外部請求。"""
+        return await preview_database_formal_quality_v12(limit)
+
+    @mcp.tool()
+    async def get_v12_formal_performance_summary(
+        formal_model_revision: str = FORMAL_MODEL_REVISION,
+    ) -> dict:
+        """新版正式入選的可執行淨績效；獨立分版，不混入試單及舊版。"""
+        return await execution_performance_summary(formal_model_revision=formal_model_revision)
 
     @mcp.tool()
     async def get_v12_prelaunch_preview(limit: int = 10) -> dict:
@@ -543,9 +558,9 @@ def register_v10_tools(mcp: Any) -> None:
         return await prepare_database_prelaunch_v12(limit)
 
     @mcp.tool()
-    async def prepare_v12_market_history(limit: int = 30) -> dict:
+    async def prepare_v12_market_history(limit: int = 30, retry_failed_institutional: bool = False) -> dict:
         """全市場歷史回補一批：持久佇列、官方法人批次、營收快取、每週持股、共用40請求上限。"""
-        return await prepare_market_history(limit)
+        return await prepare_market_history(limit, retry_failed_institutional=retry_failed_institutional)
 
     @mcp.tool()
     async def get_v12_market_history_status() -> dict:
@@ -689,12 +704,14 @@ def register_v10_tools(mcp: Any) -> None:
         strategy: str | None = None,
         accuracy_engine: str | None = None,
         factor_model_revision: str | None = V12_4_FACTOR_MODEL,
+        formal_model_revision: str | None = FORMAL_MODEL_REVISION,
     ) -> dict:
         """查可執行淨績效；支援快照內所有命中策略及中文策略標籤。"""
         return await execution_performance_summary(
             strategy,
             accuracy_engine,
             factor_model_revision,
+            formal_model_revision,
         )
 
     @mcp.tool()

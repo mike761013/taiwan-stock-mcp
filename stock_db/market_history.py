@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 
 import httpx
 
@@ -66,13 +66,20 @@ def official_institutional_rows(body, market, requested_date):
     return result
 
 
-def plan_market_tasks(symbols, dates, progress, jobs, as_of, limit=30):
+def plan_market_tasks(symbols, dates, progress, jobs, as_of, limit=30,
+                      retry_failed_institutional=False, now=None):
     """Persisted attempts allow resume without starving unvisited symbols."""
     used = sum(int(mapping(j.get('metadata')).get('requestCount') or 0)
                for j in jobs if day(j.get('trade_date')) == as_of)
     reserved = {t.get('key') or f"revenue:{t.get('symbol')}"
                 for j in jobs if day(j.get('trade_date')) == as_of
                 for t in mapping(j.get('metadata')).get('tasks', [])}
+    attempt_counts = {}
+    for j in jobs:
+        if day(j.get('trade_date')) == as_of:
+            for t in mapping(j.get('metadata')).get('tasks', []):
+                key = t.get('key')
+                attempt_counts[key] = attempt_counts.get(key, 0) + 1
     old_revenue_attempts = {}
     for job in jobs:
         when = day(job.get('trade_date'))
@@ -81,11 +88,17 @@ def plan_market_tasks(symbols, dates, progress, jobs, as_of, limit=30):
                 symbol = task.get('symbol')
                 old_revenue_attempts[symbol] = max(old_revenue_attempts.get(symbol, date.min), when)
     tasks = []
+    now = now or datetime.now(timezone.utc)
     for d in dates:
         for market in ('TWSE', 'TPEX'):
             key = f'institutional:{market}:{d}'
             p = progress.get(key, {})
-            if not p.get('last_success') and day(p.get('last_attempt')) != as_of and key not in reserved:
+            updated = p.get('updated_at')
+            retry_ready = bool(retry_failed_institutional and p.get('error_message')
+                               and attempt_counts.get(key, 0) < 2
+                               and isinstance(updated, datetime)
+                               and (now-updated).total_seconds() >= 1800)
+            if not p.get('last_success') and (retry_ready or (day(p.get('last_attempt')) != as_of and key not in reserved)):
                 tasks.append({'key':key,'dataset':'official_institutional','market':market,'date':str(d)})
     revenues = []
     for symbol in symbols:
@@ -149,7 +162,7 @@ async def history_status(as_of=None):
             'note':'完成回補不等於符合營收加速或籌碼累積；缺資料不補零。'}
 
 
-async def prepare_market_history(limit=30):
+async def prepare_market_history(limit=30, retry_failed_institutional=False):
     """One durable batch. A DB advisory lock shares budget across processes."""
     await ensure_factor_schema()
     async with stock_database.acquire() as c:
@@ -164,13 +177,14 @@ async def prepare_market_history(limit=30):
             await c.execute('SELECT pg_advisory_xact_lock(12440040)')
             progress = {r['task_key']:dict(r) for r in await c.fetch('SELECT * FROM market_evidence_progress')}
             jobs = [dict(r) for r in await c.fetch("SELECT trade_date,metadata FROM database_jobs WHERE job_type='prelaunch_history' AND trade_date >= $1",as_of-timedelta(days=7))]
-            tasks,used = plan_market_tasks(symbols,dates,progress,jobs,as_of,limit)
+            tasks,used = plan_market_tasks(symbols,dates,progress,jobs,as_of,limit,
+                                           retry_failed_institutional=retry_failed_institutional)
             job_id = None
             if tasks:
                 job_id = await c.fetchval("""INSERT INTO database_jobs(job_type,trade_date,status,started_at,metadata)
                     VALUES('prelaunch_history',$1,'running',NOW(),$2::jsonb) RETURNING id""",as_of,json.dumps({'modelRevision':MODEL,'requestCount':len(tasks),'tasks':tasks}))
                 await c.executemany("""INSERT INTO market_evidence_progress(task_key,symbol,dataset,evidence_date,last_attempt)
-                    VALUES($1,$2,$3,$4,$5) ON CONFLICT(task_key) DO UPDATE SET last_attempt=EXCLUDED.last_attempt,updated_at=NOW()""",
+                    VALUES($1,$2,$3,$4,$5) ON CONFLICT(task_key) DO UPDATE SET last_attempt=EXCLUDED.last_attempt,error_message=NULL,updated_at=NOW()""",
                     [(t['key'],t.get('symbol'),t['dataset'],day(t.get('date')),as_of) for t in tasks])
     # One downloaded weekly CSV already covers the market; the existing parser
     # persists all ordinary shares, not only the selected list.

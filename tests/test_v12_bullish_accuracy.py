@@ -434,6 +434,10 @@ def test_execution_prior_is_capped_and_keeps_scores_separate():
 
 
 def test_full_radar_top10_excludes_wait_and_do_not_chase(monkeypatch):
+    # This fixture tests bucket routing, not the independent evidence gates.
+    async def passthrough(candidates, *args):
+        return candidates
+    monkeypatch.setattr(radar, "_apply_formal_gates", passthrough)
     async def evidence(*args):
         return {}
     async def observation_performance(*args):

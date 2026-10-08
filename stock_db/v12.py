@@ -27,6 +27,7 @@ V12_ACCURACY_ENGINE = V12_VERSION
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "v12_config.json"
 
 V12_STATUS_LABELS = {
+    "WAIT_ACTIVATION": "等待量價與籌碼確認",
     "BUY_ZONE": "買進區",
     "BUY_ON_BREAKOUT": "突破時買進",
     "EARLY_ENTRY": "早期進場",
@@ -70,6 +71,12 @@ def v12_status_label(status_code: str) -> str:
 
 @dataclass(frozen=True)
 class V12Config:
+    formal_min_daily_volume_lots: float = 3000.0
+    formal_min_average_volume20_lots: float = 1500.0
+    formal_min_volume_ratio: float = 1.3
+    formal_weak_min_volume_ratio: float = 1.5
+    formal_min_close_position: float = 0.7
+    formal_max_distance_ma20_pct: float = 8.0
     # V7 liquidity gates. Volumes are expressed in Taiwan lots (1 lot=1,000 shares).
     min_daily_volume_lots: float = 2000.0
     min_average_volume20_lots: float = 1000.0

@@ -759,6 +759,9 @@ def simulate_signal_execution(
         ),
     }
 
+    if snapshot.get("formalModelRevision") and not (snapshot.get("formalQualification") or {}).get("qualified"):
+        result.update(execution_status="NO_TRADE", status_reason="新版正式門檻未通過，觀察名單不模擬成交")
+        return result
     if not plan or not aggressive or not confirmation or not failure:
         result.update(
             execution_status="NO_TRADE",
@@ -901,6 +904,10 @@ def simulate_signal_execution(
                 and close >= confirmation_price
                 and close <= no_chase
                 and close <= maximum_buy
+                and (not snapshot.get("formalModelRevision") or (
+                    (_as_float(bar.get("volume_ratio")) or 0) >= (_as_float(confirmation.get("minimumVolumeRatio")) or 1.3)
+                    and close_position >= (_as_float(confirmation.get("minimumClosePosition")) or .7)
+                ))
             ):
                 fill_price = close * (
                     1 + CONFIRMATION_ENTRY_SLIPPAGE_BPS / 10_000
@@ -1351,11 +1358,13 @@ async def update_signal_execution_performance(
         minimum_date = min(row["run_date"] for row in signals)
         all_bars = await connection.fetch(
             """
-            SELECT symbol, trade_date, open, high, low, close
-            FROM daily_bars
-            WHERE symbol=ANY($1::varchar[])
-              AND trade_date > $2
-            ORDER BY symbol, trade_date
+            SELECT b.symbol, b.trade_date, b.open, b.high, b.low, b.close,
+                   b.volume, i.volume_ratio
+            FROM daily_bars b
+            LEFT JOIN daily_indicators i ON i.symbol=b.symbol AND i.trade_date=b.trade_date
+            WHERE b.symbol=ANY($1::varchar[])
+              AND b.trade_date > $2
+            ORDER BY b.symbol, b.trade_date
             """,
             symbols,
             minimum_date,
@@ -1514,6 +1523,7 @@ async def execution_performance_summary(
     strategy: str | None = None,
     accuracy_engine: str | None = None,
     factor_model_revision: str | None = None,
+    formal_model_revision: str | None = None,
 ) -> dict[str, Any]:
     """Return performance only for plans that would really have filled."""
     requested = str(strategy or "").strip().lower()
@@ -1567,6 +1577,11 @@ async def execution_performance_summary(
                 "COALESCE(NULLIF(e.factor_model_revision, ''), "
                 f"c.snapshot->>'factorModelRevision', '')=${len(args)}"
             )
+        requested_formal_model = str(formal_model_revision or "").strip()
+        if requested_formal_model:
+            args.append(requested_formal_model)
+            conditions.append(f"c.snapshot->>'formalModelRevision'=${len(args)}")
+            conditions.append("c.snapshot->'formalQualification'->>'qualified'='true'")
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         distinct_keys = "e.signal_date, e.symbol"
         row = await connection.fetchrow(
@@ -1668,6 +1683,7 @@ async def execution_performance_summary(
         "strategyLabel": _strategy_label(resolved) if resolved else None,
         "accuracyEngine": requested_engine or None,
         "factorModelRevision": requested_factor_model or None,
+        "formalModelRevision": requested_formal_model or None,
         "summary": summary,
         "method": EXECUTION_MODEL_REVISION,
         "costModel": _execution_cost_model(),
