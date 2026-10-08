@@ -35,3 +35,12 @@ def test_supplement_requires_all_five_categories_and_only_requested_dates():
     assert supplemental_institutional_rows(raw,"2355",["2026-10-07"])==[]
     raw.append(dict(stock_id="2355",date="2026-10-08",name="Total",buy=99999,sell=0))
     assert supplemental_institutional_rows(raw,"2355",["2026-10-08"])[0][-1]==400
+
+
+def test_wide_supplement_accepts_explicit_zero_but_rejects_missing_columns():
+    from stock_db.bulk_evidence import supplemental_institutional_rows
+    names=["Foreign_Investor","Foreign_Dealer_Self","Investment_Trust","Dealer_self","Dealer_Hedging"]
+    row=dict(stock_id="1813",date="2026-10-08",**{n+suffix:0 for n in names for suffix in ("_buy","_sell")})
+    assert supplemental_institutional_rows([row],"1813",["2026-10-08"])==[("1813",date(2026,10,8),0)]
+    row.pop("Investment_Trust_sell")
+    assert supplemental_institutional_rows([row],"1813",["2026-10-08"])==[]

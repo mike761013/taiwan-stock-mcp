@@ -159,11 +159,18 @@ async def market_evidence_gaps():
         missing_dates=[d for d in dates if existing.get(d) is None]
         if missing_dates:missing.append("institutional")
         if missing:gaps.append({**row,"missing":missing,"revenueMonths":[str(d) for d in months],"ownershipDates":[str(d) for d in weeks],"institutionalMissingDates":missing_dates})
-    return {"ok":True,"asOfDate":str(as_of),"gaps":gaps}
+    return {"ok":True,"asOfDate":str(as_of),"supplementDataset":"TaiwanStockInstitutionalInvestorsBuySellWide","gaps":gaps}
 
 
 def supplemental_institutional_rows(raw, symbol, required_dates):
     # Aggregate only explicitly published investor categories; never invent zeros.
+    required={"Foreign_Investor","Foreign_Dealer_Self","Investment_Trust","Dealer_self","Dealer_Hedging"}
+    wide=[]
+    for row in raw:
+        if str(row.get("stock_id"))!=symbol or str(row.get("date")) not in required_dates:continue
+        if all(row.get(k+suffix) is not None for k in required for suffix in ("_buy","_sell")):
+            wide.append((symbol,date.fromisoformat(str(row["date"])),sum(int(row[k+"_buy"])-int(row[k+"_sell"]) for k in required)))
+    if wide:return wide
     categories={}
     for row in raw:
         if str(row.get("stock_id"))!=symbol or str(row.get("date")) not in required_dates:continue
@@ -190,7 +197,7 @@ async def supplement_institutional_gaps(limit=50, excluded_symbols=None):
     async def fetch(g):
         async with semaphore:
             try:
-                raw=await asyncio.wait_for(_finmind_rows("TaiwanStockInstitutionalInvestorsBuySell",g["symbol"],as_of-timedelta(days=12),as_of),timeout=45)
+                raw=await asyncio.wait_for(_finmind_rows("TaiwanStockInstitutionalInvestorsBuySellWide",g["symbol"],as_of-timedelta(days=12),as_of),timeout=45)
                 parsed=supplemental_institutional_rows(raw,g["symbol"],g["institutionalMissingDates"])
                 if not parsed:errors.append({"symbol":g["symbol"],"error":"No complete published investor categories for missing dates"})
                 return parsed
