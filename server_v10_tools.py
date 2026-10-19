@@ -317,6 +317,25 @@ def register_v10_tools(mcp: Any) -> None:
         ))
 
     @mcp.tool()
+    async def correct_portfolio_cash_lot_allocations(
+        symbol: str, corrections_json: str, reason: str, dry_run: bool = True,
+    ) -> dict:
+        """預覽或原子更正跨日期、部分股數的現股配對；保留現金流與稽核。
+
+        corrections_json is a list of {sellTransactionId, expectedAllocations,
+        allocations}; each allocation is {buyTransactionId, quantity}.
+        Supply reviewed existing allocations as a concurrency guard. Defaults
+        to preview; dry_run=false applies only after full validation.
+        """
+        try:
+            corrections = json.loads(corrections_json)
+        except (ValueError, TypeError):
+            return {"ok": False, "errorType": "VALIDATION", "error": "corrections_json must be valid JSON"}
+        return await _portfolio_call(portfolio_ledger.correct_cash_lot_allocations(
+            symbol=symbol, corrections=corrections, reason=reason, dry_run=dry_run,
+        ))
+
+    @mcp.tool()
     async def correct_same_day_portfolio_cash_lot(
         symbol: str, retained_buy_id: int, consumed_buy_id: int,
         expected_quantity: int, reason: str,

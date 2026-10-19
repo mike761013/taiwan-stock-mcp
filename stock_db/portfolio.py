@@ -40,6 +40,94 @@ class PortfolioLedgerError(ValueError):
     """User-correctable portfolio input or consistency error."""
 
 
+def plan_cash_lot_corrections(
+    transactions: Sequence[Mapping[str, Any]],
+    allocations: Sequence[Mapping[str, Any]],
+    corrections: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Validate an atomic lot reassignment without altering actual trade cash flows."""
+    trades = {int(t["id"]): dict(t) for t in transactions}
+    if not corrections:
+        raise PortfolioLedgerError("at least one correction is required")
+
+    def matches(items: Any, buy_key: str) -> dict[int, int]:
+        if not isinstance(items, (list, tuple)) or not items:
+            raise PortfolioLedgerError("nonempty allocation lists are required")
+        result: dict[int, int] = {}
+        for item in items:
+            bid, qty = item.get(buy_key), item.get("quantity")
+            if type(bid) is not int or type(qty) is not int or bid <= 0 or qty <= 0 or bid in result:
+                raise PortfolioLedgerError("unique positive integer buy IDs and quantities required")
+            result[bid] = qty
+        return result
+
+    proposed = [dict(a) for a in allocations]
+    plans: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for correction in corrections:
+        sid = correction.get("sellTransactionId")
+        if type(sid) is not int or sid in seen or sid not in trades:
+            raise PortfolioLedgerError("unique active sell IDs required")
+        seen.add(sid)
+        sell = trades[sid]
+        if sell["side"] != "SELL" or sell["account_type"] != "CASH" or sell.get("voided_at"):
+            raise PortfolioLedgerError("correction supports active cash sales only")
+        current = [a for a in allocations if int(a["sell_transaction_id"]) == sid]
+        existing = matches(current, "buy_transaction_id")
+        expected = matches(correction.get("expectedAllocations"), "buyTransactionId")
+        desired = matches(correction.get("allocations"), "buyTransactionId")
+        if existing != expected and existing != desired:
+            raise PortfolioLedgerError("sale allocations changed since review; no changes made")
+        quantity = int(sell["quantity"])
+        if sum(existing.values()) != quantity or sum(expected.values()) != quantity or sum(desired.values()) != quantity:
+            raise PortfolioLedgerError("correction must preserve each sale's full quantity")
+        if any(Decimal(str(a["margin_interest"])) != 0 for a in current):
+            raise PortfolioLedgerError("margin interest corrections are not supported")
+        rates = {Decimal(str(a["tax_rate"])) for a in current}
+        if len(rates) != 1:
+            raise PortfolioLedgerError("mixed tax-rate sales require a separate correction")
+        totals = {k: sum((Decimal(str(a[k])) for a in current), Decimal(0))
+                  for k in ("sell_proceeds", "sell_commission", "transaction_tax")}
+        if (totals["sell_proceeds"] != Decimal(str(sell["net_cash_flow"]))
+                or totals["sell_commission"] != Decimal(str(sell["commission"]))
+                or totals["transaction_tax"] != Decimal(str(sell["transaction_tax"]))):
+            raise PortfolioLedgerError("sale cash totals do not reconcile; no changes made")
+        remaining = dict(totals)
+        updated = []
+        for index, (bid, qty) in enumerate(desired.items()):
+            buy = trades.get(bid)
+            if (not buy or buy["side"] != "BUY" or buy.get("voided_at")
+                    or any(buy[k] != sell[k] for k in ("symbol", "account_type", "asset_type", "lot_type"))):
+                raise PortfolioLedgerError("buy and sale must share the same active cash position")
+            # This operation deliberately excludes same-day/day-trade rematching.
+            if _parse_date(buy["trade_date"], "buy date") >= _parse_date(sell["trade_date"], "sale date"):
+                raise PortfolioLedgerError("replacement buy must precede the sale date")
+            if next(iter(rates)) != _sell_tax_rate(sell["asset_type"], "NORMAL", False):
+                raise PortfolioLedgerError("day-trade tax corrections are not supported")
+            amounts = {}
+            for key, total in totals.items():
+                amounts[key] = remaining[key] if index == len(desired) - 1 else _money(total * qty / quantity)
+                remaining[key] -= amounts[key]
+            cost = _money((Decimal(str(buy["price"])) + Decimal(str(buy["commission"])) / int(buy["quantity"])) * qty)
+            updated.append(dict(
+                sell_transaction_id=sid, buy_transaction_id=bid, quantity=qty,
+                matching_rule="USER_CONFIRMED_LOT", buy_cost=cost,
+                **amounts, tax_rate=next(iter(rates)), margin_interest=Decimal(0),
+                realized_pnl=_money(amounts["sell_proceeds"] - cost),
+            ))
+        proposed = [a for a in proposed if int(a["sell_transaction_id"]) != sid] + updated
+        plans.append(dict(sellTransactionId=sid, originalAllocations=current,
+                          correctedAllocations=updated, alreadyApplied=existing == desired,
+                          realizedPnl=sum((a["realized_pnl"] for a in updated), Decimal(0))))
+    used: dict[int, int] = defaultdict(int)
+    for allocation in proposed:
+        used[int(allocation["buy_transaction_id"])] += int(allocation["quantity"])
+    for bid, qty in used.items():
+        if bid not in trades or qty > int(trades[bid]["quantity"]):
+            raise PortfolioLedgerError("correction would overdraw a buy lot; no changes made")
+    return plans
+
+
 def corrected_cash_lot_allocation(allocation: Mapping[str, Any], buy: Mapping[str, Any]) -> dict[str, Any]:
     """Reprice a broker-confirmed buy-lot match without changing sale proceeds."""
     if buy["account_type"] != "CASH" or Decimal(str(allocation["margin_interest"])) != 0:
@@ -1331,6 +1419,66 @@ class PortfolioLedger:
             "allocations": _json_safe([dict(row) for row in allocations]),
             "plans": _json_safe([dict(row) for row in plans]),
         }
+
+    async def correct_cash_lot_allocations(
+        self, *, symbol: str, corrections: Sequence[Mapping[str, Any]],
+        reason: str, dry_run: bool = True,
+    ) -> dict[str, Any]:
+        """Preview/apply an atomic, audited reassignment of older cash buy lots."""
+        await self._ensure_schema()
+        symbol = str(symbol).strip().upper()
+        if not symbol or not str(reason).strip():
+            raise PortfolioLedgerError("symbol and correction reason are required")
+        if not isinstance(corrections, list) or not 1 <= len(corrections) <= 20 or any(not isinstance(c, dict) for c in corrections):
+            raise PortfolioLedgerError("corrections must contain 1-20 objects")
+        async with self.database.acquire() as connection:
+            async with connection.transaction():
+                # Trade insertion also locks eligible buy rows. Lock existing trades
+                # first, then re-read allocations to serialize against sales/voids.
+                trades = [dict(r) for r in await connection.fetch(
+                    "SELECT * FROM portfolio_transactions WHERE symbol=$1 AND voided_at IS NULL ORDER BY id FOR UPDATE",
+                    symbol,
+                )]
+                allocations = [dict(r) for r in await connection.fetch(
+                    """SELECT a.* FROM portfolio_lot_allocations a
+                       JOIN portfolio_transactions s ON s.id=a.sell_transaction_id
+                       WHERE s.symbol=$1 AND s.voided_at IS NULL
+                       ORDER BY a.sell_transaction_id,a.buy_transaction_id FOR UPDATE OF a""",
+                    symbol,
+                )]
+                plans = plan_cash_lot_corrections(trades, allocations, corrections)
+                for plan in plans:
+                    if dry_run or plan["alreadyApplied"]:
+                        continue
+                    sid = plan["sellTransactionId"]
+                    await connection.execute(
+                        "DELETE FROM portfolio_lot_allocations WHERE sell_transaction_id=$1", sid,
+                    )
+                    for a in plan["correctedAllocations"]:
+                        await connection.execute(
+                            """INSERT INTO portfolio_lot_allocations(
+                               sell_transaction_id,buy_transaction_id,quantity,matching_rule,
+                               buy_cost,sell_proceeds,sell_commission,transaction_tax,tax_rate,
+                               margin_interest,realized_pnl)
+                               VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)""",
+                            *(a[k] for k in ("sell_transaction_id", "buy_transaction_id", "quantity", "matching_rule",
+                                             "buy_cost", "sell_proceeds", "sell_commission", "transaction_tax",
+                                             "tax_rate", "margin_interest", "realized_pnl")),
+                        )
+                    audit = {"reason": str(reason).strip(), "kind": "CASH_LOT_REALLOCATION",
+                             "correctedAt": datetime.now(TAIPEI_TZ).isoformat(),
+                             "originalAllocations": _json_safe(plan["originalAllocations"]),
+                             "correctedAllocations": _json_safe(plan["correctedAllocations"])}
+                    await connection.execute(
+                        """UPDATE portfolio_transactions SET realized_pnl=$2,
+                           metadata=jsonb_set(metadata,'{lotCorrections}',
+                             COALESCE(metadata->'lotCorrections','[]'::jsonb) || $3::jsonb)
+                           WHERE id=$1""",
+                        sid, plan["realizedPnl"], json.dumps([audit], ensure_ascii=False),
+                    )
+        return {"ok": True, "dryRun": dry_run,
+                "idempotentReplay": all(p["alreadyApplied"] for p in plans),
+                "corrections": _json_safe(plans), "actualTradeCashFlowsPreserved": True}
 
     async def correct_same_day_cash_lot(
         self, *, symbol: str, retained_buy_id: int, consumed_buy_id: int,
