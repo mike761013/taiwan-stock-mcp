@@ -73,7 +73,7 @@ def test_jingjin_enters_probe_without_weakening_strict_pullback():
     assert "低點未再下移" in signals
 
 
-def test_jingjin_probe_is_reduced_position_and_never_formal_actionable():
+def test_jingjin_probe_is_not_a_formal_instruction_before_full_gates():
     candidate = build_v12_candidate(
         jingjin_2026_08_31(),
         "trend_support_probe",
@@ -83,7 +83,9 @@ def test_jingjin_probe_is_reduced_position_and_never_formal_actionable():
     assert candidate is not None
     assert candidate["actionCode"] == "PROBE_ENTRY"
     assert candidate["actionCode"] not in V12_ACTIONABLE_STATUS_CODES
-    assert candidate["forwardQualified"] is False
+    # Technical qualification is no longer vetoed solely by strategy name.
+    # It still requires the separate full-factor and activation gates.
+    assert candidate["forwardQualified"] is True
     assert candidate["rolling_massive_volume_low"] == 13.20
     assert candidate["trendSupportProbe"]["shortBullishAlignment"] is True
     assert candidate["trendSupportProbe"]["fullBullishAlignment"] is False

@@ -529,6 +529,18 @@ class StockRepository:
     ) -> int:
         async with self.database.acquire() as connection:
             async with connection.transaction():
+                # Close retries/concurrent workers must not manufacture two
+                # activation cohorts for the same origin and market date.
+                dedupe_key = (configuration or {}).get("idempotencyKey")
+                if dedupe_key:
+                    await connection.execute("SELECT pg_advisory_xact_lock(hashtext($1))", dedupe_key)
+                    existing = await connection.fetchval("""
+                        SELECT id FROM radar_runs WHERE strategy=$1 AND run_date=$2
+                          AND status='completed' AND configuration->>'idempotencyKey'=$3
+                        LIMIT 1
+                    """, strategy, run_date, dedupe_key)
+                    if existing is not None:
+                        return int(existing)
                 run_id = int(await connection.fetchval("""
                     INSERT INTO radar_runs(
                         strategy, run_date, status, universe_count,

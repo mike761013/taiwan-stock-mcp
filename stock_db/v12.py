@@ -77,6 +77,8 @@ class V12Config:
     formal_weak_min_volume_ratio: float = 1.5
     formal_min_close_position: float = 0.7
     formal_max_distance_ma20_pct: float = 8.0
+    activation_watch_sessions: int = 5
+    activation_enrichment_limit: int = 10
     # V7 liquidity gates. Volumes are expressed in Taiwan lots (1 lot=1,000 shares).
     min_daily_volume_lots: float = 2000.0
     min_average_volume20_lots: float = 1000.0
@@ -1450,11 +1452,6 @@ def evaluate_forward_qualification(
             passed_rules.append("反轉訊號已站回MA20")
         else:
             failed_rules.append("反轉訊號尚未站回MA20，只列底部觀察")
-
-    if strategy == "trend_support_probe":
-        # This layer is intentionally executable only as a reduced-position
-        # probe and never promoted into the formal actionable top ten.
-        failed_rules.append("多頭支撐策略固定列入試單區，不升正式買進榜")
 
     return {
         "qualified": not failed_rules,

@@ -10,7 +10,23 @@ from datetime import date
 from math import isfinite
 from typing import Any, Mapping
 
-FORMAL_MODEL_REVISION = "V12.4-FORMAL-ACTIVATION-1"
+FORMAL_MODEL_REVISION = "V12.4-FORMAL-ACTIVATION-2"
+
+
+def block_entry_plan(item: dict, reason: str) -> None:
+    """Watch prices remain references, never conflicting position instructions."""
+    plan = item.setdefault("tradingPlan", {})
+    plan.update(statusCode=item.get("actionCode", "WAIT_ACTIVATION"),
+                status=item.get("action", "等待量價與籌碼確認"))
+    item["forwardQualified"] = False
+    item.setdefault("forwardQualification", {})["qualified"] = False
+    plan["initialPositionPercent"] = 0
+    for key in ("aggressiveEntry", "confirmationEntry"):
+        plan.setdefault(key, {}).update(positionPercent=0, executable=False,
+                                        actionWhenUnavailable=reason)
+    plan.setdefault("positionPlan", {}).update(
+        aggressiveEntryPercent=0, confirmationEntryPercent=0,
+        maximumPlannedPercent=0, description=reason)
 
 
 def merge_formal_evidence(candidate: Mapping, cached: Mapping) -> dict:
@@ -162,14 +178,19 @@ def apply_formal_quality(candidate: Mapping, evidence: Mapping, config: Any) -> 
     item = deepcopy(dict(candidate))
     report = evaluate_formal_quality(item, evidence, config)
     previous_qualified = bool(item.get("forwardQualified", False))
-    from .v12 import V12_ACTIONABLE_STATUS_CODES
-    was_formal = item.get("actionCode") in V12_ACTIONABLE_STATUS_CODES and previous_qualified
+    from .v12 import V12_ACTIONABLE_STATUS_CODES, V12_PROBE_STATUS_CODES, v12_status_label
+    # A support setup may graduate, but only after the SAME complete gates.
+    # WAIT_PULLBACK / DO_NOT_CHASE are never bypassed by a high score.
+    was_formal = item.get("actionCode") in (V12_ACTIONABLE_STATUS_CODES | V12_PROBE_STATUS_CODES) and previous_qualified
     report["baseQualified"] = was_formal
     report["qualified"] = was_formal and report["qualified"]
     item.update(formalModelRevision=FORMAL_MODEL_REVISION, formalQualification=report)
-    if not was_formal:
-        return item
     if not report["qualified"]:
+        item["baseActionCode"] = item.get("actionCode")
+        base_failures = list((item.get("forwardQualification") or {}).get("failedRules") or [])
+        report["baseFailedRules"] = base_failures
+        if not was_formal:
+            report["failedRules"] = list(dict.fromkeys(base_failures + report["failedRules"] + ["原始分數、型態或可買價格尚未達標"]))
         item.update(forwardQualified=False, actionCode="WAIT_ACTIVATION", action="等待量價與籌碼確認")
         qualification = dict(item.get("forwardQualification") or {})
         qualification.update(qualified=False, failedRules=list(qualification.get("failedRules") or [])+report["failedRules"])
@@ -177,11 +198,17 @@ def apply_formal_quality(candidate: Mapping, evidence: Mapping, config: Any) -> 
         item["warnings"] = list(item.get("warnings") or []) + report["failedRules"] + report["warnings"]
         item.setdefault("tradingPlan", {})["statusCode"] = "WAIT_ACTIVATION"
         item["tradingPlan"]["status"] = item["action"]
+        block_entry_plan(item, "僅供觀察；重新通過全部正式條件後才啟用部位")
         return item
     # A formal signal is entered only after price and volume confirmation;
     # a touch of the former aggressive support zone cannot manufacture a fill.
     plan = item["tradingPlan"]
-    plan.setdefault("aggressiveEntry", {})["positionPercent"] = 0
+    if item.get("actionCode") in V12_PROBE_STATUS_CODES:
+        item["activationOriginActionCode"] = item["actionCode"]
+        item.update(actionCode="PRICE_CONFIRMATION_REQUIRED", action="等待價格確認")
+    item["action"] = v12_status_label(item["actionCode"])
+    plan.update(statusCode=item["actionCode"], status=item["action"], initialPositionPercent=0)
+    plan.setdefault("aggressiveEntry", {}).update(positionPercent=0, executable=False)
     plan["confirmationEntry"]["positionPercent"] = 40
     plan["confirmationEntry"]["minimumVolumeRatio"] = report["metrics"]["minimumVolumeRatio"]
     plan["confirmationEntry"]["minimumClosePosition"] = config.formal_min_close_position
@@ -194,12 +221,12 @@ def apply_formal_quality(candidate: Mapping, evidence: Mapping, config: Any) -> 
 
 def prioritize_activation(candidate: Mapping, config: Any) -> dict:
     """Reserve enrichment capacity for technically executable activations."""
-    from .v12 import V12_ACTIONABLE_STATUS_CODES
+    from .v12 import V12_ACTIONABLE_STATUS_CODES, V12_PROBE_STATUS_CODES
     item = dict(candidate)
     technical_codes = {"scope", "volume", "volume_ma20", "turnover", "strength_profile",
                        "relative_strength", "sector", "activation_volume", "activation_price",
                        "not_extended", "weak_market_leader", "executable_plan", "cost_and_noise"}
     failed = set(evaluate_formal_quality(item, {}, config)["metrics"].get("failedRuleCodes", []))
-    item["activationTechnicalReady"] = bool(item.get("actionCode") in V12_ACTIONABLE_STATUS_CODES
+    item["activationTechnicalReady"] = bool(item.get("actionCode") in (V12_ACTIONABLE_STATUS_CODES | V12_PROBE_STATUS_CODES)
         and item.get("forwardQualified") and not failed.intersection(technical_codes))
     return item
