@@ -476,6 +476,9 @@ async def explain_database_stock_v12(symbol: str) -> dict[str, Any]:
         {
             "latestTradeDate": latest_trade_date,
             "universeCount": universe_count,
+            "selectionPhase": "TECHNICAL_PREFILTER_ONLY",
+            "formalEntryEvaluated": False,
+            "note": "僅解釋技術型態；支撐候選仍須完整因子與正式啟動條件確認，不能視為進場指令。",
         }
     )
     return explanation

@@ -249,6 +249,8 @@ def _snapshot_strategies(
 
 def _action_tier(row: Mapping[str, Any]) -> str:
     snapshot = _mapping(row.get("snapshot"))
+    if snapshot.get("formalModelRevision") and not (snapshot.get("formalQualification") or {}).get("qualified"):
+        return "WATCH"
     plan = _mapping(snapshot.get("tradingPlan"))
     action_code = str(
         row.get("action_code")
@@ -1319,7 +1321,7 @@ async def update_signal_execution_performance(
             WHERE LOWER(r.strategy) LIKE 'v12_%'
               AND (
                 COALESCE(c.snapshot->>'accuracyEngine','') NOT LIKE 'V12.%'
-                OR LOWER(r.strategy) = 'v12_combined'
+                OR LOWER(r.strategy) IN ('v12_combined', 'v12_activation')
               )
               AND (
                 e.radar_run_id IS NULL
